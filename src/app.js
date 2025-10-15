@@ -1,4 +1,3 @@
-// src/app.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -35,7 +34,7 @@ app.set("trust proxy", 1); // behind Render/NGINX/Cloudflare
 app.use(
   helmet({
     crossOriginResourcePolicy: false, // allow images/files from other origins
-    contentSecurityPolicy: false,     // relax for now; tighten later if possible
+    contentSecurityPolicy: false,    // relax for now; tighten later if possible
   })
 );
 
@@ -55,6 +54,15 @@ const extraOrigins = (process.env.APP_ORIGINS || "")
   .filter(Boolean);
 
 const ALLOWED_ORIGINS = [...new Set([...DEFAULT_DEV_ORIGINS, ...extraOrigins])];
+
+// ********************************************************************************
+// NOTE: To fix the CORS issue, you MUST set the following environment variable
+// on your Render backend service:
+//
+// APP_ORIGINS = https://movieticketbooking-rajy.netlify.app
+//
+// Your current code is correct but relies on this ENV variable for the Netlify URL.
+// ********************************************************************************
 
 app.use(
   cors({
