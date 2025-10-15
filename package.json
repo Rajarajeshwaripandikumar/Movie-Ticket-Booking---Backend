@@ -1,0 +1,61 @@
+{
+  "name": "movie-booking-backend-full",
+  "version": "1.0.0",
+  "description": "Full-featured Movie Booking backend using Express, MongoDB, JWT, Stripe, Socket.IO, Redis, and Twilio — part of full-stack project with Vite + React frontend.",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "@sendgrid/mail": "^7.7.0",
+    "agenda": "^5.0.0",
+    "axios": "^1.12.2",
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^6.11.2",
+    "express-validator": "^7.2.1",
+    "helmet": "^6.2.0",
+    "ioredis": "^5.8.0",
+    "joi": "^17.9.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^7.8.7",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
+    "node-cron": "^4.2.1",
+    "node-fetch": "^3.3.2",
+    "nodemailer": "^7.0.6",
+    "pdfkit": "^0.13.0",
+    "qrcode": "^1.5.4",
+    "razorpay": "^2.9.6",
+    "redis": "^4.7.1",
+    "socket.io": "^4.8.1",
+    "stripe": "^12.18.0",
+    "twilio": "^4.23.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "express",
+    "mongodb",
+    "jwt",
+    "stripe",
+    "socket.io",
+    "redis",
+    "movie-booking",
+    "backend",
+    "fullstack"
+  ],
+  "author": "Tejasvi Pandikumar",
+  "license": "ISC"
+}
