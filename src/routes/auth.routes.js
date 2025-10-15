@@ -41,6 +41,47 @@ function safeUserPayload(userDoc) {
 }
 
 // -----------------------------------------------------------------------------
+// TEMPORARY ADMIN SEEDING ROUTE (DELETE IMMEDIATELY AFTER USE)
+// -----------------------------------------------------------------------------
+// USE THIS ONCE with any password to ensure the admin user exists in the database.
+router.post("/seed-admin", async (req, res) => {
+  const { password } = req.body;
+  const email = "admin@cinema.com";
+  
+  if (!password) {
+    return res.status(400).json({ message: "Password required in request body" });
+  }
+
+  try {
+    let user = await User.findOne({ email });
+
+    if (user && user.role === "ADMIN") {
+      return res.status(200).json({ message: `Admin account already exists: ${email}. Please DELETE this route now.` });
+    }
+    
+    // Create new admin user if not found, or update existing user to ADMIN role
+    user = user || new User({
+      email: email,
+      name: "Admin User",
+      role: "ADMIN",
+    });
+    
+    user.role = "ADMIN";
+    user.password = password; // Trigger pre-save hash hook
+    await user.save();
+    
+    return res.status(201).json({ 
+      message: `Admin account created/updated: ${email}. Use this password to log in. Please DELETE this route immediately.`,
+      user: safeUserPayload(user)
+    });
+  } catch (err) {
+    console.error("ADMIN_SEED_ERROR:", err.message);
+    res.status(500).json({ message: "Failed to seed admin user" });
+  }
+});
+
+
+// -----------------------------------------------------------------------------
 // REGISTER (User or Admin)
 // -----------------------------------------------------------------------------
 router.post("/register", async (req, res) => {
