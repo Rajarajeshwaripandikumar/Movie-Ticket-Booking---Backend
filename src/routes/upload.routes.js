@@ -1,4 +1,3 @@
-// backend/src/routes/upload.routes.js
 import express from "express";
 import multer from "multer";
 import fs from "fs";
@@ -6,11 +5,14 @@ import path from "path";
 
 const router = express.Router();
 
-/* ── Ensure uploads dir ────────────────────────────────────────────────────── */
+// Quick check
+router.get("/ping", (req, res) => res.json({ ok: true, where: "upload.routes.js" }));
+
+// Ensure uploads folder
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ── Multer setup ──────────────────────────────────────────────────────────── */
+// Multer setup
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, UPLOAD_DIR),
   filename: (_, file, cb) => {
@@ -32,18 +34,16 @@ const fileFilter = (_, file, cb) => {
 const upload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 3 * 1024 * 1024 }, // 3MB
+  limits: { fileSize: 3 * 1024 * 1024 }, // 3 MB
 });
 
-/* ── Routes ───────────────────────────────────────────────────────────────── */
-router.get("/ping", (_req, res) => res.json({ ok: true, where: "upload" }));
-
-// POST /api/upload  => { url: "/uploads/<file>" }
+// POST /api/upload
 router.post("/", (req, res) => {
   upload.single("image")(req, res, (err) => {
     if (err) {
-      if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "Max file size is 3MB" });
-      return res.status(400).json({ error: err.message || "Upload error" });
+      if (err.code === "LIMIT_FILE_SIZE")
+        return res.status(413).json({ error: "Max file size is 3MB" });
+      return res.status(400).json({ error: err.message });
     }
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
     return res.status(201).json({ url: `/uploads/${req.file.filename}` });
