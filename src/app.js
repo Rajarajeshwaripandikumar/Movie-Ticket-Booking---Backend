@@ -121,6 +121,7 @@ app.use(`${API_PREFIX}/theaters`, theatersRouter);
 app.use(`${API_PREFIX}/tickets`, ticketRoutes);
 app.use(`${API_PREFIX}/bookings`, bookingsRoutes);
 app.use(`${API_PREFIX}/payments`, paymentsRoutes);
+app.use(`${API_PREFIX}/upload`, uploadRoutes);
 
 /** SSE / notifications (SSE route is `${API_PREFIX}/notifications/stream`) */
 app.use(`${API_PREFIX}/notifications`, notificationsRoutes);
