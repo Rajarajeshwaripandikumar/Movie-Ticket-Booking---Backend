@@ -1,3 +1,4 @@
+// backend/src/models/Theater.js
 import mongoose from "mongoose";
 
 const TheaterSchema = new mongoose.Schema(
@@ -11,24 +12,54 @@ const TheaterSchema = new mongoose.Schema(
       type: [String],
       default: [],
       set: (val) => {
-        if (Array.isArray(val)) return val.map(String).map(s=>s.trim()).filter(Boolean);
-        if (typeof val === "string") return val.split(",").map(s=>s.trim()).filter(Boolean);
+        if (Array.isArray(val)) {
+          return val.map(String).map((s) => s.trim()).filter(Boolean);
+        }
+        if (typeof val === "string") {
+          return val
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        }
         return [];
       },
     },
+
+    // Lowercase fields for reliable unique enforcement (case-insensitive across all MongoDBs)
+    nameLower: { type: String, index: true },
+    cityLower: { type: String, index: true },
   },
   { timestamps: true }
 );
 
-// Case-insensitive unique name+city
+/* -------------------------------------------------------------------------- */
+/*                               Pre-save Hooks                               */
+/* -------------------------------------------------------------------------- */
+// Auto-populate lowercase fields for uniqueness enforcement
+TheaterSchema.pre("save", function (next) {
+  this.nameLower = (this.name || "").trim().toLowerCase();
+  this.cityLower = (this.city || "").trim().toLowerCase();
+  next();
+});
+
+/* -------------------------------------------------------------------------- */
+/*                            Case-insensitive Index                          */
+/* -------------------------------------------------------------------------- */
 TheaterSchema.index(
-  { name: 1, city: 1 },
-  { unique: true, collation: { locale: "en", strength: 2 } }
+  { nameLower: 1, cityLower: 1 },
+  { unique: true } // enforce unique per lowercase pair
 );
 
-// Optional virtual aliases if other code expects them
-TheaterSchema.virtual("posterUrl").get(function () { return this.imageUrl; });
-TheaterSchema.virtual("theaterImage").get(function () { return this.imageUrl; });
+/* -------------------------------------------------------------------------- */
+/*                                Virtual Fields                              */
+/* -------------------------------------------------------------------------- */
+TheaterSchema.virtual("posterUrl").get(function () {
+  return this.imageUrl;
+});
+TheaterSchema.virtual("theaterImage").get(function () {
+  return this.imageUrl;
+});
+
 TheaterSchema.set("toJSON", { virtuals: true });
 TheaterSchema.set("toObject", { virtuals: true });
 
