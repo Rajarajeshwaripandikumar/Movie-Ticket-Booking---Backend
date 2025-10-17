@@ -1,6 +1,6 @@
 // backend/src/routes/admin.routes.js
 import { Router } from "express";
-import bcrypt from "bcryptjs";                 // ⭐ added
+import bcrypt from "bcryptjs";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import User from "../models/User.js";
 import Theater from "../models/Theater.js";
@@ -11,13 +11,7 @@ import Booking from "../models/Booking.js";
 const router = Router();
 
 /* ----------------------------- AUTH / DEBUG ------------------------------ */
-
-// Quick check: returns decoded JWT payload
-router.get("/debug/me", requireAuth, (req, res) => {
-  res.json({ user: req.user });
-});
-
-// All routes below require a valid token
+router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }));
 router.use(requireAuth);
 
 /**
@@ -32,16 +26,15 @@ router.get("/me", requireAdmin, async (req, res) => {
     if (!doc) return res.status(404).json({ message: "Admin not found" });
 
     const { _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt } = doc;
-    return res.json({ id: _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt });
+    res.json({ id: _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt });
   } catch (e) {
     console.error("[Admin] /me error:", e);
-    return res.status(500).json({ message: "Failed to fetch profile" });
+    res.status(500).json({ message: "Failed to fetch profile" });
   }
 });
 
 /**
  * PUT /api/admin/profile
- * Updates safe fields for the current admin
  */
 router.put("/profile", requireAdmin, async (req, res) => {
   try {
@@ -52,28 +45,21 @@ router.put("/profile", requireAdmin, async (req, res) => {
     const update = {};
     for (const k of allowed) if (req.body[k] !== undefined) update[k] = req.body[k];
 
-    const updated = await User.findByIdAndUpdate(id, update, {
-      new: true,
-      runValidators: true,
-    }).lean();
-
+    const updated = await User.findByIdAndUpdate(id, update, { new: true, runValidators: true }).lean();
     if (!updated) return res.status(404).json({ message: "Admin not found" });
 
     const { _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt } = updated;
-    return res.json({ id: _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt });
+    res.json({ id: _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt });
   } catch (e) {
     console.error("[Admin] update profile error:", e);
-    return res.status(500).json({ message: "Failed to update profile", error: e.message });
+    res.status(500).json({ message: "Failed to update profile", error: e.message });
   }
 });
 
-/* ------------------------- CHANGE PASSWORD (NEW) ------------------------- */
+/* ------------------------- CHANGE PASSWORD ------------------------- */
 /**
  * POST /api/admin/change-password
  * Body: { currentPassword, newPassword }
- * Notes:
- * - If your User schema already hashes in a pre('save') hook, setting `user.password = newPassword` is enough.
- * - If not, we hash here with bcrypt.
  */
 router.post("/change-password", requireAdmin, async (req, res) => {
   try {
@@ -83,46 +69,35 @@ router.post("/change-password", requireAdmin, async (req, res) => {
     }
 
     const id = req.user?._id || req.user?.sub;
-    const user = await User.findById(id);
+    // ensure password is selected if schema hides it
+    const user = await User.findById(id).select("+password");
     if (!user) return res.status(404).json({ ok: false, message: "User not found" });
 
-    // Compare current password
-    let isMatch = false;
+    const matches = typeof user.comparePassword === "function"
+      ? await user.comparePassword(currentPassword)
+      : await bcrypt.compare(currentPassword, user.password || "");
 
-    // Prefer a model helper if you have one (e.g., user.comparePassword)
-    if (typeof user.comparePassword === "function") {
-      isMatch = await user.comparePassword(currentPassword);
-    } else if (user.password) {
-      isMatch = await bcrypt.compare(currentPassword, user.password);
-    }
-
-    if (!isMatch) {
+    if (!matches) {
       return res.status(400).json({ ok: false, message: "Current password is incorrect" });
     }
 
-    // Update password (hash via pre-save if present; otherwise hash here)
-    if (user.schema?.paths?.password?.options?.select === false) {
-      // If your schema excludes password by default, ensure it's selected. (Adjust if needed)
+    // Hash if no pre-save hook; otherwise assign and save
+    if (user.schema?.methods?.comparePassword || user.isModified) {
+      user.password = newPassword; // pre('save') should hash
+    } else {
+      const salt = await bcrypt.genSalt(10);
+      user.password = await bcrypt.hash(newPassword, salt);
     }
 
-    // If you DON'T have a pre-save hasher:
-    // const salt = await bcrypt.genSalt(10);
-    // user.password = await bcrypt.hash(newPassword, salt);
-
-    // If you DO have a pre-save hasher:
-    user.password = newPassword;
-
     await user.save();
-    return res.json({ ok: true, message: "Password updated" });
+    res.json({ ok: true, message: "Password updated" });
   } catch (e) {
     console.error("[Admin] change-password error:", e);
-    return res.status(500).json({ ok: false, message: "Failed to change password" });
+    res.status(500).json({ ok: false, message: "Failed to change password" });
   }
 });
 
-/* ------------------------------- THEATERS -------------------------------- */
-
-/** POST /api/admin/theaters  Body: { name, city, address } */
+/* -------------------------------- THEATERS -------------------------------- */
 router.post("/theaters", requireAdmin, async (req, res) => {
   try {
     const { name, city, address } = req.body || {};
@@ -139,8 +114,7 @@ router.post("/theaters", requireAdmin, async (req, res) => {
   }
 });
 
-/** GET /api/admin/theaters */
-router.get("/theaters", requireAdmin, async (_, res) => {
+router.get("/theaters", requireAdmin, async (_req, res) => {
   try {
     const theaters = await Theater.find().sort({ createdAt: -1 });
     res.json(theaters);
@@ -150,7 +124,6 @@ router.get("/theaters", requireAdmin, async (_, res) => {
   }
 });
 
-/** GET /api/admin/theaters/:id */
 router.get("/theaters/:id", requireAdmin, async (req, res) => {
   try {
     const theater = await Theater.findById(req.params.id);
@@ -162,7 +135,6 @@ router.get("/theaters/:id", requireAdmin, async (req, res) => {
   }
 });
 
-/** DELETE /api/admin/theaters/:id */
 router.delete("/theaters/:id", requireAdmin, async (req, res) => {
   try {
     const deleted = await Theater.findByIdAndDelete(req.params.id);
@@ -175,21 +147,13 @@ router.delete("/theaters/:id", requireAdmin, async (req, res) => {
 });
 
 /* -------------------------------- SCREENS -------------------------------- */
-
-/** POST /api/admin/theaters/:id/screens  Body: { name, rows, cols } */
 router.post("/theaters/:id/screens", requireAdmin, async (req, res) => {
   try {
     const { name, rows, cols } = req.body || {};
-    if (!name || !rows || !cols)
+    if (!name || !rows || !cols) {
       return res.status(400).json({ message: "name, rows, cols are required" });
-
-    const screen = await Screen.create({
-      theater: req.params.id,
-      name,
-      rows,
-      cols,
-    });
-
+    }
+    const screen = await Screen.create({ theater: req.params.id, name, rows, cols });
     res.status(201).json(screen);
   } catch (e) {
     console.error("[Admin] create screen error:", e);
@@ -197,7 +161,6 @@ router.post("/theaters/:id/screens", requireAdmin, async (req, res) => {
   }
 });
 
-/** GET /api/admin/theaters/:id/screens */
 router.get("/theaters/:id/screens", requireAdmin, async (req, res) => {
   try {
     const screens = await Screen.find({ theater: req.params.id }).sort({ createdAt: -1 });
@@ -209,9 +172,7 @@ router.get("/theaters/:id/screens", requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------- SHOWTIMES ------------------------------- */
-
-/** GET /api/admin/showtimes */
-router.get("/showtimes", requireAdmin, async (_, res) => {
+router.get("/showtimes", requireAdmin, async (_req, res) => {
   try {
     const showtimes = await Showtime.find()
       .populate("movie", "title genre durationMins language")
@@ -226,12 +187,12 @@ router.get("/showtimes", requireAdmin, async (_, res) => {
   }
 });
 
-/** POST /api/admin/showtimes */
 router.post("/showtimes", requireAdmin, async (req, res) => {
   try {
     const { movie, screen: screenId, city, startTime, basePrice, rows, cols } = req.body || {};
-    if (!movie || !screenId || !city || !startTime)
+    if (!movie || !screenId || !city || !startTime) {
       return res.status(400).json({ message: "movie, screen, city, startTime are required" });
+    }
 
     const screen = await Screen.findById(screenId);
     if (!screen) return res.status(404).json({ message: "Screen not found" });
@@ -239,13 +200,10 @@ router.post("/showtimes", requireAdmin, async (req, res) => {
     const theater = screen.theater;
     const R = Number(rows ?? screen.rows);
     const C = Number(cols ?? screen.cols);
-    if (!R || !C)
-      return res.status(400).json({ message: "rows and cols are required (body or screen)" });
+    if (!R || !C) return res.status(400).json({ message: "rows and cols are required (body or screen)" });
 
     const seats = [];
-    for (let r = 1; r <= R; r++) {
-      for (let c = 1; c <= C; c++) seats.push({ row: r, col: c, status: "AVAILABLE" });
-    }
+    for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) seats.push({ row: r, col: c, status: "AVAILABLE" });
 
     const showtime = await Showtime.create({
       movie,
@@ -264,7 +222,6 @@ router.post("/showtimes", requireAdmin, async (req, res) => {
   }
 });
 
-/** PATCH /api/admin/showtimes/:id */
 router.patch("/showtimes/:id", requireAdmin, async (req, res) => {
   try {
     const updated = await Showtime.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -277,8 +234,6 @@ router.patch("/showtimes/:id", requireAdmin, async (req, res) => {
 });
 
 /* -------------------------------- PRICING -------------------------------- */
-
-/** PATCH /api/admin/pricing/:showtimeId */
 router.patch("/pricing/:showtimeId", requireAdmin, async (req, res) => {
   try {
     const { basePrice, multipliers } = req.body || {};
@@ -297,8 +252,6 @@ router.patch("/pricing/:showtimeId", requireAdmin, async (req, res) => {
 });
 
 /* -------------------------------- REPORTS -------------------------------- */
-
-/** GET /api/admin/reports?from=YYYY-MM-DD&to=YYYY-MM-DD */
 router.get("/reports", requireAdmin, async (req, res) => {
   try {
     const { from, to } = req.query;
