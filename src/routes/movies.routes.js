@@ -17,25 +17,40 @@ const BASE_URL =
 const uploadDir = path.resolve("uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
+const MIME_EXT = {
+  "image/jpeg": ".jpeg",
+  "image/jpg": ".jpg", // some clients send this
+  "image/png": ".png",
+  "image/webp": ".webp",
+  "image/gif": ".gif",
+};
+
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, uploadDir),
   filename: (_, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const base = path
-      .basename(file.originalname, ext)
+    // ensure we always save with a real extension
+    let ext = (path.extname(file.originalname || "") || "").toLowerCase();
+    if (!ext) ext = MIME_EXT[file.mimetype] || ".jpg";
+
+    const base = (path.parse(file.originalname || "").name || "poster")
       .replace(/\s+/g, "-")
       .replace(/[^a-zA-Z0-9-_]/g, "");
+
     cb(null, `${base}-${Date.now()}${ext}`);
   },
 });
+
 const fileFilter = (_, file, cb) => {
-  const ok = ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(
-    file.mimetype
-  );
-  ok
-    ? cb(null, true)
-    : cb(new Error("Only image files (jpg, png, webp, gif) are allowed"));
+  const ok = [
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+  ].includes(file.mimetype);
+  ok ? cb(null, true) : cb(new Error("Only image files are allowed"));
 };
+
 const upload = multer({
   storage,
   fileFilter,
@@ -46,7 +61,6 @@ const upload = multer({
 const isValidId = (id) => mongoose.isValidObjectId(id);
 
 function toRelativePoster(u) {
-  // Normalize anything (absolute localhost, absolute prod, or relative) to a RELATIVE path
   if (!u) return "";
   try {
     if (/^https?:\/\//i.test(u)) {
@@ -59,8 +73,13 @@ function toRelativePoster(u) {
   return u.startsWith("/") ? u : `/${u}`;
 }
 
+// Only allow /uploads/* to be stored; everything else is dropped
+function onlyUploads(relish) {
+  const p = toRelativePoster(relish);
+  return p.startsWith("/uploads/") ? p : "";
+}
+
 function toPublicUrl(u) {
-  // Ensure the client always receives an ABSOLUTE URL
   if (!u) return "";
   const rel = toRelativePoster(u);
   return `${BASE_URL}${rel}`;
@@ -69,9 +88,8 @@ function toPublicUrl(u) {
 function safeUnlink(anyUrlOrPath) {
   try {
     if (!anyUrlOrPath) return;
-    const rel = toRelativePoster(anyUrlOrPath);
-    const abs = path.join(process.cwd(), rel.replace(/^\/+/, "")); // /uploads/.. -> uploads/..
-    // Only delete inside our uploads directory
+    const rel = toRelativePoster(anyUrlOrPath); // /uploads/...
+    const abs = path.join(process.cwd(), rel.replace(/^\/+/, "")); // -> uploads/...
     if (abs.startsWith(uploadDir) && fs.existsSync(abs)) fs.unlinkSync(abs);
   } catch {
     /* ignore */
@@ -124,18 +142,15 @@ router.get("/", async (req, res) => {
     const skip = Number(req.query.skip) || 0;
 
     const [docs, count] = await Promise.all([
-      Movie.find()
-        .sort({ releaseDate: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
+      Movie.find().sort({ releaseDate: -1, createdAt: -1 }).skip(skip).limit(limit).lean(),
       Movie.countDocuments(),
     ]);
 
     const movies = docs.map((m) => ({
       ...m,
-      // Always send absolute, frontend-safe URL
-      posterUrl: toPublicUrl(m.posterUrl || m.image || m.poster || m.imageUrl || ""),
+      posterUrl: toPublicUrl(
+        onlyUploads(m.posterUrl || m.image || m.poster || m.imageUrl || "")
+      ),
       cast: castResponseObjects(m.cast),
     }));
 
@@ -154,13 +169,7 @@ router.get("/search", async (req, res) => {
 
     if (q) {
       const rx = new RegExp(q, "i");
-      filter.$or = [
-        { title: rx },
-        { description: rx },
-        { director: rx },
-        { cast: rx },
-        { genre: rx },
-      ];
+      filter.$or = [{ title: rx }, { description: rx }, { director: rx }, { cast: rx }, { genre: rx }];
     }
 
     if (genre) {
@@ -180,7 +189,9 @@ router.get("/search", async (req, res) => {
 
     const movies = docs.map((m) => ({
       ...m,
-      posterUrl: toPublicUrl(m.posterUrl || m.image || m.poster || m.imageUrl || ""),
+      posterUrl: toPublicUrl(
+        onlyUploads(m.posterUrl || m.image || m.poster || m.imageUrl || "")
+      ),
       cast: castResponseObjects(m.cast),
     }));
 
@@ -200,7 +211,9 @@ router.get("/:id", async (req, res) => {
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ message: "Movie not found" });
 
-    movie.posterUrl = toPublicUrl(movie.posterUrl || movie.image || movie.poster || movie.imageUrl || "");
+    movie.posterUrl = toPublicUrl(
+      onlyUploads(movie.posterUrl || movie.image || movie.poster || movie.imageUrl || "")
+    );
     movie.cast = castResponseObjects(movie.cast);
     res.json(movie);
   } catch (err) {
@@ -229,13 +242,13 @@ router.post("/", upload.single("poster"), async (req, res) => {
 
     payload.cast = castToStringArray(payload.cast);
 
-    // ✅ Store RELATIVE path; never localhost
+    // Store RELATIVE path only
     if (req.file) {
       payload.posterUrl = `/uploads/${req.file.filename}`;
     } else if (payload.posterUrl || payload.image || payload.imageUrl || payload.poster) {
-      // Normalize any absolute URL (including localhost) to relative
-      const raw = payload.posterUrl || payload.image || payload.imageUrl || payload.poster;
-      payload.posterUrl = toRelativePoster(raw);
+      payload.posterUrl = onlyUploads(
+        payload.posterUrl || payload.image || payload.imageUrl || payload.poster
+      );
     }
 
     if (typeof payload.genre === "string") payload.genre = payload.genre.trim();
@@ -243,7 +256,7 @@ router.post("/", upload.single("poster"), async (req, res) => {
 
     const movie = await Movie.create(payload);
     const out = movie.toObject();
-    out.posterUrl = toPublicUrl(out.posterUrl);
+    out.posterUrl = toPublicUrl(onlyUploads(out.posterUrl));
     out.cast = castResponseObjects(out.cast);
     res.status(201).json(out);
   } catch (err) {
@@ -279,17 +292,15 @@ router.put("/:id", upload.single("poster"), async (req, res) => {
       durationMins: typeof b.durationMins !== "undefined" ? Number(b.durationMins) : existing.durationMins,
       releaseDate: typeof b.releaseDate !== "undefined" ? b.releaseDate : existing.releaseDate,
       cast: typeof b.cast !== "undefined" ? castToStringArray(b.cast) : existing.cast,
-      posterUrl: existing.posterUrl, // keep current by default
+      posterUrl: existing.posterUrl, // default: keep
     };
 
     let oldPoster = null;
     if (req.file) {
-      // ✅ new upload: store relative path
       payload.posterUrl = `/uploads/${req.file.filename}`;
       oldPoster = existing.posterUrl;
     } else if (b.posterUrl || b.image || b.imageUrl || b.poster) {
-      // normalize any incoming value to relative
-      payload.posterUrl = toRelativePoster(b.posterUrl || b.image || b.imageUrl || b.poster);
+      payload.posterUrl = onlyUploads(b.posterUrl || b.image || b.imageUrl || b.poster);
     }
 
     const updated = await Movie.findByIdAndUpdate(id, payload, {
@@ -297,11 +308,11 @@ router.put("/:id", upload.single("poster"), async (req, res) => {
       runValidators: true,
     }).lean();
 
-    if (updated && oldPoster && toRelativePoster(oldPoster) !== toRelativePoster(updated.posterUrl)) {
+    if (updated && oldPoster && onlyUploads(oldPoster) !== onlyUploads(updated.posterUrl)) {
       safeUnlink(oldPoster);
     }
 
-    updated.posterUrl = toPublicUrl(updated.posterUrl);
+    updated.posterUrl = toPublicUrl(onlyUploads(updated.posterUrl));
     updated.cast = castResponseObjects(updated.cast);
     res.json(updated);
   } catch (err) {
