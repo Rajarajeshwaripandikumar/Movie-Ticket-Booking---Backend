@@ -30,13 +30,13 @@ import { requireAuth, requireAdmin } from "./middleware/auth.js";
 const app = express();
 
 /* ─────────────────────────────── CORE APP SETTINGS ───────────────────────────── */
-app.set("trust proxy", 1); // if deployed behind a proxy (nginx/render/etc.)
+app.set("trust proxy", 1); // needed on Render / Nginx / AWS ELB setups
 
 /* ─────────────────────────────── SECURITY HEADERS ────────────────────────────── */
 app.use(
   helmet({
-    crossOriginResourcePolicy: false, // allow images from other origins if needed
-    contentSecurityPolicy: false,     // relaxed for dev; tighten in prod if you can
+    crossOriginResourcePolicy: false, // allow serving /uploads to other origins
+    contentSecurityPolicy: false,     // loosened for frontend asset compatibility
   })
 );
 
@@ -44,34 +44,42 @@ app.use(
 const DEV_ORIGINS = [
   process.env.APP_ORIGIN || "http://localhost:5173",
   "http://127.0.0.1:5173",
-  ...(process.env.APP_ORIGINS ? process.env.APP_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : []),
+  ...(process.env.APP_ORIGINS
+    ? process.env.APP_ORIGINS.split(",").map(s => s.trim()).filter(Boolean)
+    : []),
 ];
+
 app.use(
   cors({
-    origin: (origin, cb) => (!origin || DEV_ORIGINS.includes(origin) ? cb(null, true) : cb(null, false)),
+    origin: (origin, cb) => {
+      if (!origin || DEV_ORIGINS.includes(origin)) cb(null, true);
+      else cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    // Allow custom headers your frontend sends (e.g., X-Intent)
-    allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Intent", "X-Requested-With"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Idempotency-Key",
+      "X-Intent",
+      "X-Requested-With",
+    ],
     exposedHeaders: ["Content-Length", "Content-Type"],
     maxAge: 86400,
   })
 );
-// Answer ALL preflights early
 app.options("*", cors({ origin: DEV_ORIGINS, credentials: true }));
 
 /* ───────────────────────────── LOGGING & PARSERS ─────────────────────────────── */
 app.use(morgan("dev"));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 /* ─────────────────────────────── STATIC FILES ───────────────────────────────── */
-// Public access to uploaded images/files at /uploads/...
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 /* ─────────── Defensive: normalize accidental /api/api/... → /api/... ────────── */
 app.use((req, _res, next) => {
-  // If the URL contains duplicate /api prefix, collapse it
   req.url = req.url.replace(/\/api\/api(\/|$)/g, "/api$1");
   next();
 });
@@ -94,22 +102,22 @@ app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
 
-/** Notifications + prefs (SSE route is /api/notifications/stream) */
+/** Notifications + prefs (SSE route: /api/notifications/stream) */
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/notification-prefs", notificationPrefRoutes);
 
 /** Profiles */
 app.use("/api/profile", profileRoutes);
 
-/** Admin (lock the entire namespace) */
+/** Admin routes (locked down with auth + admin check) */
 app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
 
-/** ✅ Admin alias for theaters (so frontend can use /api/admin/theaters[...]) */
+/** ✅ Admin alias for theaters for frontend convenience (/api/admin/theaters/...) */
 app.use("/api/admin/theaters", requireAuth, requireAdmin, theatersRouter);
 
-/** Screens (explicit prefix so paths are unambiguous) */
+/** Screens (explicit prefix for clarity) */
 app.use("/api/screens", screensRoutes);
-// Optional dual mount during migration (keep only if you need legacy /api/... screen endpoints)
+// Optional dual mount for legacy /api/... screen endpoints
 app.use("/api", screensRoutes);
 
 /** Protected analytics */
