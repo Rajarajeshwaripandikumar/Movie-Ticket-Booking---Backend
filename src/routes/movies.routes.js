@@ -1,4 +1,4 @@
-// src/routes/movies.routes.js
+// backend/src/routes/movies.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import path from "path";
@@ -7,6 +7,11 @@ import multer from "multer";
 import Movie from "../models/Movie.js";
 
 const router = Router();
+
+/* --------------------------- BASE URL for Render --------------------------- */
+const BASE_URL =
+  process.env.BASE_URL ||
+  "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
 /* -------------------------- Uploads (multer) --------------------------- */
 const uploadDir = path.join(process.cwd(), "uploads");
@@ -24,8 +29,12 @@ const storage = multer.diskStorage({
   },
 });
 const fileFilter = (_, file, cb) => {
-  const ok = ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype);
-  ok ? cb(null, true) : cb(new Error("Only image files (jpg, png, webp, gif) are allowed"));
+  const ok = ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(
+    file.mimetype
+  );
+  ok
+    ? cb(null, true)
+    : cb(new Error("Only image files (jpg, png, webp, gif) are allowed"));
 };
 const upload = multer({
   storage,
@@ -39,8 +48,9 @@ const isValidId = (id) => mongoose.isValidObjectId(id);
 function safeUnlink(relativeUrl) {
   try {
     if (!relativeUrl) return;
-    // relativeUrl like "/uploads/xxx.jpg" or "uploads/xxx.jpg"
-    const normalized = relativeUrl.startsWith("/") ? relativeUrl.slice(1) : relativeUrl;
+    const normalized = relativeUrl.startsWith("/")
+      ? relativeUrl.slice(1)
+      : relativeUrl;
     const abs = path.join(process.cwd(), normalized);
     if (abs.startsWith(uploadDir) && fs.existsSync(abs)) fs.unlinkSync(abs);
   } catch {
@@ -52,11 +62,13 @@ const toArray = (v) =>
   Array.isArray(v)
     ? v
     : typeof v === "string"
-    ? v.split(",").map((s) => s.trim()).filter(Boolean)
+    ? v
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
     : [];
 
 /* ------------------------ Cast Normalization --------------------------- */
-/** Store as [String] in DB (matches your schema) */
 function castToStringArray(anyCast) {
   if (!anyCast) return [];
 
@@ -74,16 +86,6 @@ function castToStringArray(anyCast) {
 
   if (typeof anyCast === "object") {
     const vals = Object.values(anyCast).filter(Boolean);
-    const perChar = vals.length > 10 && vals.every((v) => typeof v === "string" && v.length === 1);
-    if (perChar) {
-      const joined = vals.join("");
-      try {
-        const parsed = JSON.parse(joined);
-        return castToStringArray(parsed);
-      } catch {
-        return joined.split(",").map((s) => s.trim()).filter(Boolean);
-      }
-    }
     return vals.map((v) => String(v).trim()).filter(Boolean);
   }
 
@@ -94,23 +96,21 @@ function castToStringArray(anyCast) {
       const parsed = JSON.parse(s);
       return castToStringArray(parsed);
     } catch {
-      return s.split(",").map((x) => x.trim()).filter(Boolean);
+      return s
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
     }
   }
 
   return [];
 }
 
-/** Pretty objects for UI response */
 function castResponseObjects(anyCast) {
   return castToStringArray(anyCast).map((name) => ({ actorName: name }));
 }
 
 /* ------------------------------ GET: list ------------------------------- */
-/**
- * GET /api/movies?limit=20&skip=0
- * Returns { movies: [...], count }
- */
 router.get("/", async (req, res) => {
   try {
     const limit = Math.min(100, Number(req.query.limit) || 20);
@@ -133,15 +133,13 @@ router.get("/", async (req, res) => {
     res.json({ movies, count });
   } catch (err) {
     console.error("[Movies] GET / error:", err);
-    res.status(500).json({ message: "Failed to load movies", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to load movies", error: err.message });
   }
 });
 
 /* ----------------------------- GET: search ------------------------------ */
-/**
- * GET /api/movies/search?q=...&genre=...&date=...
- * - q matches title/description/cast/director (case-insensitive)
- */
 router.get("/search", async (req, res) => {
   try {
     const { q, genre, date, limit = 50 } = req.query;
@@ -153,21 +151,15 @@ router.get("/search", async (req, res) => {
         { title: rx },
         { description: rx },
         { director: rx },
-        // cast is [String] in your schema
         { cast: rx },
-        // if you sometimes store comma string in genre
         { genre: rx },
       ];
     }
 
     if (genre) {
-      // allow comma-separated genres in your single-string schema
       const g = toArray(genre);
       if (g.length) {
-        filter.$or = [
-          ...(filter.$or || []),
-          { genre: { $in: g } },
-        ];
+        filter.$or = [...(filter.$or || []), { genre: { $in: g } }];
       }
     }
 
@@ -189,7 +181,9 @@ router.get("/search", async (req, res) => {
     res.json({ movies, count: movies.length });
   } catch (err) {
     console.error("[Movies] GET /search error:", err);
-    res.status(500).json({ message: "Failed to search movies", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to search movies", error: err.message });
   }
 });
 
@@ -197,7 +191,8 @@ router.get("/search", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
+    if (!isValidId(id))
+      return res.status(400).json({ message: "Invalid movie id" });
 
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ message: "Movie not found" });
@@ -206,42 +201,42 @@ router.get("/:id", async (req, res) => {
     res.json(movie);
   } catch (err) {
     console.error("[Movies] GET /:id error:", err);
-    res.status(500).json({ message: "Failed to fetch movie", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to fetch movie", error: err.message });
   }
 });
 
 /* ------------------------- POST: create (with poster) ------------------- */
-/**
- * POST /api/movies
- * Field name for file: "poster"
- * Body (form-data or json): title (required), description, genre, language, durationMins, releaseDate, director, rating, cast
- */
 router.post("/", upload.single("poster"), async (req, res) => {
   try {
     const payload = req.body || {};
 
-    if (!payload.title || typeof payload.title !== "string" || payload.title.trim().length === 0) {
+    if (!payload.title || typeof payload.title !== "string") {
       if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
       return res.status(400).json({ message: "Title is required" });
     }
 
-    // Validate duration
-    if (typeof payload.durationMins !== "undefined" && Number.isNaN(Number(payload.durationMins))) {
+    if (
+      typeof payload.durationMins !== "undefined" &&
+      Number.isNaN(Number(payload.durationMins))
+    ) {
       if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(400).json({ message: "durationMins must be a number" });
+      return res
+        .status(400)
+        .json({ message: "durationMins must be a number" });
     }
 
-    // Sanitize cast to [String]
     payload.cast = castToStringArray(payload.cast);
 
-    // Poster
+    // ✅ FIXED: Absolute poster URL
     if (req.file) {
-      payload.posterUrl = `/uploads/${req.file.filename}`;
+      payload.posterUrl = `${BASE_URL}/uploads/${req.file.filename}`;
     }
 
-    // Trim some strings
     if (typeof payload.genre === "string") payload.genre = payload.genre.trim();
-    if (typeof payload.language === "string") payload.language = payload.language.trim();
+    if (typeof payload.language === "string")
+      payload.language = payload.language.trim();
 
     const movie = await Movie.create(payload);
     const out = movie.toObject();
@@ -250,70 +245,9 @@ router.post("/", upload.single("poster"), async (req, res) => {
   } catch (err) {
     console.error("[Movies] POST / error:", err);
     if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-    res.status(400).json({ message: "Failed to create movie", error: err.message });
-  }
-});
-
-/* -------------------------- PATCH: update (safe set) -------------------- */
-/**
- * PATCH /api/movies/:id
- * Only updates provided fields; accepts same inputs as POST.
- */
-router.patch("/:id", upload.single("poster"), async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!isValidId(id)) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(400).json({ message: "Invalid movie id" });
-    }
-
-    const b = req.body || {};
-    const $set = {};
-
-    // Strings
-    if (typeof b.title !== "undefined") $set.title = String(b.title).trim();
-    if (typeof b.description !== "undefined") $set.description = b.description;
-    if (typeof b.genre !== "undefined") $set.genre = String(b.genre).trim();
-    if (typeof b.language !== "undefined") $set.language = String(b.language).trim();
-    if (typeof b.director !== "undefined") $set.director = b.director;
-    if (typeof b.rating !== "undefined") $set.rating = Number(b.rating);
-
-    // Dates / numbers
-    if (typeof b.releaseDate !== "undefined") $set.releaseDate = b.releaseDate;
-    if (typeof b.durationMins !== "undefined") {
-      if (Number.isNaN(Number(b.durationMins))) {
-        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-        return res.status(400).json({ message: "durationMins must be a number" });
-      }
-      $set.durationMins = Number(b.durationMins);
-    }
-
-    // Cast
-    if (typeof b.cast !== "undefined") {
-      $set.cast = castToStringArray(b.cast);
-    }
-
-    // Poster
-    if (req.file) $set.posterUrl = `/uploads/${req.file.filename}`;
-
-    const existing = await Movie.findById(id).lean();
-    if (!existing) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(404).json({ message: "Movie not found" });
-    }
-
-    const updated = await Movie.findByIdAndUpdate(id, { $set }, { new: true, runValidators: true }).lean();
-
-    // if poster replaced, remove old file
-    if (req.file && existing.posterUrl && existing.posterUrl !== updated.posterUrl) {
-      safeUnlink(existing.posterUrl);
-    }
-
-    updated.cast = castResponseObjects(updated.cast);
-    res.json(updated);
-  } catch (err) {
-    console.error("[Movies] PATCH /:id error:", err);
-    res.status(400).json({ message: "Failed to update movie", error: err.message });
+    res
+      .status(400)
+      .json({ message: "Failed to create movie", error: err.message });
   }
 });
 
@@ -334,38 +268,63 @@ router.put("/:id", upload.single("poster"), async (req, res) => {
 
     const b = req.body || {};
     const payload = {
-      title: typeof b.title !== "undefined" ? String(b.title).trim() : existing.title,
-      description: typeof b.description !== "undefined" ? b.description : existing.description,
-      genre: typeof b.genre !== "undefined" ? String(b.genre).trim() : existing.genre,
-      language: typeof b.language !== "undefined" ? String(b.language).trim() : existing.language,
-      director: typeof b.director !== "undefined" ? b.director : existing.director,
+      title:
+        typeof b.title !== "undefined"
+          ? String(b.title).trim()
+          : existing.title,
+      description:
+        typeof b.description !== "undefined"
+          ? b.description
+          : existing.description,
+      genre:
+        typeof b.genre !== "undefined"
+          ? String(b.genre).trim()
+          : existing.genre,
+      language:
+        typeof b.language !== "undefined"
+          ? String(b.language).trim()
+          : existing.language,
+      director:
+        typeof b.director !== "undefined" ? b.director : existing.director,
       rating:
-        typeof b.rating !== "undefined" ? Number(b.rating) : existing.rating,
+        typeof b.rating !== "undefined"
+          ? Number(b.rating)
+          : existing.rating,
       durationMins:
         typeof b.durationMins !== "undefined"
           ? Number(b.durationMins)
           : existing.durationMins,
       releaseDate:
-        typeof b.releaseDate !== "undefined" ? b.releaseDate : existing.releaseDate,
+        typeof b.releaseDate !== "undefined"
+          ? b.releaseDate
+          : existing.releaseDate,
       cast:
-        typeof b.cast !== "undefined" ? castToStringArray(b.cast) : existing.cast,
+        typeof b.cast !== "undefined"
+          ? castToStringArray(b.cast)
+          : existing.cast,
       posterUrl: existing.posterUrl,
     };
 
     let oldPoster = null;
     if (req.file) {
-      payload.posterUrl = `/uploads/${req.file.filename}`;
+      // ✅ FIXED: Absolute poster URL
+      payload.posterUrl = `${BASE_URL}/uploads/${req.file.filename}`;
       if (existing.posterUrl) oldPoster = existing.posterUrl;
     }
 
-    const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+    const updated = await Movie.findByIdAndUpdate(id, payload, {
+      new: true,
+      runValidators: true,
+    }).lean();
     if (updated && oldPoster) safeUnlink(oldPoster);
 
     updated.cast = castResponseObjects(updated.cast);
     res.json(updated);
   } catch (err) {
     console.error("[Movies] PUT /:id error:", err);
-    res.status(400).json({ message: "Failed to update movie", error: err.message });
+    res
+      .status(400)
+      .json({ message: "Failed to update movie", error: err.message });
   }
 });
 
@@ -373,17 +332,21 @@ router.put("/:id", upload.single("poster"), async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
+    if (!isValidId(id))
+      return res.status(400).json({ message: "Invalid movie id" });
 
     const removed = await Movie.findByIdAndDelete(id).lean();
-    if (!removed) return res.status(404).json({ message: "Movie not found" });
+    if (!removed)
+      return res.status(404).json({ message: "Movie not found" });
 
     if (removed.posterUrl) safeUnlink(removed.posterUrl);
 
     res.json({ message: "Movie deleted", id: removed._id });
   } catch (err) {
     console.error("[Movies] DELETE /:id error:", err);
-    res.status(500).json({ message: "Failed to delete movie", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to delete movie", error: err.message });
   }
 });
 
