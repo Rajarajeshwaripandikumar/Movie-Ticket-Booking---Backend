@@ -1,22 +1,40 @@
 // backend/src/routes/admin.routes.js
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+
 import User from "../models/User.js";
 import Theater from "../models/Theater.js";
 import Screen from "../models/Screen.js";
 import Showtime from "../models/Showtime.js";
 import Booking from "../models/Booking.js";
 
+// IMPORTANT: reuse the movies router so admin can call /api/admin/movies/...
+import moviesRouter from "./movies.routes.js";
+
 const router = Router();
 
-/* ----------------------------- AUTH / DEBUG ------------------------------ */
-router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }));
-router.use(requireAuth);
-
 /**
- * GET /api/admin/me
+ * NOTE:
+ * app.js mounts this file under /api/admin with:
+ *   app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
+ *
+ * That means every route here is already behind auth+admin when mounted.
+ * We still keep requireAdmin on sensitive endpoints for clarity/defense-in-depth.
  */
+
+/* ----------------------------- DEBUG / INFO ------------------------------- */
+// debug which user (route kept for convenience)
+router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }));
+
+/* --------------------------- Mount admin routers -------------------------- */
+// Mount movies routes under /api/admin/movies
+// This reuses your existing movies router (which contains POST/PUT/DELETE/multer logic).
+// Because app.js wraps /api/admin with requireAuth+requireAdmin, these routes are protected.
+router.use("/movies", moviesRouter);
+
+/* ----------------------------- PROFILE / AUTH ----------------------------- */
 router.get("/me", requireAdmin, async (req, res) => {
   try {
     const id = req.user?._id || req.user?.sub;
@@ -33,9 +51,6 @@ router.get("/me", requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * PUT /api/admin/profile
- */
 router.put("/profile", requireAdmin, async (req, res) => {
   try {
     const id = req.user?._id || req.user?.sub;
@@ -57,10 +72,6 @@ router.put("/profile", requireAdmin, async (req, res) => {
 });
 
 /* ------------------------- CHANGE PASSWORD ------------------------- */
-/**
- * POST /api/admin/change-password
- * Body: { currentPassword, newPassword }
- */
 router.post("/change-password", requireAdmin, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body || {};
@@ -69,7 +80,6 @@ router.post("/change-password", requireAdmin, async (req, res) => {
     }
 
     const id = req.user?._id || req.user?.sub;
-    // ensure password is selected if schema hides it
     const user = await User.findById(id).select("+password");
     if (!user) return res.status(404).json({ ok: false, message: "User not found" });
 
@@ -77,13 +87,11 @@ router.post("/change-password", requireAdmin, async (req, res) => {
       ? await user.comparePassword(currentPassword)
       : await bcrypt.compare(currentPassword, user.password || "");
 
-    if (!matches) {
-      return res.status(400).json({ ok: false, message: "Current password is incorrect" });
-    }
+    if (!matches) return res.status(400).json({ ok: false, message: "Current password is incorrect" });
 
-    // Hash if no pre-save hook; otherwise assign and save
+    // Hash new password if no pre-save hook
     if (user.schema?.methods?.comparePassword || user.isModified) {
-      user.password = newPassword; // pre('save') should hash
+      user.password = newPassword; // presave should handle hashing
     } else {
       const salt = await bcrypt.genSalt(10);
       user.password = await bcrypt.hash(newPassword, salt);
