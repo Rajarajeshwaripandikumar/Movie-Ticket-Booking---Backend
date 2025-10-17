@@ -125,7 +125,7 @@ app.use("/api/admin/theaters", requireAuth, requireAdmin, theatersRouter);
 
 // Screens (explicit + legacy mount)
 app.use("/api/screens", screensRoutes);
-app.use("/api", screensRoutes);
+
 
 // Analytics (protected)
 app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
