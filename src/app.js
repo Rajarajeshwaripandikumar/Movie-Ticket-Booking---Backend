@@ -1,4 +1,4 @@
-// backend/src/index.js
+// src/app.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -8,6 +8,7 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 
+// routes
 import authRoutes from "./routes/auth.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
 import moviesRoutes from "./routes/movies.routes.js";
@@ -22,115 +23,107 @@ import notificationsRoutes from "./routes/notifications.routes.js";
 import notificationPrefRoutes from "./routes/notificationPref.routes.js";
 import analyticsRoutes from "./routes/analytics.routes.js";
 import screensRoutes from "./routes/screens.routes.js";
+
+// middleware
 import { requireAuth, requireAdmin } from "./middleware/auth.js";
 
 const app = express();
 
-/* ── Core ─────────────────────────────────────────────────────────────────── */
-app.set("trust proxy", 1);
+/* ─────────────────────────────── CORE APP SETTINGS ───────────────────────────── */
+app.set("trust proxy", 1); // if deployed behind a proxy (nginx/render/etc.)
 
-const API_PREFIX = (process.env.API_PREFIX || "/api").replace(/\/+$/, "");
-
-/* ── Security / CORS ──────────────────────────────────────────────────────── */
+/* ─────────────────────────────── SECURITY HEADERS ────────────────────────────── */
 app.use(
   helmet({
-    crossOriginResourcePolicy: false,
-    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: false, // allow images from other origins if needed
+    contentSecurityPolicy: false,     // relaxed for dev; tighten in prod if you can
   })
 );
 
-const DEFAULT_DEV_ORIGINS = [
+/* ─────────────────────────────────── CORS ────────────────────────────────────── */
+const DEV_ORIGINS = [
   process.env.APP_ORIGIN || "http://localhost:5173",
   "http://127.0.0.1:5173",
+  ...(process.env.APP_ORIGINS ? process.env.APP_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : []),
 ];
-const extraOrigins = (process.env.APP_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const ALLOWED_ORIGINS = [...new Set([...DEFAULT_DEV_ORIGINS, ...extraOrigins])];
-
 app.use(
   cors({
-    origin: (origin, cb) => (!origin || ALLOWED_ORIGINS.includes(origin) ? cb(null, true) : cb(null, false)),
+    origin: (origin, cb) => (!origin || DEV_ORIGINS.includes(origin) ? cb(null, true) : cb(null, false)),
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"],
+    // Allow custom headers your frontend sends (e.g., X-Intent)
+    allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Intent", "X-Requested-With"],
     exposedHeaders: ["Content-Length", "Content-Type"],
     maxAge: 86400,
   })
 );
-app.options("*", cors());
+// Answer ALL preflights early
+app.options("*", cors({ origin: DEV_ORIGINS, credentials: true }));
 
-/* ── Parsers / logging ────────────────────────────────────────────────────── */
+/* ───────────────────────────── LOGGING & PARSERS ─────────────────────────────── */
 app.use(morgan("dev"));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/* ── Health ───────────────────────────────────────────────────────────────── */
-app.get(`${API_PREFIX}/health`, (req, res) => {
-  const ready = !!app.locals.dbReady;
-  res.status(ready ? 200 : 503).json({
-    ok: ready,
-    db: ready ? "up" : "connecting",
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
-});
+/* ─────────────────────────────── STATIC FILES ───────────────────────────────── */
+// Public access to uploaded images/files at /uploads/...
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
-/* ── Public static for uploaded files ─────────────────────────────────────── */
-app.use("/uploads", express.static(path.join(process.cwd(), "uploads"), { etag: true, lastModified: true }));
-
-/* ── API warm-up guard (does NOT block /uploads) ──────────────────────────── */
-app.use((req, res, next) => {
-  if (!req.path.startsWith(API_PREFIX)) return next();
-  if (req.path === `${API_PREFIX}/health`) return next();
-  if (!app.locals.dbReady) return res.status(503).json({ message: "Service warming up, try again shortly." });
+/* ─────────── Defensive: normalize accidental /api/api/... → /api/... ────────── */
+app.use((req, _res, next) => {
+  // If the URL contains duplicate /api prefix, collapse it
+  req.url = req.url.replace(/\/api\/api(\/|$)/g, "/api$1");
   next();
 });
 
-/* ── Routes (order matters; mount before 404 handler) ─────────────────────── */
-app.use(`${API_PREFIX}/upload`, uploadRoutes);         // <- /api/upload (POST, GET /ping)
-app.use(`${API_PREFIX}/auth`, authRoutes);
-app.use(`${API_PREFIX}/movies`, moviesRoutes);
-app.use(`${API_PREFIX}/showtimes`, showtimesRoutes);
-app.use(`${API_PREFIX}/theaters`, theatersRouter);
-app.use(`${API_PREFIX}/tickets`, ticketRoutes);
-app.use(`${API_PREFIX}/bookings`, bookingsRoutes);
-app.use(`${API_PREFIX}/payments`, paymentsRoutes);
-app.use(`${API_PREFIX}/notifications`, notificationsRoutes);
-app.use(`${API_PREFIX}/notification-prefs`, notificationPrefRoutes);
-app.use(`${API_PREFIX}/profile`, profileRoutes);
-app.use(`${API_PREFIX}/admin`, adminRoutes);
-app.use(`${API_PREFIX}/screens`, screensRoutes);
-app.use(`${API_PREFIX}/analytics`, requireAuth, requireAdmin, analyticsRoutes);
+/* ─────────────────────────────────── ROUTES ──────────────────────────────────── */
+/** Health */
+app.get("/api/health", (_, res) =>
+  res.json({ ok: true, uptime: process.uptime(), timestamp: new Date().toISOString() })
+);
 
-/* ── Debug: list routes on boot (optional; remove later) ──────────────────── */
-function listRoutes(app) {
-  const lines = [];
-  app._router?.stack?.forEach((m) => {
-    if (m.route && m.route.path) {
-      const methods = Object.keys(m.route.methods).join(",").toUpperCase();
-      lines.push(`${methods.padEnd(10)} ${m.route.path}`);
-    } else if (m.name === "router" && m.handle?.stack) {
-      m.handle.stack.forEach((h) => {
-        if (h.route) {
-          const methods = Object.keys(h.route.methods).join(",").toUpperCase();
-          lines.push(`${methods.padEnd(10)} ${m.regexp} -> ${h.route.path}`);
-        }
-      });
-    }
-  });
-  console.log("[ROUTES]\n" + lines.join("\n"));
-}
-listRoutes(app);
+/** Upload (POST /api/upload, GET /api/upload/ping) */
+app.use("/api/upload", uploadRoutes);
 
-/* ── 404 for API ──────────────────────────────────────────────────────────── */
+/** Public/basic routes */
+app.use("/api/auth", authRoutes);
+app.use("/api/movies", moviesRoutes);
+app.use("/api/showtimes", showtimesRoutes);
+app.use("/api/theaters", theatersRouter);
+app.use("/api/tickets", ticketRoutes);
+app.use("/api/bookings", bookingsRoutes);
+app.use("/api/payments", paymentsRoutes);
+
+/** Notifications + prefs (SSE route is /api/notifications/stream) */
+app.use("/api/notifications", notificationsRoutes);
+app.use("/api/notification-prefs", notificationPrefRoutes);
+
+/** Profiles */
+app.use("/api/profile", profileRoutes);
+
+/** Admin (lock the entire namespace) */
+app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
+
+/** ✅ Admin alias for theaters (so frontend can use /api/admin/theaters[...]) */
+app.use("/api/admin/theaters", requireAuth, requireAdmin, theatersRouter);
+
+/** Screens (explicit prefix so paths are unambiguous) */
+app.use("/api/screens", screensRoutes);
+// Optional dual mount during migration (keep only if you need legacy /api/... screen endpoints)
+app.use("/api", screensRoutes);
+
+/** Protected analytics */
+app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
+
+/* ────────────────────────────── 404 FALLTHROUGH ──────────────────────────────── */
 app.use((req, res, next) => {
-  if (req.path.startsWith(API_PREFIX)) return res.status(404).json({ message: "Not Found", path: req.path });
-  next();
+  if (req.path.startsWith("/api")) {
+    return res.status(404).json({ message: "Not Found", path: req.path });
+  }
+  return next();
 });
 
-/* ── Error handler ────────────────────────────────────────────────────────── */
+/* ─────────────────────────────── ERROR HANDLER ───────────────────────────────── */
 app.use((err, req, res, next) => {
   console.error("💥 Uncaught error:", err);
   if (res.headersSent) return next(err);
