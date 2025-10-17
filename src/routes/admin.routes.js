@@ -1,7 +1,8 @@
 // backend/src/routes/admin.routes.js
 import { Router } from "express";
+import bcrypt from "bcryptjs";                 // ⭐ added
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
-import User from "../models/User.js";          // adjust if your user model is named differently
+import User from "../models/User.js";
 import Theater from "../models/Theater.js";
 import Screen from "../models/Screen.js";
 import Showtime from "../models/Showtime.js";
@@ -21,7 +22,6 @@ router.use(requireAuth);
 
 /**
  * GET /api/admin/me
- * Uses req.user._id per your middleware
  */
 router.get("/me", requireAdmin, async (req, res) => {
   try {
@@ -41,7 +41,7 @@ router.get("/me", requireAdmin, async (req, res) => {
 
 /**
  * PUT /api/admin/profile
- * Updates safe fields for the current admin (role check already done)
+ * Updates safe fields for the current admin
  */
 router.put("/profile", requireAdmin, async (req, res) => {
   try {
@@ -64,6 +64,59 @@ router.put("/profile", requireAdmin, async (req, res) => {
   } catch (e) {
     console.error("[Admin] update profile error:", e);
     return res.status(500).json({ message: "Failed to update profile", error: e.message });
+  }
+});
+
+/* ------------------------- CHANGE PASSWORD (NEW) ------------------------- */
+/**
+ * POST /api/admin/change-password
+ * Body: { currentPassword, newPassword }
+ * Notes:
+ * - If your User schema already hashes in a pre('save') hook, setting `user.password = newPassword` is enough.
+ * - If not, we hash here with bcrypt.
+ */
+router.post("/change-password", requireAdmin, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword || String(newPassword).length < 6) {
+      return res.status(400).json({ ok: false, message: "Invalid input" });
+    }
+
+    const id = req.user?._id || req.user?.sub;
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ ok: false, message: "User not found" });
+
+    // Compare current password
+    let isMatch = false;
+
+    // Prefer a model helper if you have one (e.g., user.comparePassword)
+    if (typeof user.comparePassword === "function") {
+      isMatch = await user.comparePassword(currentPassword);
+    } else if (user.password) {
+      isMatch = await bcrypt.compare(currentPassword, user.password);
+    }
+
+    if (!isMatch) {
+      return res.status(400).json({ ok: false, message: "Current password is incorrect" });
+    }
+
+    // Update password (hash via pre-save if present; otherwise hash here)
+    if (user.schema?.paths?.password?.options?.select === false) {
+      // If your schema excludes password by default, ensure it's selected. (Adjust if needed)
+    }
+
+    // If you DON'T have a pre-save hasher:
+    // const salt = await bcrypt.genSalt(10);
+    // user.password = await bcrypt.hash(newPassword, salt);
+
+    // If you DO have a pre-save hasher:
+    user.password = newPassword;
+
+    await user.save();
+    return res.json({ ok: true, message: "Password updated" });
+  } catch (e) {
+    console.error("[Admin] change-password error:", e);
+    return res.status(500).json({ ok: false, message: "Failed to change password" });
   }
 });
 
