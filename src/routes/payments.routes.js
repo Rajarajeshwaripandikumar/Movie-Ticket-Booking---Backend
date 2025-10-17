@@ -8,18 +8,13 @@ import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
-// Express router
 const router = express.Router();
-
-// Log confirmation when module loads
-console.log("🚀 payments.routes.js loaded (enhanced version)");
+console.log("🚀 payments.routes.js loaded (final fixed version)");
 
 // ---------------------------------------------------------------------------
-// Razorpay Initialization (Safe)
+// Razorpay Initialization
 // ---------------------------------------------------------------------------
 let razorpay = null;
 const keyId = process.env.RAZORPAY_KEY_ID;
@@ -40,58 +35,68 @@ if (keyId && keySecret) {
 // ---------------------------------------------------------------------------
 // Health Check Route
 // ---------------------------------------------------------------------------
-router.get("/test", (req, res) => res.send("✅ Payments route active"));
+router.get("/test", (_req, res) => res.send("✅ Payments route active"));
 
 // ---------------------------------------------------------------------------
-// Create Order Route (with support for full amount calculation)
+// Create Order Route
 // ---------------------------------------------------------------------------
 router.post("/create-order", async (req, res) => {
   try {
-    const { amount, base, convFee, gst, currency = "INR" } = req.body;
+    const { amount, base, convFee, gst, currency = "INR", showtimeId } = req.body;
+    console.log("💡 Received /create-order body:", req.body);
 
-    // Compute the total amount safely
+    // -------------------- Compute total safely --------------------
     let total = 0;
-    if (amount) {
-      total = Number(amount);
-    } else if (base) {
-      total = Number(base || 0) + Number(convFee || 0) + Number(gst || 0);
+
+    // Prefer full breakdown if provided
+    if (base !== undefined || convFee !== undefined || gst !== undefined) {
+      total =
+        (Number(base) || 0) +
+        (Number(convFee) || 0) +
+        (Number(gst) || 0);
+      console.log(`🧾 Calculated from breakdown: base=${base}, fee=${convFee}, gst=${gst} => total=${total}`);
+    } else {
+      total = Number(amount) || 0;
+      console.log(`🧾 Using direct amount from client: total=${total}`);
     }
 
+    // Validate
     if (!total || isNaN(total) || total <= 0) {
       return res.status(400).json({ ok: false, error: "Invalid total amount" });
     }
 
-    // Convert to paise (₹373.50 → 37350)
+    // Convert ₹ to paise
     const amountPaise = Math.round(total * 100);
-    console.log(`💰 Creating order for ₹${total.toFixed(2)} (${amountPaise} paise)`);
+    console.log(`💰 Final total for Razorpay: ₹${total.toFixed(2)} (${amountPaise} paise)`);
 
-    // Create real or fake order
-    if (razorpay) {
-      const order = await razorpay.orders.create({
-        amount: amountPaise,
-        currency,
-        receipt: "rcpt_" + Date.now(),
-        payment_capture: 1,
-      });
-
-      console.log("✅ Razorpay Order Created:", order.id);
-      return res.json({
-        ok: true,
-        id: order.id,
-        amount: order.amount,
-        currency: order.currency,
-        total,
-      });
-    } else {
+    // -------------------- Create order --------------------
+    if (!razorpay) {
       const fakeOrder = {
         id: "order_dev_" + Date.now(),
         amount: amountPaise,
         currency,
         total,
       };
-      console.log("⚙️ Returning fake order (dev):", fakeOrder.id);
+      console.log("⚙️ Dev mode: returning fake order", fakeOrder.id);
       return res.json({ ok: true, ...fakeOrder });
     }
+
+    const order = await razorpay.orders.create({
+      amount: amountPaise,
+      currency,
+      receipt: "rcpt_" + Date.now(),
+      notes: { showtimeId, total },
+      payment_capture: 1,
+    });
+
+    console.log("✅ Razorpay Order Created:", order.id);
+    return res.json({
+      ok: true,
+      id: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      total,
+    });
   } catch (err) {
     console.error("[create-order Error]", err?.error || err);
     return res.status(500).json({
@@ -103,7 +108,7 @@ router.post("/create-order", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Verify Payment Route
+// Verify Payment
 // ---------------------------------------------------------------------------
 router.post("/verify-payment", (req, res) => {
   try {
@@ -123,11 +128,10 @@ router.post("/verify-payment", (req, res) => {
       .digest("hex");
 
     if (expected === razorpay_signature) {
-      console.log("✅ Payment verified:", razorpay_order_id);
-      // TODO: Mark order as paid in your DB here
+      console.log("✅ Payment verified successfully:", razorpay_order_id);
       return res.json({ ok: true, message: "Payment verified successfully" });
     } else {
-      console.warn("❌ Invalid signature for order:", razorpay_order_id);
+      console.warn("❌ Invalid Razorpay signature for:", razorpay_order_id);
       return res.status(400).json({ ok: false, message: "Invalid signature" });
     }
   } catch (err) {
