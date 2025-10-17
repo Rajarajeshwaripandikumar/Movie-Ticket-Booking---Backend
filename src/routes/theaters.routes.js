@@ -57,11 +57,18 @@ const safeUnlink = (rel) => {
 /**
  * POST /api/theaters
  * Create new theater (accepts JSON or multipart form)
+ * - Enforces case-insensitive uniqueness on (name, city) via model index
+ * - On 409, returns existing document and cleans up newly uploaded file
  */
 router.post("/", upload.single("image"), async (req, res) => {
+  const cleanupNewUpload = () => {
+    if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+  };
+
   try {
     const { name, address = "", city, amenities = "", screens = 1 } = req.body;
     if (!name || !city) {
+      cleanupNewUpload();
       return res.status(400).json({ error: "Name and city are required" });
     }
 
@@ -71,12 +78,10 @@ router.post("/", upload.single("image"), async (req, res) => {
     const parsedAmenities = Array.isArray(amenities)
       ? amenities.map((a) => String(a).trim()).filter(Boolean)
       : typeof amenities === "string"
-      ? amenities
-          .split(",")
-          .map((a) => a.trim())
-          .filter(Boolean)
+      ? amenities.split(",").map((a) => a.trim()).filter(Boolean)
       : [];
 
+    // Attempt create (unique index will catch conflicts)
     const theater = await Theater.create({
       name: String(name).trim(),
       address: String(address).trim(),
@@ -88,19 +93,33 @@ router.post("/", upload.single("image"), async (req, res) => {
       screens: Number(screens) || 1,
     });
 
-    res.status(201).json({ ok: true, data: theater });
+    return res.status(201).json({ ok: true, data: theater });
   } catch (err) {
+    // Duplicate key => return existing doc so UI can prefill
     if (err?.code === 11000) {
-      return res.status(409).json({ error: "Theater with this name & city already exists" });
+      // remove the newly uploaded file to avoid orphan files
+      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+
+      const nameLower = (req.body?.name || "").trim().toLowerCase();
+      const cityLower = (req.body?.city || "").trim().toLowerCase();
+      const existing = await Theater.findOne({ nameLower, cityLower }).lean();
+
+      return res.status(409).json({
+        error: "Theater with this name & city already exists",
+        existingId: existing?._id,
+        data: existing || null,
+      });
     }
     console.error("[Theaters] POST / error:", err);
-    res.status(500).json({ error: "Failed to create theater" });
+    if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+    return res.status(500).json({ error: "Failed to create theater" });
   }
 });
 
 /**
  * PUT /api/theaters/:id
  * Update theater; deletes old image if replaced
+ * - pre('save') on model will keep lower fields in sync
  */
 router.put("/:id", upload.single("image"), async (req, res) => {
   try {
@@ -126,27 +145,29 @@ router.put("/:id", upload.single("image"), async (req, res) => {
         : Array.isArray(amenities)
         ? amenities.map((a) => String(a).trim()).filter(Boolean)
         : typeof amenities === "string"
-        ? amenities
-            .split(",")
-            .map((a) => a.trim())
-            .filter(Boolean)
+        ? amenities.split(",").map((a) => a.trim()).filter(Boolean)
         : existing.amenities;
 
-    existing.name = name ?? existing.name;
-    existing.address = address ?? existing.address;
-    existing.city = city ?? existing.city;
+    if (name !== undefined) existing.name = String(name);
+    if (address !== undefined) existing.address = String(address);
+    if (city !== undefined) existing.city = String(city);
     existing.amenities = parsedAmenities;
+
     if (imageUrl) {
       existing.imageUrl = imageUrl;
       existing.posterUrl = imageUrl;
       existing.theaterImage = imageUrl;
     }
 
-    const saved = await existing.save();
-    res.json({ ok: true, data: saved });
+    const saved = await existing.save(); // pre('save') updates lowers
+    return res.json({ ok: true, data: saved });
   } catch (err) {
+    // If user tries to rename to a duplicate name+city
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: "Another theater with same name & city exists." });
+    }
     console.error("[Theaters] PUT /:id error:", err);
-    res.status(500).json({ error: "Failed to update theater" });
+    return res.status(500).json({ error: "Failed to update theater" });
   }
 });
 
@@ -178,6 +199,7 @@ router.delete("/:id", async (req, res) => {
 /**
  * GET /api/theaters
  * Paginated, newest-first list with city list and screen counts
+ * - Adds exact filters by name & city (case-insensitive) for duplicate pre-checks
  */
 router.get("/", async (req, res) => {
   try {
@@ -186,9 +208,9 @@ router.get("/", async (req, res) => {
     res.set("Pragma", "no-cache");
     res.set("Expires", "0");
 
-    const { q, city, page = 1, limit = 12 } = req.query;
-    const filter = {};
+    const { q, city, name, page = 1, limit = 12 } = req.query;
 
+    const filter = {};
     if (q) {
       filter.$or = [
         { name: new RegExp(q, "i") },
@@ -196,7 +218,14 @@ router.get("/", async (req, res) => {
         { address: new RegExp(q, "i") },
       ];
     }
+
     if (city && city !== "All") filter.city = city;
+
+    // Exact match filters (used by frontend pre-check)
+    if (name) filter.nameLower = String(name).trim().toLowerCase();
+    if (city && city !== "All") {
+      filter.cityLower = String(city).trim().toLowerCase();
+    }
 
     const safeLimit = Math.min(Number(limit) || 12, 1000);
     const safePage = Math.max(Number(page) || 1, 1);
