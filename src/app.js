@@ -9,6 +9,9 @@ import morgan from "morgan";
 
 // routes
 import authRoutes from "./routes/auth.routes.js";
+// + add this import with your other route imports
+import uploadRoutes from "./routes/upload.routes.js";
+
 import moviesRoutes from "./routes/movies.routes.js";
 import showtimesRoutes from "./routes/showtimes.routes.js";
 import bookingsRoutes from "./routes/bookings.routes.js";
