@@ -6,11 +6,11 @@ import path from "path";
 
 const router = express.Router();
 
-/* ───────────────────────────── uploads directory ───────────────────────────── */
+/* ── Ensure uploads dir ────────────────────────────────────────────────────── */
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-/* ──────────────────────────────── multer setup ─────────────────────────────── */
+/* ── Multer setup ──────────────────────────────────────────────────────────── */
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, UPLOAD_DIR),
   filename: (_, file, cb) => {
@@ -24,8 +24,10 @@ const storage = multer.diskStorage({
 });
 
 const ALLOWED = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
-const fileFilter = (_, file, cb) =>
-  cb(ALLOWED.has(file.mimetype) ? null : new Error("Only JPG/PNG/WEBP/GIF allowed"));
+const fileFilter = (_, file, cb) => {
+  if (!ALLOWED.has(file.mimetype)) return cb(new Error("Only JPG/PNG/WEBP/GIF allowed"));
+  cb(null, true);
+};
 
 const upload = multer({
   storage,
@@ -33,33 +35,18 @@ const upload = multer({
   limits: { fileSize: 3 * 1024 * 1024 }, // 3MB
 });
 
-/* ────────────────────────────────── routes ─────────────────────────────────── */
-
-// Simple ping to confirm the router is mounted
+/* ── Routes ───────────────────────────────────────────────────────────────── */
 router.get("/ping", (_req, res) => res.json({ ok: true, where: "upload" }));
 
-// POST /api/upload  (expects FormData field "image")
-// Returns a *relative* URL that your frontend can resolve via FILES_BASE.
-router.post("/", (req, res, next) => {
+// POST /api/upload  => { url: "/uploads/<file>" }
+router.post("/", (req, res) => {
   upload.single("image")(req, res, (err) => {
-    if (err instanceof multer.MulterError) {
-      // Multer-specific errors (e.g., file too large)
-      if (err.code === "LIMIT_FILE_SIZE") {
-        return res.status(413).json({ error: "Max file size is 3MB" });
-      }
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "Max file size is 3MB" });
       return res.status(400).json({ error: err.message || "Upload error" });
     }
-    if (err) {
-      // Validation errors from fileFilter, etc.
-      return res.status(400).json({ error: err.message || "Invalid file" });
-    }
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    // Return a relative URL. Example: /uploads/1699999999999-photo.webp
-    const url = `/uploads/${req.file.filename}`;
-    return res.status(201).json({ url });
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    return res.status(201).json({ url: `/uploads/${req.file.filename}` });
   });
 });
 
