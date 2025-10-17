@@ -1,4 +1,4 @@
-// src/app.js
+// backend/src/app.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -36,7 +36,7 @@ app.set("trust proxy", 1); // needed on Render / Nginx / AWS ELB setups
 app.use(
   helmet({
     crossOriginResourcePolicy: false, // allow serving /uploads to other origins
-    contentSecurityPolicy: false,     // loosened for frontend asset compatibility
+    contentSecurityPolicy: false,     // relax CSP; tighten in prod if you can
   })
 );
 
@@ -45,7 +45,7 @@ const DEV_ORIGINS = [
   process.env.APP_ORIGIN || "http://localhost:5173",
   "http://127.0.0.1:5173",
   ...(process.env.APP_ORIGINS
-    ? process.env.APP_ORIGINS.split(",").map(s => s.trim()).filter(Boolean)
+    ? process.env.APP_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
     : []),
 ];
 
@@ -85,15 +85,15 @@ app.use((req, _res, next) => {
 });
 
 /* ─────────────────────────────────── ROUTES ──────────────────────────────────── */
-/** Health */
-app.get("/api/health", (_, res) =>
+// Health
+app.get("/api/health", (_req, res) =>
   res.json({ ok: true, uptime: process.uptime(), timestamp: new Date().toISOString() })
 );
 
-/** Upload (POST /api/upload, GET /api/upload/ping) */
+// Uploads
 app.use("/api/upload", uploadRoutes);
 
-/** Public/basic routes */
+// Public/basic routes
 app.use("/api/auth", authRoutes);
 app.use("/api/movies", moviesRoutes);
 app.use("/api/showtimes", showtimesRoutes);
@@ -102,25 +102,24 @@ app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
 
-/** Notifications + prefs (SSE route: /api/notifications/stream) */
+// Notifications + prefs (SSE route: /api/notifications/stream)
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/notification-prefs", notificationPrefRoutes);
 
-/** Profiles */
+// Profiles
 app.use("/api/profile", profileRoutes);
 
-/** Admin routes (locked down with auth + admin check) */
+// Admin routes (locked down)
 app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
 
-/** ✅ Admin alias for theaters for frontend convenience (/api/admin/theaters/...) */
+// Admin alias for theaters
 app.use("/api/admin/theaters", requireAuth, requireAdmin, theatersRouter);
 
-/** Screens (explicit prefix for clarity) */
+// Screens (explicit prefix + optional legacy dual-mount)
 app.use("/api/screens", screensRoutes);
-// Optional dual mount for legacy /api/... screen endpoints
 app.use("/api", screensRoutes);
 
-/** Protected analytics */
+// Protected analytics
 app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
 
 /* ────────────────────────────── 404 FALLTHROUGH ──────────────────────────────── */
