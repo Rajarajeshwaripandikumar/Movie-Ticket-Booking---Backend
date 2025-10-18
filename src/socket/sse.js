@@ -56,6 +56,33 @@ function extractToken(req) {
   return { token, authHeader, cookies };
 }
 
+/** Sanitize a JWT string pulled from header/query/cookie.
+ *  - trims, decodeURIComponent, strips common accidental suffixes like ":1"
+ *  - validates it has 3 dot-separated segments (simple sanity)
+ */
+function sanitizeToken(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  let t = raw.trim();
+
+  // URL-decode (safe guard if token was placed into query string)
+  try {
+    t = decodeURIComponent(t);
+  } catch (e) {
+    // ignore decode errors (leave t as-is)
+  }
+
+  // Defensive: strip trailing colon-digit (":1") or common accidental suffixes
+  if ((t.match(/\./g) || []).length !== 2) {
+    t = t.replace(/:\d+$/, ""); // strip :1, :0, etc
+    // remove characters that are unlikely to belong in a base64url token
+    t = t.replace(/[^\w\-_.=]/g, "");
+  }
+
+  // final sanity: expect exactly 2 dots (3 parts)
+  if ((t.match(/\./g) || []).length !== 2) return null;
+  return t;
+}
+
 function roleFromDecoded(decoded) {
   const r =
     decoded?.role ||
@@ -64,6 +91,8 @@ function roleFromDecoded(decoded) {
   return String(r).toUpperCase().includes("ADMIN") ? "ADMIN" : "USER";
 }
 
+// global in-process store of SSE clients (Map<channel, Set<res>>)
+// NOTE: this is per-process. For multi-process deployments use Redis/pubsub
 global.sseClients = global.sseClients || new Map();
 
 /** CORS preflight kept as you had it */
@@ -76,27 +105,63 @@ export const ssePreflight = (req, res) => {
 
 export const sseHandler = async (req, res) => {
   try {
-    const { token, authHeader, cookies } = extractToken(req);
+    const { token: rawToken, authHeader, cookies } = extractToken(req);
+    const token = sanitizeToken(rawToken);
 
     // Dev debug
-    console.log("SSE: URL:", req.originalUrl, "Auth header?", Boolean(authHeader), "cookieKeys:", Object.keys(cookies), "token?", Boolean(token));
+    console.log(
+      "SSE: URL:",
+      req.originalUrl,
+      "Auth header?",
+      Boolean(authHeader),
+      "cookieKeys:",
+      Object.keys(cookies),
+      "token present?",
+      Boolean(token),
+      "rawTokenLen:",
+      rawToken ? rawToken.length : 0,
+      "sanitizedLen:",
+      token ? token.length : 0
+    );
 
-    if (!token) return res.status(401).json({ message: "Unauthorized: missing token" });
+    if (!token) {
+      // If SSE headers are not yet sent, return a plain-text 401 to avoid client-side EventSource confusing JSON bodies.
+      if (!res.headersSent) {
+        res.status(401).type("text").send("Unauthorized: missing token");
+      } else {
+        sseWrite(res, { event: "error", data: { message: "Unauthorized: missing token" } });
+        res.end();
+      }
+      return;
+    }
 
     let decoded;
     try {
-      // tighten verification: optionally restrict algorithms if you use HS256 only
+      // tighten verification: restrict algorithms if you use HS256 only
       decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], ignoreExpiration: false });
     } catch (err) {
-      console.error("❌ Invalid JWT in SSE:", err.message);
-      return res.status(401).json({ message: "Unauthorized: invalid token" });
+      console.error("❌ Invalid JWT in SSE:", err.name, err.message);
+      if (!res.headersSent) {
+        res.status(401).type("text").send(`Unauthorized: invalid token (${err.name})`);
+      } else {
+        sseWrite(res, { event: "error", data: { message: "Unauthorized: invalid token", detail: err.message } });
+        res.end();
+      }
+      return;
     }
 
     const userId = String(decoded._id || decoded.id || decoded.userId || "");
     if (!userId) {
       console.error("❌ JWT missing user id field:", decoded);
-      return res.status(401).json({ message: "Unauthorized: invalid payload" });
+      if (!res.headersSent) {
+        res.status(401).type("text").send("Unauthorized: invalid payload");
+      } else {
+        sseWrite(res, { event: "error", data: { message: "Unauthorized: invalid payload" } });
+        res.end();
+      }
+      return;
     }
+
     const role = roleFromDecoded(decoded);
     const isAdmin = role === "ADMIN";
 
@@ -110,7 +175,7 @@ export const sseHandler = async (req, res) => {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    // notify client how long to retry (ms)
+    // optionally advertise retry to client (ms)
     res.write("retry: 10000\n\n");
     res.flushHeaders?.();
 
@@ -134,12 +199,22 @@ export const sseHandler = async (req, res) => {
 
     // INIT: send recent items (trim projection to keep size reasonable)
     const limit = Math.min(Number(req.query?.limit) || 20, 100);
-    const or = channel === "admin" ? [{ audience: "ADMIN" }, { audience: "ALL" }] : [{ user: userId, $or: [{ audience: { $exists: false } }, { audience: null }, { audience: "USER" }] }, { audience: "ALL" }];
-    const initial = await Notification.find({ $or: or })
-      .select("-__v") // drop mongoose version field
-      .sort({ createdAt: -1 }) // most recent first
-      .limit(limit)
-      .lean();
+    const or =
+      channel === "admin"
+        ? [{ audience: "ADMIN" }, { audience: "ALL" }]
+        : [
+            { user: userId, $or: [{ audience: { $exists: false } }, { audience: null }, { audience: "USER" }] },
+            { audience: "ALL" },
+          ];
+
+    let initial = [];
+    try {
+      initial = await Notification.find({ $or: or }).select("-__v").sort({ createdAt: -1 }).limit(limit).lean();
+    } catch (err) {
+      // If DB read fails, send a small error event but keep the stream open
+      console.error("SSE: failed to load initial notifications:", err && err.message);
+      sseWrite(res, { event: "error", data: { message: "init_load_failed" } });
+    }
 
     sseWrite(res, { event: "init", data: { notifications: initial } });
 
@@ -159,7 +234,9 @@ export const sseHandler = async (req, res) => {
         bucket.delete(res);
         if (bucket.size === 0) global.sseClients.delete(channel);
       }
-      console.log(`❌ SSE disconnected for channel: ${channel} (remaining=${global.sseClients.get(channel)?.size ?? 0})`);
+      console.log(
+        `❌ SSE disconnected for channel: ${channel} (remaining=${global.sseClients.get(channel)?.size ?? 0})`
+      );
     };
 
     req.on("close", cleanup);
@@ -173,8 +250,9 @@ export const sseHandler = async (req, res) => {
     // Optionally handle Last-Event-ID from client to resume (req.headers['last-event-id'])
     // const lastEventId = req.headers["last-event-id"] || req.query.lastEventId;
 
+    // DO NOT end the response here; keep it open for streaming
   } catch (err) {
-    console.error("SSE handler error:", err);
+    console.error("SSE handler error:", err && err.message);
     if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
   }
 };
@@ -240,7 +318,7 @@ export const pushNotification = (doc) => {
  *   pushNotification(doc);
  * });
  *
- * // 2) Or use change streams (if you run a replica set / production Mongo)
+ * // 2) Or use change streams (if you run a replica set / atlas).
  * const changeStream = Notification.watch();
  * changeStream.on("change", (change) => {
  *   if (change.operationType === "insert") {
@@ -251,3 +329,4 @@ export const pushNotification = (doc) => {
  *
  * Note: change streams require a replica set (or atlas).
  */
+
