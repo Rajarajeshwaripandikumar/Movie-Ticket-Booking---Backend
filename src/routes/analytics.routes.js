@@ -44,7 +44,23 @@ const router = Router();
 /* ------------------------------ helpers ------------------------------ */
 
 // robust amount expression (supports totalAmount or amount, default 0)
-const AMOUNT_EXPR = { $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }] };
+// Uses $isNumber for safe numeric detection, falls back to $toDouble on strings
+const AMOUNT_SAFE = {
+  $ifNull: [
+    {
+      $switch: {
+        branches: [
+          { case: { $isNumber: "$totalAmount" }, then: "$totalAmount" },
+          { case: { $isNumber: "$amount" }, then: "$amount" },
+        ],
+        default: {
+          $toDouble: { $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }] },
+        },
+      },
+    },
+    0,
+  ],
+};
 
 // robust showtime reference
 const SHOWTIME_ID = { $ifNull: ["$showtime", "$showtimeId"] };
@@ -61,7 +77,6 @@ const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
 /**
  * group-by-day using $dateToString to produce a YYYY-MM-DD string.
  * This avoids using $function or server-side JS and is supported on Atlas M0/M2/M5 tiers.
- * The frontend expects `date` to be sliceable (ISO-like), so YYYY-MM-DD works well.
  */
 const dayProject = [
   {
@@ -80,7 +95,15 @@ router.get("/", async (req, res, next) => {
     const days = Number(req.query.days || 7);
     const since = toPast(days);
 
-    /* -------- Daily Revenue (confirmed/paid) -------- */
+    // quick debug: how many bookings exist since 'since'?
+    const matchBase = { createdAt: { $gte: since } };
+    const totalBookingsSince = await Booking.countDocuments(matchBase).catch((e) => {
+      debug("countDocuments error:", e && e.message);
+      return 0;
+    });
+    debug(`Analytics: bookings since ${since.toISOString()}: ${totalBookingsSince}`);
+
+    /* -------- Daily Revenue (confirmed/paid) -- defensive cast for numeric strings -------- */
     const revenue = await Booking.aggregate([
       {
         $match: {
@@ -89,15 +112,18 @@ router.get("/", async (req, res, next) => {
         },
       },
       ...dayProject,
+      { $addFields: { __amount_safe: AMOUNT_SAFE } },
       {
         $group: {
           _id: "$_d",
-          total: { $sum: AMOUNT_EXPR },
+          total: { $sum: "$__amount_safe" },
+          bookings: { $sum: 1 },
         },
       },
       { $sort: { _id: 1 } },
-      { $project: { _id: 0, date: "$_id", total: 1 } },
+      { $project: { _id: 0, date: "$_id", total: 1, bookings: 1 } },
     ]);
+    debug("Revenue aggregation results sample:", revenue.slice(0, 5));
 
     /* -------- Daily Active Users -------- */
     const users = await Booking.aggregate([
@@ -107,6 +133,7 @@ router.get("/", async (req, res, next) => {
       { $project: { _id: 0, date: "$_id", count: { $size: "$users" } } },
       { $sort: { date: 1 } },
     ]);
+    debug("Users aggregation sample:", users.slice(0, 5));
 
     /* -------- Theater Occupancy (average) --------
        booked seats from bookings vs total seats in showtime.seats (array length)  */
@@ -143,7 +170,7 @@ router.get("/", async (req, res, next) => {
           as: "t",
         },
       },
-      { $unwind: "$t" },
+      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
       {
         $group: {
           _id: "$t.name",
@@ -157,6 +184,7 @@ router.get("/", async (req, res, next) => {
       { $project: { _id: 0, theater: "$_id", avgOccupancy: 1 } },
       { $sort: { avgOccupancy: -1 } },
     ]);
+    debug("Occupancy sample:", occupancy.slice(0, 5));
 
     /* -------- Popular Movies (bookings + revenue) -------- */
     const popularMovies = await Booking.aggregate([
@@ -165,7 +193,7 @@ router.get("/", async (req, res, next) => {
         $group: {
           _id: MOVIE_ID,
           bookings: { $sum: 1 },
-          revenue: { $sum: AMOUNT_EXPR },
+          revenue: { $sum: AMOUNT_SAFE },
         },
       },
       { $sort: { bookings: -1 } },
@@ -173,8 +201,21 @@ router.get("/", async (req, res, next) => {
       {
         $lookup: {
           from: "movies",
-          localField: "_id",
-          foreignField: "_id",
+          let: { mid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$mid"] }, // ObjectId equality
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] }, // movie._id string vs booking._id string
+                    { $eq: [{ $toString: "$$mid" }, { $toString: "$_id" }] }, // fallback
+                  ],
+                },
+              },
+            },
+            { $project: { title: 1 } },
+          ],
           as: "movie",
         },
       },
@@ -188,9 +229,19 @@ router.get("/", async (req, res, next) => {
         },
       },
     ]);
+    debug("Popular movies:", popularMovies);
 
-    res.json({ ok: true, revenue, users, occupancy, popularMovies });
+    // final response with safe default values
+    res.json({
+      ok: true,
+      revenue: revenue || [],
+      users: users || [],
+      occupancy: occupancy || [],
+      popularMovies: popularMovies || [],
+      debug: { totalBookingsSince }, // remove in production
+    });
   } catch (err) {
+    debug("Analytics error:", err && (err.stack || err.message));
     next(err);
   }
 });
@@ -204,12 +255,16 @@ router.get("/revenue/trends", async (req, res, next) => {
     const data = await Booking.aggregate([
       { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
       ...dayProject,
-      { $group: { _id: "$_d", totalRevenue: { $sum: AMOUNT_EXPR }, bookings: { $sum: 1 } } },
+      { $addFields: { __amount_safe: AMOUNT_SAFE } },
+      { $group: { _id: "$_d", totalRevenue: { $sum: "$__amount_safe" }, bookings: { $sum: 1 } } },
       { $sort: { _id: 1 } },
       { $project: { date: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
     ]);
     res.json(data);
-  } catch (e) { next(e); }
+  } catch (e) {
+    debug("revenue/trends error:", e && e.message);
+    next(e);
+  }
 });
 
 // 2) Popular movies
@@ -219,7 +274,7 @@ router.get("/movies/popular", async (req, res, next) => {
     const limit = Number(req.query.limit || 10);
     const data = await Booking.aggregate([
       { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
-      { $group: { _id: MOVIE_ID, totalBookings: { $sum: 1 }, totalRevenue: { $sum: AMOUNT_EXPR } } },
+      { $group: { _id: MOVIE_ID, totalBookings: { $sum: 1 }, totalRevenue: { $sum: AMOUNT_SAFE } } },
       { $sort: { totalBookings: -1 } },
       { $limit: limit },
       { $lookup: { from: "movies", localField: "_id", foreignField: "_id", as: "m" } },
@@ -227,7 +282,10 @@ router.get("/movies/popular", async (req, res, next) => {
       { $project: { _id: 0, movieId: "$_id", movieName: { $ifNull: ["$m.title", "Unknown"] }, totalBookings: 1, totalRevenue: 1 } },
     ]);
     res.json(data);
-  } catch (e) { next(e); }
+  } catch (e) {
+    debug("movies/popular error:", e && e.message);
+    next(e);
+  }
 });
 
 // 3) Theater occupancy
@@ -268,7 +326,10 @@ router.get("/occupancy", async (req, res, next) => {
       { $sort: { occupancyRate: -1 } },
     ]);
     res.json(data);
-  } catch (e) { next(e); }
+  } catch (e) {
+    debug("occupancy error:", e && e.message);
+    next(e);
+  }
 });
 
 // 4) Bookings by hour
@@ -283,7 +344,10 @@ router.get("/bookings/by-hour", async (req, res, next) => {
       { $sort: { dow: 1, hour: 1 } },
     ]);
     res.json(data);
-  } catch (e) { next(e); }
+  } catch (e) {
+    debug("bookings/by-hour error:", e && e.message);
+    next(e);
+  }
 });
 
 // 5) Active users
@@ -298,7 +362,10 @@ router.get("/users/active", async (req, res, next) => {
       { $sort: { date: 1 } },
     ]);
     res.json(data);
-  } catch (e) { next(e); }
+  } catch (e) {
+    debug("users/active error:", e && e.message);
+    next(e);
+  }
 });
 
 // 6) Bookings summary
@@ -313,14 +380,17 @@ router.get("/bookings/summary", async (req, res, next) => {
           _id: "$_d",
           confirmed: { $sum: { $cond: [{ $in: ["$status", ["CONFIRMED", "PAID"]] }, 1, 0] } },
           cancelled: { $sum: { $cond: [{ $eq: ["$status", "CANCELLED"] }, 1, 0] } },
-          revenue: { $sum: { $cond: [{ $in: ["$status", ["CONFIRMED", "PAID"]] }, AMOUNT_EXPR, 0] } },
+          revenue: { $sum: { $cond: [{ $in: ["$status", ["CONFIRMED", "PAID"]] }, AMOUNT_SAFE, 0] } },
         },
       },
       { $sort: { _id: 1 } },
       { $project: { _id: 0, date: "$_id", confirmed: 1, cancelled: 1, revenue: 1 } },
     ]);
     res.json(data);
-  } catch (e) { next(e); }
+  } catch (e) {
+    debug("bookings/summary error:", e && e.message);
+    next(e);
+  }
 });
 
 /* ------------------------------- SSE /stream ------------------------------- */
