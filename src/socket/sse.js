@@ -4,17 +4,19 @@ import mongoose from "mongoose";
 import debugFactory from "debug";
 const debug = debugFactory("app:sse");
 
+/* ----------------------------- config ------------------------------ */
 const JWT_SECRET = process.env.JWT_SECRET || process.env.JWT_SECRET_BASE64 || "dev_jwt_secret_change_me";
-const APP_ORIGIN = process.env.APP_ORIGIN || "*";
+const APP_ORIGIN = process.env.APP_ORIGIN || "*"; // set to your frontend origin in production
 const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
 const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
 
+/* -------------------------- helpers / safe writes ------------------- */
 function sseWriteRaw(res, str) {
   try {
     if (!res || res.writableEnded || res.destroyed) return false;
     res.write(str);
     return true;
-  } catch {
+  } catch (err) {
     return false;
   }
 }
@@ -22,9 +24,15 @@ function sseWrite(res, { event, id, data }) {
   if (!res || res.writableEnded || res.destroyed) return false;
   if (event) sseWriteRaw(res, `event: ${event}\n`);
   if (id) sseWriteRaw(res, `id: ${id}\n`);
-  try { sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`); } catch (e) { sseWriteRaw(res, `data: ${JSON.stringify({ error: "stringify_failed", raw: String(data) })}\n\n`); }
+  try {
+    sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
+  } catch (err) {
+    sseWriteRaw(res, `data: ${JSON.stringify({ error: "stringify_failed", raw: String(data) })}\n\n`);
+  }
   return true;
 }
+
+/* --------------------------- token extraction ---------------------- */
 function parseCookie(header) {
   const out = {};
   if (!header) return out;
@@ -42,23 +50,38 @@ function extractToken(req) {
   if (!token && cookies.token) token = cookies.token;
   if (!token && cookies.access_token) token = cookies.access_token;
   if (!token && cookies.jwt) token = cookies.jwt;
+  // try last-event-id style or URL-embedded token (defensive)
+  if (!token && req.originalUrl) {
+    try {
+      const full = new URL(req.originalUrl, `http://${req.headers.host}`);
+      const qp = full.searchParams.get("token");
+      if (qp) token = qp;
+    } catch {}
+  }
   return { token: token ? String(token) : null, authHeader, cookies };
 }
 function sanitizeToken(raw) {
   if (!raw || typeof raw !== "string") return null;
   let t = raw.trim();
   try { t = decodeURIComponent(t); } catch {}
-  t = t.replace(/:\d+$/, "");
+  t = t.replace(/:\d+$/, ""); // strip accidental :1 suffix
   if ((t.match(/\./g) || []).length !== 2) return null;
   return t;
 }
 function roleFromDecoded(decoded) {
-  const r = decoded?.role || (Array.isArray(decoded?.roles) && decoded.roles.find((x) => String(x).toUpperCase().includes("ADMIN"))) || decoded?.roleName || "USER";
+  const r =
+    decoded?.role ||
+    (Array.isArray(decoded?.roles) && decoded.roles.find((x) => String(x).toUpperCase().includes("ADMIN"))) ||
+    decoded?.roleName ||
+    "USER";
   return String(r).toUpperCase().includes("ADMIN") ? "ADMIN" : "USER";
 }
 
+/* ----------------------- in-process client store ------------------- */
+// Map<channelKey, Set<res>>
 global.sseClients = global.sseClients || new Map();
 
+/* -------------------------- CORS preflight ------------------------- */
 export const ssePreflight = (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
   res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -66,15 +89,17 @@ export const ssePreflight = (req, res) => {
   res.status(204).end();
 };
 
+/* -------------------------- SSE handler --------------------------- */
 export const sseHandler = async (req, res) => {
   try {
     const { token: rawToken, cookies } = extractToken(req);
     const token = sanitizeToken(rawToken);
 
-    debug("SSE attempt", { url: req.originalUrl, tokenPresent: Boolean(token), cookieKeys: Object.keys(cookies) });
+    debug("SSE connection attempt", { url: req.originalUrl, hasAuthHeader: Boolean(req.headers.authorization), hasToken: Boolean(token) });
 
     if (!token) {
-      res.status(401).type("text").send("Unauthorized: missing token (use ?token= or Bearer header or cookie)");
+      // return a simple text 401 (EventSource expects non-200 to indicate failure)
+      res.status(401).type("text").send("Unauthorized: missing token (provide ?token= or Bearer header or cookie)");
       return;
     }
 
@@ -99,37 +124,48 @@ export const sseHandler = async (req, res) => {
     const scope = String(req.query?.scope || "user").toLowerCase();
     const channel = isAdmin && scope === "admin" ? "admin" : userId;
 
+    // SSE headers
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
     res.setHeader("Access-Control-Allow-Credentials", "true");
+    // retry hint for clients
     res.write("retry: 10000\n\n");
     res.flushHeaders?.();
 
+    // enforce soft cap per user/channel
     const current = global.sseClients.get(channel) || new Set();
     if (current.size >= MAX_CLIENTS_PER_USER) {
       sseWrite(res, { event: "error", data: { message: "too_many_connections" } });
       return res.end();
     }
 
+    // register client
     current.add(res);
     global.sseClients.set(channel, current);
-    debug(`SSE connected channel=${channel} clients=${current.size}`);
+    debug(`🔗 SSE connection established for channel: ${channel} (clients=${current.size})`);
 
+    // helper aliveness check
     res._isSseAlive = () => !res.writableEnded && !res.destroyed;
 
+    // send connected event
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-    // Try to load Notification model if exists
+    // INIT payload: attempt to load recent notifications (if model exists)
     let Notification = null;
     try {
       Notification = mongoose.models.Notification || (await import("../models/Notification.js").then((m) => m.default)).model || mongoose.model("Notification");
-    } catch { Notification = null; }
+    } catch (err) {
+      Notification = null;
+    }
     if (Notification) {
       try {
         const limit = Math.min(Number(req.query?.limit) || 20, 100);
-        const or = channel === "admin" ? [{ audience: "ADMIN" }, { audience: "ALL" }] : [{ user: userId }, { audience: "ALL" }];
+        const or =
+          channel === "admin"
+            ? [{ audience: "ADMIN" }, { audience: "ALL" }]
+            : [{ user: userId }, { audience: "ALL" }];
         const initial = await Notification.find({ $or: or }).sort({ createdAt: -1 }).limit(limit).lean();
         sseWrite(res, { event: "init", data: { notifications: initial } });
       } catch (err) {
@@ -139,29 +175,39 @@ export const sseHandler = async (req, res) => {
       sseWrite(res, { event: "init", data: { message: "init_ok", notificationsModel: false } });
     }
 
+    // heartbeat (comment: keep short enough to detect dead sockets)
     const ping = setInterval(() => {
       if (!res._isSseAlive()) return;
       sseWriteRaw(res, `: heartbeat ${Date.now()}\n\n`);
     }, HEARTBEAT_MS);
 
+    // cleanup on close/error
     const cleanup = () => {
-      clearInterval(ping);
+      try { clearInterval(ping); } catch {}
       const bucket = global.sseClients.get(channel);
-      if (bucket) { bucket.delete(res); if (bucket.size === 0) global.sseClients.delete(channel); }
-      debug(`SSE disconnected channel=${channel} remaining=${global.sseClients.get(channel)?.size ?? 0}`);
+      if (bucket) {
+        bucket.delete(res);
+        if (bucket.size === 0) global.sseClients.delete(channel);
+      }
+      debug(`❌ SSE disconnected for channel: ${channel} (remaining=${global.sseClients.get(channel)?.size ?? 0})`);
     };
 
     req.on("close", cleanup);
     req.on("end", cleanup);
-    res.on("error", (err) => { debug("SSE socket error", err && err.message); cleanup(); });
+    res.on("error", (err) => {
+      debug("SSE socket error:", err && err.message);
+      cleanup();
+    });
 
+    // keep the response open
     return;
   } catch (err) {
-    debug("sseHandler error", err && err.message);
+    debug("sseHandler error:", err && err.message);
     if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
   }
 };
 
+/* ------------------------ push helpers ------------------------------ */
 function pushToChannel(channelKey, payload, { eventName } = {}) {
   const set = global.sseClients.get(String(channelKey));
   if (!set || set.size === 0) return 0;
@@ -171,9 +217,12 @@ function pushToChannel(channelKey, payload, { eventName } = {}) {
   for (const res of Array.from(set)) {
     try {
       const ok = sseWrite(res, { event, id, data: payload });
-      if (!ok) { set.delete(res); continue; }
+      if (!ok) {
+        set.delete(res);
+        continue;
+      }
       delivered++;
-    } catch {
+    } catch (err) {
       set.delete(res);
     }
   }
@@ -183,6 +232,7 @@ function pushToChannel(channelKey, payload, { eventName } = {}) {
 export const pushToUser = (userId, payload, opts = {}) => pushToChannel(String(userId), payload, opts);
 export const pushToAdmins = (payload, opts = {}) => pushToChannel("admin", payload, opts);
 
+/* push Notification helper (accepts mongoose doc or POJO) */
 export const pushNotification = (doc) => {
   if (!doc) return 0;
   const payload = doc.toObject ? doc.toObject() : doc;
@@ -197,8 +247,10 @@ export const pushNotification = (doc) => {
   return 0;
 };
 
+/* ------------------ analytics snapshot emitter ---------------------- */
 export async function emitAnalyticsSnapshot(options = {}) {
   try {
+    // attempt to load models (fallback permissive)
     let Booking = mongoose.models.Booking;
     let Showtime = mongoose.models.Showtime;
     let Theater = mongoose.models.Theater;
@@ -215,7 +267,10 @@ export async function emitAnalyticsSnapshot(options = {}) {
       $ifNull: [
         {
           $switch: {
-            branches: [{ case: { $isNumber: "$totalAmount" }, then: "$totalAmount" }, { case: { $isNumber: "$amount" }, then: "$amount" }],
+            branches: [
+              { case: { $isNumber: "$totalAmount" }, then: "$totalAmount" },
+              { case: { $isNumber: "$amount" }, then: "$amount" },
+            ],
             default: { $toDouble: { $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }] } },
           },
         },
@@ -232,7 +287,10 @@ export async function emitAnalyticsSnapshot(options = {}) {
       { $group: { _id: "$_d", totalRevenue: { $sum: "$__amount_safe" }, bookings: { $sum: 1 } } },
       { $sort: { _id: 1 } },
       { $project: { date: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
-    ]).catch((e) => { debug("revenue aggregate failed", e && e.message); return []; });
+    ]).catch((e) => {
+      debug("revenue aggregate failed", e && e.message);
+      return [];
+    });
 
     const users = await Booking.aggregate([
       { $match: { createdAt: { $gte: since } } },
@@ -240,30 +298,75 @@ export async function emitAnalyticsSnapshot(options = {}) {
       { $group: { _id: "$_d", users: { $addToSet: { $ifNull: ["$user", "$userId"] } } } },
       { $project: { date: "$_id", dau: { $size: "$users" }, _id: 0 } },
       { $sort: { date: 1 } },
-    ]).catch((e) => { debug("users aggregate failed", e && e.message); return []; });
+    ]).catch((e) => {
+      debug("users aggregate failed", e && e.message);
+      return [];
+    });
 
     const occupancy = await Showtime.aggregate([
       { $match: { startTime: { $gte: since } } },
       { $lookup: { from: "bookings", localField: "_id", foreignField: "showtime", as: "bks" } },
-      { $project: { theater: 1, totalSeats: { $size: { $ifNull: ["$seats", []] } }, booked: { $sum: { $map: { input: "$bks", as: "b", in: { $size: { $ifNull: ["$$b.seats", { $ifNull: ["$$b.seatsBooked", []] }] } } } } } } },
+      {
+        $project: {
+          theater: 1,
+          totalSeats: { $size: { $ifNull: ["$seats", []] } },
+          booked: {
+            $sum: {
+              $map: { input: "$bks", as: "b", in: { $size: { $ifNull: ["$$b.seats", { $ifNull: ["$$b.seatsBooked", []] }] } } },
+            },
+          },
+        },
+      },
       { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
       { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
       { $group: { _id: "$t.name", avgOccupancy: { $avg: { $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0] } } } },
       { $project: { theaterName: "$_id", avgOccupancy: 1, _id: 0 } },
       { $sort: { avgOccupancy: -1 } },
-    ]).catch((e) => { debug("occupancy aggregate failed", e && e.message); return []; });
+    ]).catch((e) => {
+      debug("occupancy aggregate failed", e && e.message);
+      return [];
+    });
 
     const popularMovies = await Booking.aggregate([
       { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
       { $group: { _id: { $ifNull: ["$movie", "$movieId"] }, bookings: { $sum: 1 }, revenue: { $sum: AMOUNT_SAFE } } },
       { $sort: { bookings: -1 } },
       { $limit: 8 },
-      { $lookup: { from: "movies", let: { mid: "$_id" }, pipeline: [ { $match: { $expr: { $or: [ { $eq: ["$_id", "$$mid"] }, { $eq: [{ $toString: "$_id" }, "$$mid"] } ] } } }, { $project: { title: 1 } } ], as: "movie" } },
+      {
+        $lookup: {
+          from: "movies",
+          let: { mid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$mid"] },
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                  ],
+                },
+              },
+            },
+            { $project: { title: 1 } },
+          ],
+          as: "movie",
+        },
+      },
       { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
       { $project: { movie: { $ifNull: ["$movie.title", "Unknown"] }, bookings: 1, revenue: 1 } },
-    ]).catch((e) => { debug("popularMovies aggregate failed", e && e.message); return []; });
+    ]).catch((e) => {
+      debug("popularMovies aggregate failed", e && e.message);
+      return [];
+    });
 
-    const snapshot = { revenueDaily: revenue, dauDaily: users, occupancy, movies: popularMovies, debug: { emittedAt: new Date().toISOString(), days } };
+    const snapshot = {
+      revenueDaily: revenue,
+      dauDaily: users,
+      occupancy,
+      movies: popularMovies,
+      debug: { emittedAt: new Date().toISOString(), days },
+    };
+
     const delivered = pushToChannel("admin", snapshot, { eventName: "snapshot" });
     debug(`emitAnalyticsSnapshot delivered=${delivered}`);
     return delivered;
@@ -274,11 +377,18 @@ export async function emitAnalyticsSnapshot(options = {}) {
   }
 }
 
+/* ---------------------- auto-publish on bookings (change stream) ------- */
 export function startBookingWatcher() {
   try {
-    if (!mongoose.connection || mongoose.connection.readyState !== 1) { debug("startBookingWatcher: mongoose not connected"); return; }
+    if (!mongoose.connection || mongoose.connection.readyState !== 1) {
+      debug("startBookingWatcher: mongoose not connected");
+      return;
+    }
     const BookingColl = mongoose.connection.collection("bookings");
-    if (!BookingColl || !BookingColl.watch) { debug("startBookingWatcher: change streams not supported"); return; }
+    if (!BookingColl || !BookingColl.watch) {
+      debug("startBookingWatcher: change streams not supported in this deployment");
+      return;
+    }
     const pipeline = [{ $match: { operationType: "insert" } }];
     const stream = BookingColl.watch(pipeline, { fullDocument: "updateLookup" });
     stream.on("change", (change) => {
@@ -288,17 +398,53 @@ export function startBookingWatcher() {
           const total = Number(doc.totalAmount ?? doc.amount ?? 0);
           const seats = (doc.seats || doc.seatsBooked || []).length || 1;
           const dayISO = doc.createdAt ? new Date(doc.createdAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-          const payload = { dayISO, revenueDelta: Number(total), bookingsDelta: 1, bookingId: String(doc._1d || doc._id), bookingSummary: { user: doc.user, movie: doc.movie, seats, totalAmount: Number(total) }, ts: Date.now() };
+
+          const payload = {
+            dayISO,
+            revenueDelta: Number(total),
+            bookingsDelta: 1,
+            bookingId: String(doc._id),
+            bookingSummary: {
+              user: doc.user,
+              movie: doc.movie,
+              seats,
+              totalAmount: Number(total),
+            },
+            ts: Date.now(),
+          };
+
+          // publish revenue delta event (admins)
           pushToAdmins(payload, { eventName: "revenue" });
+          // also publish summary
           pushToAdmins({ revenueDelta: payload.revenueDelta, bookingsDelta: 1, dayISO }, { eventName: "summary" });
+
           debug("Booking watcher published deltas", payload.bookingId);
         }
-      } catch (err) { debug("booking watcher error", err && err.message); }
+      } catch (err) {
+        debug("booking watcher change handling error", err && err.message);
+      }
     });
-    stream.on("error", (err) => { debug("booking change stream error", err && err.message); try { stream.close(); } catch {} });
+
+    stream.on("error", (err) => {
+      debug("booking change stream error", err && err.message);
+      try { stream.close(); } catch {}
+    });
+
     debug("Booking change stream started");
     return stream;
-  } catch (err) { debug("startBookingWatcher failed", err && err.message); return null; }
+  } catch (err) {
+    debug("startBookingWatcher failed", err && err.message);
+    return null;
+  }
 }
 
-export default { sseHandler, ssePreflight, pushToUser, pushToAdmins, pushNotification, emitAnalyticsSnapshot, startBookingWatcher };
+/* --------------------------- export defaults ------------------------- */
+export default {
+  sseHandler,
+  ssePreflight,
+  pushToUser,
+  pushToAdmins,
+  pushNotification,
+  emitAnalyticsSnapshot,
+  startBookingWatcher,
+};
