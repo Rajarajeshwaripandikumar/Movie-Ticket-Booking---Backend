@@ -1,10 +1,10 @@
-// backend/src/routes/movies.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import path from "path";
 import fs from "fs";
 import multer from "multer";
 import Movie from "../models/Movie.js";
+import { verifyToken, requireAdmin } from "../middleware/auth.js"; // ✅ Added auth middleware
 
 const router = Router();
 
@@ -19,7 +19,7 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const MIME_EXT = {
   "image/jpeg": ".jpeg",
-  "image/jpg": ".jpg", // some clients send this
+  "image/jpg": ".jpg",
   "image/png": ".png",
   "image/webp": ".webp",
   "image/gif": ".gif",
@@ -28,14 +28,11 @@ const MIME_EXT = {
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, uploadDir),
   filename: (_, file, cb) => {
-    // ensure we always save with a real extension
     let ext = (path.extname(file.originalname || "") || "").toLowerCase();
     if (!ext) ext = MIME_EXT[file.mimetype] || ".jpg";
-
     const base = (path.parse(file.originalname || "").name || "poster")
       .replace(/\s+/g, "-")
       .replace(/[^a-zA-Z0-9-_]/g, "");
-
     cb(null, `${base}-${Date.now()}${ext}`);
   },
 });
@@ -65,15 +62,12 @@ function toRelativePoster(u) {
   try {
     if (/^https?:\/\//i.test(u)) {
       const a = new URL(u);
-      return a.pathname; // keep just /uploads/...
+      return a.pathname;
     }
-  } catch {
-    /* not a URL */
-  }
+  } catch {}
   return u.startsWith("/") ? u : `/${u}`;
 }
 
-// Only allow /uploads/* to be stored; everything else is dropped
 function onlyUploads(relish) {
   const p = toRelativePoster(relish);
   return p.startsWith("/uploads/") ? p : "";
@@ -88,12 +82,10 @@ function toPublicUrl(u) {
 function safeUnlink(anyUrlOrPath) {
   try {
     if (!anyUrlOrPath) return;
-    const rel = toRelativePoster(anyUrlOrPath); // /uploads/...
-    const abs = path.join(process.cwd(), rel.replace(/^\/+/, "")); // -> uploads/...
+    const rel = toRelativePoster(anyUrlOrPath);
+    const abs = path.join(process.cwd(), rel.replace(/^\/+/, ""));
     if (abs.startsWith(uploadDir) && fs.existsSync(abs)) fs.unlinkSync(abs);
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 }
 
 const toArray = (v) =>
@@ -148,9 +140,7 @@ router.get("/", async (req, res) => {
 
     const movies = docs.map((m) => ({
       ...m,
-      posterUrl: toPublicUrl(
-        onlyUploads(m.posterUrl || m.image || m.poster || m.imageUrl || "")
-      ),
+      posterUrl: toPublicUrl(onlyUploads(m.posterUrl || "")),
       cast: castResponseObjects(m.cast),
     }));
 
@@ -189,9 +179,7 @@ router.get("/search", async (req, res) => {
 
     const movies = docs.map((m) => ({
       ...m,
-      posterUrl: toPublicUrl(
-        onlyUploads(m.posterUrl || m.image || m.poster || m.imageUrl || "")
-      ),
+      posterUrl: toPublicUrl(onlyUploads(m.posterUrl || "")),
       cast: castResponseObjects(m.cast),
     }));
 
@@ -211,9 +199,7 @@ router.get("/:id", async (req, res) => {
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ message: "Movie not found" });
 
-    movie.posterUrl = toPublicUrl(
-      onlyUploads(movie.posterUrl || movie.image || movie.poster || movie.imageUrl || "")
-    );
+    movie.posterUrl = toPublicUrl(onlyUploads(movie.posterUrl || ""));
     movie.cast = castResponseObjects(movie.cast);
     res.json(movie);
   } catch (err) {
@@ -222,8 +208,8 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-/* ------------------------- POST: create (with poster) ---------------------- */
-router.post("/", upload.single("poster"), async (req, res) => {
+/* ------------------------- POST: create (admin only) ---------------------- */
+router.post("/", verifyToken, requireAdmin, upload.single("poster"), async (req, res) => {
   try {
     const payload = req.body || {};
 
@@ -232,27 +218,14 @@ router.post("/", upload.single("poster"), async (req, res) => {
       return res.status(400).json({ message: "Title is required" });
     }
 
-    if (
-      typeof payload.durationMins !== "undefined" &&
-      Number.isNaN(Number(payload.durationMins))
-    ) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(400).json({ message: "durationMins must be a number" });
-    }
-
     payload.cast = castToStringArray(payload.cast);
+    if (req.file) payload.posterUrl = `/uploads/${req.file.filename}`;
 
-    // Store RELATIVE path only
-    if (req.file) {
-      payload.posterUrl = `/uploads/${req.file.filename}`;
-    } else if (payload.posterUrl || payload.image || payload.imageUrl || payload.poster) {
-      payload.posterUrl = onlyUploads(
-        payload.posterUrl || payload.image || payload.imageUrl || payload.poster
-      );
+    // record uploader info
+    if (req.user) {
+      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
+      payload.uploaderRole = req.user.role || "admin";
     }
-
-    if (typeof payload.genre === "string") payload.genre = payload.genre.trim();
-    if (typeof payload.language === "string") payload.language = payload.language.trim();
 
     const movie = await Movie.create(payload);
     const out = movie.toObject();
@@ -266,8 +239,8 @@ router.post("/", upload.single("poster"), async (req, res) => {
   }
 });
 
-/* -------------------------- PUT: full update (legacy) ---------------------- */
-router.put("/:id", upload.single("poster"), async (req, res) => {
+/* -------------------------- PUT: update (admin only) ---------------------- */
+router.put("/:id", verifyToken, requireAdmin, upload.single("poster"), async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
@@ -283,24 +256,28 @@ router.put("/:id", upload.single("poster"), async (req, res) => {
 
     const b = req.body || {};
     const payload = {
-      title: typeof b.title !== "undefined" ? String(b.title).trim() : existing.title,
-      description: typeof b.description !== "undefined" ? b.description : existing.description,
-      genre: typeof b.genre !== "undefined" ? String(b.genre).trim() : existing.genre,
-      language: typeof b.language !== "undefined" ? String(b.language).trim() : existing.language,
-      director: typeof b.director !== "undefined" ? b.director : existing.director,
-      rating: typeof b.rating !== "undefined" ? Number(b.rating) : existing.rating,
-      durationMins: typeof b.durationMins !== "undefined" ? Number(b.durationMins) : existing.durationMins,
-      releaseDate: typeof b.releaseDate !== "undefined" ? b.releaseDate : existing.releaseDate,
-      cast: typeof b.cast !== "undefined" ? castToStringArray(b.cast) : existing.cast,
-      posterUrl: existing.posterUrl, // default: keep
+      title: b.title ?? existing.title,
+      description: b.description ?? existing.description,
+      genre: b.genre ?? existing.genre,
+      language: b.language ?? existing.language,
+      director: b.director ?? existing.director,
+      rating: b.rating ?? existing.rating,
+      durationMins: b.durationMins ?? existing.durationMins,
+      releaseDate: b.releaseDate ?? existing.releaseDate,
+      cast: b.cast ? castToStringArray(b.cast) : existing.cast,
+      posterUrl: existing.posterUrl,
     };
 
     let oldPoster = null;
     if (req.file) {
       payload.posterUrl = `/uploads/${req.file.filename}`;
       oldPoster = existing.posterUrl;
-    } else if (b.posterUrl || b.image || b.imageUrl || b.poster) {
-      payload.posterUrl = onlyUploads(b.posterUrl || b.image || b.imageUrl || b.poster);
+    }
+
+    // record uploader info
+    if (req.user) {
+      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
+      payload.uploaderRole = req.user.role || "admin";
     }
 
     const updated = await Movie.findByIdAndUpdate(id, payload, {
@@ -321,8 +298,8 @@ router.put("/:id", upload.single("poster"), async (req, res) => {
   }
 });
 
-/* -------------------------- DELETE: movie (+ poster) ----------------------- */
-router.delete("/:id", async (req, res) => {
+/* -------------------------- DELETE: movie (admin only) ----------------------- */
+router.delete("/:id", verifyToken, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
