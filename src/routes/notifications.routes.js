@@ -3,6 +3,7 @@ import { Router } from "express";
 import jwt from "jsonwebtoken";
 import Notification from "../models/Notification.js";
 import { requireAuth } from "../middleware/auth.js";
+import { sendEmail } from "../utils/sendEmail.js"; // NEW: email helper
 
 const router = Router();
 
@@ -240,34 +241,60 @@ export function broadcastAll(payload) {
  * Push a saved Notification document to the correct channel after you create it.
  *   const doc = await Notification.create(...);
  *   pushNotification(doc);
+ *
+ *  NOTE: this function now attempts to send an email (if an address is available)
+ *        while preserving your existing SSE broadcast behavior.
  */
-export function pushNotification(doc) {
+export async function pushNotification(doc) {
   if (!doc) return 0;
 
-  // If your schema includes `audience`, route accordingly; otherwise fallback to user.
   const payload = doc.toObject ? doc.toObject() : doc;
   const audience = payload.audience;
 
+  // 1) SSE broadcast (unchanged)
+  let delivered = 0;
   if (audience === "ADMIN") {
-    const delivered = broadcastToAdmins(payload);
-    console.log(`[pushNotification] audience=ADMIN delivered=${delivered} id=${String(payload._id || "")}`);
-    return delivered;
-  }
-  if (audience === "ALL") {
-    let delivered = 0;
-    // If ALL, deliver to admin channel
     delivered += broadcastToAdmins(payload);
-    // And to a specific user if present
+  } else if (audience === "ALL") {
+    delivered += broadcastToAdmins(payload);
     if (payload.user) delivered += broadcastToUser(String(payload.user), payload);
-    console.log(`[pushNotification] audience=ALL delivered=${delivered} id=${String(payload._id || "")}`);
-    return delivered;
+  } else {
+    const userId = payload.user ? String(payload.user._id || payload.user) : null;
+    if (userId) delivered += broadcastToUser(userId, payload);
   }
 
-  // Default: user-scoped
-  const userId = payload.user ? String(payload.user._id || payload.user) : null;
-  if (!userId) return 0;
-  const delivered = broadcastToUser(userId, payload);
-  console.log(`[pushNotification] audience=USER delivered=${delivered} id=${String(payload._id || "")}`);
+  // 2) Email (best-effort) — will not throw (errors logged)
+  try {
+    // Determine recipient email:
+    // - If Notification doc includes an email field or user.email, use it
+    // - Fallback to SUPPORT_EMAIL or ADMIN email env var if set (useful for admin/ALL)
+    const recipient =
+      payload.email ||
+      (payload.user && (payload.user.email || payload.user.emailAddress)) ||
+      process.env.SUPPORT_EMAIL ||
+      process.env.NOTIFICATIONS_FALLBACK_EMAIL ||
+      null;
+
+    if (recipient) {
+      const subject = payload.title || payload.type || "MovieBook Notification";
+      const html = `
+        <div>
+          <h3>${payload.title || payload.type || "Notification"}</h3>
+          <p>${payload.message || payload.body || ""}</p>
+          <hr/>
+          <small>This is an automated message from MovieBook</small>
+        </div>
+      `;
+      // sendEmail returns true/false — best-effort
+      const ok = await sendEmail({ to: recipient, subject, html });
+      console.log(`[pushNotification] email_sent=${ok} to=${recipient} id=${String(payload._id || "")}`);
+    } else {
+      console.log(`[pushNotification] no email target for notification id=${String(payload._id || "")}`);
+    }
+  } catch (err) {
+    console.error("[pushNotification] email error:", err?.message || err);
+  }
+
   return delivered;
 }
 
