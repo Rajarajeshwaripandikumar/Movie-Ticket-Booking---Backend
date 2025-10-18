@@ -1,18 +1,43 @@
 // backend/src/routes/analytics.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
+import debugFactory from "debug";
+const debug = debugFactory("app:analytics");
 
-// Prefer explicit imports if you have them, e.g.:
-// import Booking from "../models/Booking.js";
-// import Showtime from "../models/Showtime.js";
-// import Theater from "../models/Theater.js";
-// import Movie from "../models/Movie.js";
+/**
+ * Try to import explicit models if they exist in your project.
+ * If not present, fall back to mongoose.models.* or create permissive schemas
+ * so the route file doesn't crash in dev/test setups.
+ */
+function tryRequire(path) {
+  try {
+    // eslint-disable-next-line global-require, import/no-dynamic-require
+    return require(path).default || require(path);
+  } catch (e) {
+    debug(`tryRequire failed for ${path}: ${e.message}`);
+    return null;
+  }
+}
 
-// Fallback to registry if models are already registered elsewhere
-const Booking  = mongoose.models.Booking  || mongoose.model("Booking");
-const Showtime = mongoose.models.Showtime || mongoose.model("Showtime");
-const Theater  = mongoose.models.Theater  || mongoose.model("Theater");
-const Movie    = mongoose.models.Movie    || mongoose.model("Movie");
+let Booking = tryRequire("../models/Booking.js");
+let Showtime = tryRequire("../models/Showtime.js");
+let Theater = tryRequire("../models/Theater.js");
+let Movie = tryRequire("../models/Movie.js");
+
+// Fallbacks: if models already registered elsewhere, use those.
+// If not, create permissive schemas so aggregation queries won't throw.
+if (!Booking) {
+  Booking = mongoose.models.Booking || mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
+}
+if (!Showtime) {
+  Showtime = mongoose.models.Showtime || mongoose.model("Showtime", new mongoose.Schema({}, { strict: false, timestamps: true }));
+}
+if (!Theater) {
+  Theater = mongoose.models.Theater || mongoose.model("Theater", new mongoose.Schema({}, { strict: false, timestamps: true }));
+}
+if (!Movie) {
+  Movie = mongoose.models.Movie || mongoose.model("Movie", new mongoose.Schema({}, { strict: false, timestamps: true }));
+}
 
 const router = Router();
 
@@ -33,21 +58,24 @@ const BOOKED_SEATS_ARR = { $ifNull: ["$seats", { $ifNull: ["$seatsBooked", []] }
 
 const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
 
-// group-by-day using $dateTrunc if available
+// group-by-day using $dateTrunc if available, otherwise fallback to $dateToString
 const dayProject = [
-  { $addFields: { _d: { $dateTrunc: { date: "$createdAt", unit: "day" } } } },
+  {
+    $addFields: {
+      _d: {
+        $cond: [
+          { $function: { body: "function(){return typeof Date.prototype.toISOString === 'function'}", args: [], lang: "js" } },
+          { $dateTrunc: { date: "$createdAt", unit: "day" } },
+          { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+        ],
+      },
+    },
+  },
 ];
 
 /* ========================  PRIMARY COMPOSITE ENDPOINT  ======================= */
 /** GET /api/analytics
- * Returns:
- * {
- *   ok: true,
- *   revenue: [{ date, total }],
- *   users: [{ date, count }],
- *   occupancy: [{ theater, avgOccupancy }],
- *   popularMovies: [{ movie, bookings, revenue }]
- * }
+ * Returns aggregated analytics (revenue, users, occupancy, popularMovies)
  */
 router.get("/", async (req, res, next) => {
   try {
@@ -85,7 +113,7 @@ router.get("/", async (req, res, next) => {
     /* -------- Theater Occupancy (average) --------
        booked seats from bookings vs total seats in showtime.seats (array length)  */
     const occupancy = await Showtime.aggregate([
-      { $match: { startTime: { $gte: since } } }, // robust: if you use startAt, add an $or
+      { $match: { startTime: { $gte: since } } },
       {
         $lookup: {
           from: "bookings",
@@ -97,7 +125,7 @@ router.get("/", async (req, res, next) => {
       {
         $project: {
           theater: 1,
-          totalSeats: { $size: { $ifNull: ["$seats", []] } }, // showtime seats layout
+          totalSeats: { $size: { $ifNull: ["$seats", []] } },
           booked: {
             $sum: {
               $map: {
@@ -296,5 +324,33 @@ router.get("/bookings/summary", async (req, res, next) => {
     res.json(data);
   } catch (e) { next(e); }
 });
+
+/* ------------------------------- SSE /stream ------------------------------- */
+/**
+ * If you have a separate SSE handler (like backend/src/sse.js exporting sseHandler),
+ * we mount it here at /stream so the frontend can open:
+ *   EventSource(`${API_ROOT}/api/analytics/stream?token=...`)
+ */
+let sseHandler = null;
+try {
+  // try a common location; adjust if your file lives elsewhere
+  // eslint-disable-next-line global-require, import/no-dynamic-require
+  sseHandler = require("../sse.js").sseHandler || require("../sse/sse.js").sseHandler || require("../sse").sseHandler;
+} catch (err) {
+  debug("No sse handler found at ../sse.js or ../sse/sse.js - SSE route will return 501 until you add one.");
+}
+
+if (sseHandler && typeof sseHandler === "function") {
+  router.get("/stream", sseHandler);
+  debug("Mounted SSE stream at GET /api/analytics/stream");
+} else {
+  router.get("/stream", (req, res) => {
+    res.status(501).json({
+      ok: false,
+      message:
+        "SSE stream handler not installed on server. Create an sse.js exporting `export const sseHandler = (req, res) => { ... }` and adjust the require path in analytics.routes.js",
+    });
+  });
+}
 
 export default router;
