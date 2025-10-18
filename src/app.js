@@ -86,7 +86,9 @@ app.use(express.urlencoded({ extended: true }));
 
 /* ─────────────────────────────── STATIC FILES ───────────────────────────────── */
 // Serve uploaded images
-app.use("/uploads", express.static(path.resolve("uploads")));
+// Serve uploaded images (uses UPLOADS_DIR if set)
+app.use("/uploads", express.static(path.resolve(process.env.UPLOADS_DIR || "uploads")));
+
 
 /* ─────────── Defensive: normalize accidental /api/api/... → /api/... ────────── */
 app.use((req, _res, next) => {
