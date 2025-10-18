@@ -58,17 +58,15 @@ const BOOKED_SEATS_ARR = { $ifNull: ["$seats", { $ifNull: ["$seatsBooked", []] }
 
 const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
 
-// group-by-day using $dateTrunc if available, otherwise fallback to $dateToString
+/**
+ * group-by-day using $dateToString to produce a YYYY-MM-DD string.
+ * This avoids using $function or server-side JS and is supported on Atlas M0/M2/M5 tiers.
+ * The frontend expects `date` to be sliceable (ISO-like), so YYYY-MM-DD works well.
+ */
 const dayProject = [
   {
     $addFields: {
-      _d: {
-        $cond: [
-          { $function: { body: "function(){return typeof Date.prototype.toISOString === 'function'}", args: [], lang: "js" } },
-          { $dateTrunc: { date: "$createdAt", unit: "day" } },
-          { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-        ],
-      },
+      _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
     },
   },
 ];
