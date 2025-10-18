@@ -1,12 +1,13 @@
+// improved-sse.js
 import jwt from "jsonwebtoken";
 import Notification from "../models/Notification.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 const APP_ORIGIN = process.env.APP_ORIGIN || "http://localhost:5173";
-const HEARTBEAT_MS = 15000;
+const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
 const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
 
-/** tiny cookie parser (no dependency) */
+// tiny cookie parser
 function parseCookie(header) {
   const out = {};
   if (!header) return out;
@@ -17,10 +18,23 @@ function parseCookie(header) {
   return out;
 }
 
+function sseWriteRaw(res, str) {
+  try {
+    if (!res || res.writableEnded || res.destroyed) return false;
+    res.write(str);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
 function sseWrite(res, { event, id, data }) {
-  if (event) res.write(`event: ${event}\n`);
-  if (id) res.write(`id: ${id}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  // guard: ensure we aren't writing to a closed stream
+  if (!res || res.writableEnded || res.destroyed) return false;
+  if (event) sseWriteRaw(res, `event: ${event}\n`);
+  if (id) sseWriteRaw(res, `id: ${id}\n`);
+  sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
+  return true;
 }
 
 function extractToken(req) {
@@ -50,26 +64,9 @@ function roleFromDecoded(decoded) {
   return String(r).toUpperCase().includes("ADMIN") ? "ADMIN" : "USER";
 }
 
-/** Build OR filters that work for admin/user feeds and remain back-compatible */
-function orFiltersForList({ isAdmin, userId, includeAll = true }) {
-  const or = [];
-  if (isAdmin) {
-    // Admin feed: ADMIN + (optional) ALL
-    or.push({ audience: "ADMIN" });
-    if (includeAll) or.push({ audience: "ALL" });
-  } else {
-    // User feed: user scoped (back-compat: audience may be absent/USER) + (optional) ALL
-    or.push({ user: userId, $or: [{ audience: { $exists: false } }, { audience: null }, { audience: "USER" }] });
-    if (includeAll) or.push({ audience: "ALL" });
-  }
-  return or;
-}
-
-/** Global client registry: Map<channelKey, Set<Response>>
- * channelKey is either a userId string or the literal "admin"
- */
 global.sseClients = global.sseClients || new Map();
 
+/** CORS preflight kept as you had it */
 export const ssePreflight = (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
   res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -81,19 +78,15 @@ export const sseHandler = async (req, res) => {
   try {
     const { token, authHeader, cookies } = extractToken(req);
 
-    // Debug (keep during dev)
-    console.log("----- SSE DEBUG -----");
-    console.log("URL:", req.originalUrl);
-    console.log("Has Authorization header:", Boolean(authHeader));
-    console.log("Cookie keys:", Object.keys(cookies));
-    console.log("Token present:", Boolean(token));
-    console.log("---------------------");
+    // Dev debug
+    console.log("SSE: URL:", req.originalUrl, "Auth header?", Boolean(authHeader), "cookieKeys:", Object.keys(cookies), "token?", Boolean(token));
 
     if (!token) return res.status(401).json({ message: "Unauthorized: missing token" });
 
     let decoded;
     try {
-      decoded = jwt.verify(token, JWT_SECRET);
+      // tighten verification: optionally restrict algorithms if you use HS256 only
+      decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], ignoreExpiration: false });
     } catch (err) {
       console.error("❌ Invalid JWT in SSE:", err.message);
       return res.status(401).json({ message: "Unauthorized: invalid token" });
@@ -117,10 +110,11 @@ export const sseHandler = async (req, res) => {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
     res.setHeader("Access-Control-Allow-Credentials", "true");
+    // notify client how long to retry (ms)
     res.write("retry: 10000\n\n");
     res.flushHeaders?.();
 
-    // Enforce a soft cap on concurrent connections per channel
+    // Enforce soft cap
     const current = global.sseClients.get(channel) || new Set();
     if (current.size >= MAX_CLIENTS_PER_USER) {
       sseWrite(res, { event: "error", data: { message: "too_many_connections" } });
@@ -132,48 +126,60 @@ export const sseHandler = async (req, res) => {
     global.sseClients.set(channel, current);
     console.log(`🔗 SSE connection established for channel: ${channel} (clients=${current.size})`);
 
-    // Mark response writable until closed
-    res._sseWritable = () => !res.writableEnded && !res.destroyed;
+    // mark writable-check helper (optional)
+    res._isSseAlive = () => !res.writableEnded && !res.destroyed;
 
-    // Connected event
+    // send connected event (use a small payload)
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-    /**
-     * INIT: send recent items
-     * For admin channel: ADMIN (+ optional ALL)
-     * For user channel:  USER (+ optional ALL)
-     */
+    // INIT: send recent items (trim projection to keep size reasonable)
     const limit = Math.min(Number(req.query?.limit) || 20, 100);
-    const or = channel === "admin" ? orFiltersForList({ isAdmin: true }) : orFiltersForList({ isAdmin: false, userId });
+    const or = channel === "admin" ? [{ audience: "ADMIN" }, { audience: "ALL" }] : [{ user: userId, $or: [{ audience: { $exists: false } }, { audience: null }, { audience: "USER" }] }, { audience: "ALL" }];
     const initial = await Notification.find({ $or: or })
-      .sort({ readAt: 1, createdAt: -1 })
+      .select("-__v") // drop mongoose version field
+      .sort({ createdAt: -1 }) // most recent first
       .limit(limit)
       .lean();
 
     sseWrite(res, { event: "init", data: { notifications: initial } });
 
-    // Keep alive
+    // heartbeat
     const ping = setInterval(() => {
-      res.write(`: heartbeat ${Date.now()}\n\n`);
+      if (res.writableEnded || res.destroyed) return;
+      sseWriteRaw(res, `: heartbeat ${Date.now()}\n\n`);
     }, HEARTBEAT_MS);
 
-    // Cleanup
-    req.on("close", () => {
-      clearInterval(ping);
+    // cleanup helper
+    const cleanup = () => {
+      try {
+        clearInterval(ping);
+      } catch {}
       const bucket = global.sseClients.get(channel);
       if (bucket) {
         bucket.delete(res);
         if (bucket.size === 0) global.sseClients.delete(channel);
       }
-      console.log(`❌ SSE disconnected for channel: ${channel}`);
+      console.log(`❌ SSE disconnected for channel: ${channel} (remaining=${global.sseClients.get(channel)?.size ?? 0})`);
+    };
+
+    req.on("close", cleanup);
+    req.on("end", cleanup);
+    res.on("error", (err) => {
+      // socket-level error; remove client
+      console.warn("SSE socket error:", err && err.message);
+      cleanup();
     });
+
+    // Optionally handle Last-Event-ID from client to resume (req.headers['last-event-id'])
+    // const lastEventId = req.headers["last-event-id"] || req.query.lastEventId;
+
   } catch (err) {
     console.error("SSE handler error:", err);
     if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
   }
 };
 
-/** Push helpers */
+/** Push helpers that remove dead clients when writes fail */
 function pushToChannel(channelKey, payload) {
   const set = global.sseClients?.get(String(channelKey));
   if (!set || set.size === 0) return 0;
@@ -183,31 +189,33 @@ function pushToChannel(channelKey, payload) {
   const id = payload?._id;
 
   let delivered = 0;
-  for (const res of set) {
+  for (const res of Array.from(set)) {
     try {
-      sseWrite(res, { event, id, data: payload });
+      const ok = sseWrite(res, { event, id, data: payload });
+      if (!ok) {
+        // remove broken stream
+        set.delete(res);
+        continue;
+      }
       delivered++;
-    } catch {
-      // ignore broken pipe
+    } catch (err) {
+      // remove on any failure
+      set.delete(res);
     }
   }
+  // cleanup empty bucket
+  if (set.size === 0) global.sseClients.delete(String(channelKey));
   return delivered;
 }
 
 export const pushToUser = (userId, payload) => pushToChannel(String(userId), payload);
 export const pushToAdmins = (payload) => pushToChannel("admin", payload);
 
-/**
- * Smart router for Notification docs: routes by `audience`
- *   - ADMIN  -> admin channel
- *   - ALL    -> admin + (optional) specific user if present
- *   - USER/* -> user channel (uses doc.user)
- */
 export const pushNotification = (doc) => {
   if (!doc) return 0;
+  // doc may already be a POJO or a mongoose doc
   const payload = doc.toObject ? doc.toObject() : doc;
   const audience = payload.audience;
-
   if (audience === "ADMIN") {
     return pushToAdmins(payload);
   }
@@ -217,7 +225,29 @@ export const pushNotification = (doc) => {
     if (payload.user) delivered += pushToUser(String(payload.user), payload);
     return delivered;
   }
-  // default user-scoped (back-compat)
   const userId = payload.user ? String(payload.user._id || payload.user) : null;
   return userId ? pushToUser(userId, payload) : 0;
 };
+
+/**
+ * Optional: wire a mongoose "watch" or post-save hook to auto-publish notifications
+ * Example (in your Notification model init code):
+ *
+ * // 1) post-save hook
+ * NotificationSchema.post("save", function(doc) {
+ *   import { pushNotification } from "./improved-sse.js"; // relative path as needed
+ *   // choose to send only when published flag or created
+ *   pushNotification(doc);
+ * });
+ *
+ * // 2) Or use change streams (if you run a replica set / production Mongo)
+ * const changeStream = Notification.watch();
+ * changeStream.on("change", (change) => {
+ *   if (change.operationType === "insert") {
+ *     const doc = change.fullDocument;
+ *     pushNotification(doc);
+ *   }
+ * });
+ *
+ * Note: change streams require a replica set (or atlas).
+ */
