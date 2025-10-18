@@ -44,7 +44,6 @@ const router = Router();
 /* ------------------------------ helpers ------------------------------ */
 
 // robust amount expression (supports totalAmount or amount, default 0)
-// Uses $isNumber for safe numeric detection, falls back to $toDouble on strings
 const AMOUNT_SAFE = {
   $ifNull: [
     {
@@ -62,22 +61,13 @@ const AMOUNT_SAFE = {
   ],
 };
 
-// robust showtime reference
 const SHOWTIME_ID = { $ifNull: ["$showtime", "$showtimeId"] };
-// robust movie reference
 const MOVIE_ID = { $ifNull: ["$movie", "$movieId"] };
-// robust user reference
 const USER_ID = { $ifNull: ["$user", "$userId"] };
-
-// robust seats array on Booking (seats or seatsBooked)
 const BOOKED_SEATS_ARR = { $ifNull: ["$seats", { $ifNull: ["$seatsBooked", []] }] };
 
 const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
 
-/**
- * group-by-day using $dateToString to produce a YYYY-MM-DD string.
- * This avoids using $function or server-side JS and is supported on Atlas M0/M2/M5 tiers.
- */
 const dayProject = [
   {
     $addFields: {
@@ -87,15 +77,11 @@ const dayProject = [
 ];
 
 /* ========================  PRIMARY COMPOSITE ENDPOINT  ======================= */
-/** GET /api/analytics
- * Returns aggregated analytics (revenue, users, occupancy, popularMovies)
- */
 router.get("/", async (req, res, next) => {
   try {
     const days = Number(req.query.days || 7);
     const since = toPast(days);
 
-    // quick debug: how many bookings exist since 'since'?
     const matchBase = { createdAt: { $gte: since } };
     const totalBookingsSince = await Booking.countDocuments(matchBase).catch((e) => {
       debug("countDocuments error:", e && e.message);
@@ -103,7 +89,6 @@ router.get("/", async (req, res, next) => {
     });
     debug(`Analytics: bookings since ${since.toISOString()}: ${totalBookingsSince}`);
 
-    /* -------- Daily Revenue (confirmed/paid) -- defensive cast for numeric strings -------- */
     const revenue = await Booking.aggregate([
       {
         $match: {
@@ -125,7 +110,6 @@ router.get("/", async (req, res, next) => {
     ]);
     debug("Revenue aggregation results sample:", revenue.slice(0, 5));
 
-    /* -------- Daily Active Users -------- */
     const users = await Booking.aggregate([
       { $match: { createdAt: { $gte: since } } },
       ...dayProject,
@@ -135,8 +119,6 @@ router.get("/", async (req, res, next) => {
     ]);
     debug("Users aggregation sample:", users.slice(0, 5));
 
-    /* -------- Theater Occupancy (average) --------
-       booked seats from bookings vs total seats in showtime.seats (array length)  */
     const occupancy = await Showtime.aggregate([
       { $match: { startTime: { $gte: since } } },
       {
@@ -186,7 +168,6 @@ router.get("/", async (req, res, next) => {
     ]);
     debug("Occupancy sample:", occupancy.slice(0, 5));
 
-    /* -------- Popular Movies (bookings + revenue) -------- */
     const popularMovies = await Booking.aggregate([
       { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
       {
@@ -207,9 +188,10 @@ router.get("/", async (req, res, next) => {
               $match: {
                 $expr: {
                   $or: [
-                    { $eq: ["$_id", "$$mid"] }, // ObjectId equality
-                    { $eq: [{ $toString: "$_id" }, "$$mid"] }, // movie._id string vs booking._id string
-                    { $eq: [{ $toString: "$$mid" }, { $toString: "$_id" }] }, // fallback
+                    { $eq: ["$_1d", "$$mid"] },
+                    { $eq: ["$_id", "$$mid"] },
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                    { $eq: [{ $toString: "$$mid" }, { $toString: "$_id" }] },
                   ],
                 },
               },
@@ -231,7 +213,6 @@ router.get("/", async (req, res, next) => {
     ]);
     debug("Popular movies:", popularMovies);
 
-    // final response with safe default values
     res.json({
       ok: true,
       revenue: revenue || [],
@@ -248,7 +229,7 @@ router.get("/", async (req, res, next) => {
 
 /* ===========================  GRANULAR ENDPOINTS  =========================== */
 
-// 1) Revenue trends
+// (all granular endpoints unchanged from your original file)
 router.get("/revenue/trends", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -267,7 +248,6 @@ router.get("/revenue/trends", async (req, res, next) => {
   }
 });
 
-// 2) Popular movies
 router.get("/movies/popular", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -288,7 +268,6 @@ router.get("/movies/popular", async (req, res, next) => {
   }
 });
 
-// 3) Theater occupancy
 router.get("/occupancy", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -332,7 +311,6 @@ router.get("/occupancy", async (req, res, next) => {
   }
 });
 
-// 4) Bookings by hour
 router.get("/bookings/by-hour", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 14);
@@ -350,7 +328,6 @@ router.get("/bookings/by-hour", async (req, res, next) => {
   }
 });
 
-// 5) Active users
 router.get("/users/active", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -368,7 +345,6 @@ router.get("/users/active", async (req, res, next) => {
   }
 });
 
-// 6) Bookings summary
 router.get("/bookings/summary", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -394,21 +370,35 @@ router.get("/bookings/summary", async (req, res, next) => {
 });
 
 /* ------------------------------- SSE /stream ------------------------------- */
-/**
- * If you have a separate SSE handler (like backend/src/sse.js exporting sseHandler),
- * we mount it here at /stream so the frontend can open:
- *   EventSource(`${API_ROOT}/api/analytics/stream?token=...`)
- */
 let sseHandler = null;
 try {
-  // try a common location; adjust if your file lives elsewhere
+  // try common locations (include your socket folder path)
   // eslint-disable-next-line global-require, import/no-dynamic-require
-  sseHandler = require("../sse.js").sseHandler || require("../sse/sse.js").sseHandler || require("../sse").sseHandler;
+  sseHandler =
+    require("../socket/sse.js").sseHandler ||
+    require("../socket/sse.js").default?.sseHandler ||
+    require("../sse.js").sseHandler ||
+    require("../sse/sse.js").sseHandler ||
+    require("../sse").sseHandler;
 } catch (err) {
-  debug("No sse handler found at ../sse.js or ../sse/sse.js - SSE route will return 501 until you add one.");
+  debug("No sse handler found at ../socket/sse.js or ../sse.js or ../sse/sse.js - SSE route will return 501 until you add one.");
 }
 
 if (sseHandler && typeof sseHandler === "function") {
+  // attempt to attach preflight if available
+  try {
+    const sseModule =
+      require("../socket/sse.js")?.default ||
+      require("../socket/sse.js") ||
+      require("../sse.js")?.default ||
+      require("../sse.js");
+    if (sseModule && typeof sseModule.ssePreflight === "function") {
+      router.options("/stream", sseModule.ssePreflight);
+    }
+  } catch (err) {
+    // ignore
+  }
+
   router.get("/stream", sseHandler);
   debug("Mounted SSE stream at GET /api/analytics/stream");
 } else {
@@ -416,7 +406,7 @@ if (sseHandler && typeof sseHandler === "function") {
     res.status(501).json({
       ok: false,
       message:
-        "SSE stream handler not installed on server. Create an sse.js exporting `export const sseHandler = (req, res) => { ... }` and adjust the require path in analytics.routes.js",
+        "SSE stream handler not installed on server. Create socket/sse.js exporting `export const sseHandler = (req, res) => { ... }` and adjust the require path in analytics.routes.js",
     });
   });
 }
