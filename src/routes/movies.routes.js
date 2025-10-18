@@ -5,7 +5,7 @@ import path from "path";
 import fs from "fs";
 import multer from "multer";
 import Movie from "../models/Movie.js";
-import { requireAuth, requireAdmin } from "../middleware/auth.js"; // <-- use requireAuth
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -15,7 +15,9 @@ const BASE_URL =
   "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
 /* ------------------------------ Paths & Multer ----------------------------- */
-const uploadDir = path.resolve("uploads");
+// configurable uploads dir so you can point to a persistent mount later
+const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
+const uploadDir = path.resolve(UPLOADS_DIR);
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const MIME_EXT = {
@@ -54,6 +56,21 @@ const upload = multer({
   fileFilter,
   limits: { fileSize: 3 * 1024 * 1024 }, // 3 MB
 });
+
+// tiny middleware to log uploads for debugging
+function logUpload(req, _res, next) {
+  if (req.file) {
+    console.log(
+      "[uploads] saved:",
+      req.file.filename,
+      "->",
+      path.join(uploadDir, req.file.filename)
+    );
+  } else {
+    console.log("[uploads] no file on this request");
+  }
+  next();
+}
 
 /* ------------------------------ Helpers ----------------------------------- */
 const isValidId = (id) => mongoose.isValidObjectId(id);
@@ -210,7 +227,7 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ------------------------- POST: create (admin only) ---------------------- */
-router.post("/", requireAuth, requireAdmin, upload.single("poster"), async (req, res) => {
+router.post("/", requireAuth, requireAdmin, upload.single("poster"), logUpload, async (req, res) => {
   try {
     const payload = req.body || {};
 
@@ -241,7 +258,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("poster"), async (req,
 });
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
-router.put("/:id", requireAuth, requireAdmin, upload.single("poster"), async (req, res) => {
+router.put("/:id", requireAuth, requireAdmin, upload.single("poster"), logUpload, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
