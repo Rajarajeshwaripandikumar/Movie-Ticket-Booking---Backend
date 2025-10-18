@@ -1,10 +1,11 @@
+// backend/src/routes/movies.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import path from "path";
 import fs from "fs";
 import multer from "multer";
 import Movie from "../models/Movie.js";
-import { verifyToken, requireAdmin } from "../middleware/auth.js"; // ✅ Added auth middleware
+import { requireAuth, requireAdmin } from "../middleware/auth.js"; // <-- use requireAuth
 
 const router = Router();
 
@@ -209,7 +210,7 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ------------------------- POST: create (admin only) ---------------------- */
-router.post("/", verifyToken, requireAdmin, upload.single("poster"), async (req, res) => {
+router.post("/", requireAuth, requireAdmin, upload.single("poster"), async (req, res) => {
   try {
     const payload = req.body || {};
 
@@ -240,7 +241,7 @@ router.post("/", verifyToken, requireAdmin, upload.single("poster"), async (req,
 });
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
-router.put("/:id", verifyToken, requireAdmin, upload.single("poster"), async (req, res) => {
+router.put("/:id", requireAuth, requireAdmin, upload.single("poster"), async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
@@ -299,7 +300,7 @@ router.put("/:id", verifyToken, requireAdmin, upload.single("poster"), async (re
 });
 
 /* -------------------------- DELETE: movie (admin only) ----------------------- */
-router.delete("/:id", verifyToken, requireAdmin, async (req, res) => {
+router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
