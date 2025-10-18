@@ -1,23 +1,16 @@
-// improved-sse.js
+// backend/src/sse.js
 import jwt from "jsonwebtoken";
-import Notification from "../models/Notification.js";
+import mongoose from "mongoose";
+import debugFactory from "debug";
+const debug = debugFactory("app:sse");
 
-const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
-const APP_ORIGIN = process.env.APP_ORIGIN || "http://localhost:5173";
+/* ----------------------------- config ------------------------------ */
+const JWT_SECRET = process.env.JWT_SECRET || process.env.JWT_SECRET_BASE64 || "dev_jwt_secret_change_me";
+const APP_ORIGIN = process.env.APP_ORIGIN || "*"; // set to your frontend origin in production
 const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
 const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
 
-// tiny cookie parser
-function parseCookie(header) {
-  const out = {};
-  if (!header) return out;
-  header.split(";").forEach((pair) => {
-    const i = pair.indexOf("=");
-    if (i > -1) out[pair.slice(0, i).trim()] = decodeURIComponent(pair.slice(i + 1).trim());
-  });
-  return out;
-}
-
+/* -------------------------- helpers / safe writes ------------------- */
 function sseWriteRaw(res, str) {
   try {
     if (!res || res.writableEnded || res.destroyed) return false;
@@ -27,75 +20,63 @@ function sseWriteRaw(res, str) {
     return false;
   }
 }
-
 function sseWrite(res, { event, id, data }) {
-  // guard: ensure we aren't writing to a closed stream
   if (!res || res.writableEnded || res.destroyed) return false;
   if (event) sseWriteRaw(res, `event: ${event}\n`);
   if (id) sseWriteRaw(res, `id: ${id}\n`);
-  sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
+  // always stringify safely
+  try {
+    sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
+  } catch (err) {
+    sseWriteRaw(res, `data: ${JSON.stringify({ error: "stringify_failed", raw: String(data) })}\n\n`);
+  }
   return true;
 }
 
+/* --------------------------- token extraction ---------------------- */
+function parseCookie(header) {
+  const out = {};
+  if (!header) return out;
+  header.split(";").forEach((pair) => {
+    const i = pair.indexOf("=");
+    if (i > -1) out[pair.slice(0, i).trim()] = decodeURIComponent(pair.slice(i + 1).trim());
+  });
+  return out;
+}
 function extractToken(req) {
   const authHeader = req.headers.authorization || "";
   const cookies = parseCookie(req.headers.cookie || "");
   let token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token && req.query && typeof req.query.token === "string") token = req.query.token;
-  if (!token && req.params && typeof req.params.token === "string") token = req.params.token;
   if (!token && cookies.token) token = cookies.token;
   if (!token && cookies.access_token) token = cookies.access_token;
   if (!token && cookies.jwt) token = cookies.jwt;
-  if (!token && req.originalUrl) {
-    try {
-      const full = new URL(req.originalUrl, `http://${req.headers.host}`);
-      const qp = full.searchParams.get("token");
-      if (qp) token = qp;
-    } catch {}
-  }
-  return { token, authHeader, cookies };
+  return { token: token ? String(token) : null, authHeader, cookies };
 }
-
-/** Sanitize a JWT string pulled from header/query/cookie.
- *  - trims, decodeURIComponent, strips common accidental suffixes like ":1"
- *  - validates it has 3 dot-separated segments (simple sanity)
- */
 function sanitizeToken(raw) {
   if (!raw || typeof raw !== "string") return null;
   let t = raw.trim();
-
-  // URL-decode (safe guard if token was placed into query string)
-  try {
-    t = decodeURIComponent(t);
-  } catch (e) {
-    // ignore decode errors (leave t as-is)
-  }
-
-  // Defensive: strip trailing colon-digit (":1") or common accidental suffixes
-  if ((t.match(/\./g) || []).length !== 2) {
-    t = t.replace(/:\d+$/, ""); // strip :1, :0, etc
-    // remove characters that are unlikely to belong in a base64url token
-    t = t.replace(/[^\w\-_.=]/g, "");
-  }
-
-  // final sanity: expect exactly 2 dots (3 parts)
+  try { t = decodeURIComponent(t); } catch {}
+  // strip accidental suffixes like ":1"
+  t = t.replace(/:\d+$/, "");
+  // require 2 dots (three parts)
   if ((t.match(/\./g) || []).length !== 2) return null;
   return t;
 }
-
 function roleFromDecoded(decoded) {
   const r =
     decoded?.role ||
     (Array.isArray(decoded?.roles) && decoded.roles.find((x) => String(x).toUpperCase().includes("ADMIN"))) ||
+    decoded?.roleName ||
     "USER";
   return String(r).toUpperCase().includes("ADMIN") ? "ADMIN" : "USER";
 }
 
-// global in-process store of SSE clients (Map<channel, Set<res>>)
-// NOTE: this is per-process. For multi-process deployments use Redis/pubsub
+/* ----------------------- in-process client store ------------------- */
+// Map<channelKey, Set<res>>
 global.sseClients = global.sseClients || new Map();
 
-/** CORS preflight kept as you had it */
+/* -------------------------- CORS preflight ------------------------- */
 export const ssePreflight = (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
   res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -103,69 +84,38 @@ export const ssePreflight = (req, res) => {
   res.status(204).end();
 };
 
+/* -------------------------- SSE handler --------------------------- */
 export const sseHandler = async (req, res) => {
   try {
-    const { token: rawToken, authHeader, cookies } = extractToken(req);
+    const { token: rawToken, cookies } = extractToken(req);
     const token = sanitizeToken(rawToken);
 
-    // Dev debug
-    console.log(
-      "SSE: URL:",
-      req.originalUrl,
-      "Auth header?",
-      Boolean(authHeader),
-      "cookieKeys:",
-      Object.keys(cookies),
-      "token present?",
-      Boolean(token),
-      "rawTokenLen:",
-      rawToken ? rawToken.length : 0,
-      "sanitizedLen:",
-      token ? token.length : 0
-    );
+    debug("SSE connection attempt", { url: req.originalUrl, hasAuthHeader: Boolean(req.headers.authorization), hasToken: Boolean(token) });
 
     if (!token) {
-      // If SSE headers are not yet sent, return a plain-text 401 to avoid client-side EventSource confusing JSON bodies.
-      if (!res.headersSent) {
-        res.status(401).type("text").send("Unauthorized: missing token");
-      } else {
-        sseWrite(res, { event: "error", data: { message: "Unauthorized: missing token" } });
-        res.end();
-      }
+      // respond with text 401 (EventSource will treat non-200 as failure)
+      res.status(401).type("text").send("Unauthorized: missing token (provide ?token= or Bearer header or cookie)");
       return;
     }
 
-    let decoded;
+    let decoded = null;
     try {
-      // tighten verification: restrict algorithms if you use HS256 only
       decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], ignoreExpiration: false });
     } catch (err) {
-      console.error("❌ Invalid JWT in SSE:", err.name, err.message);
-      if (!res.headersSent) {
-        res.status(401).type("text").send(`Unauthorized: invalid token (${err.name})`);
-      } else {
-        sseWrite(res, { event: "error", data: { message: "Unauthorized: invalid token", detail: err.message } });
-        res.end();
-      }
+      debug("Invalid JWT for SSE:", err && err.message);
+      res.status(401).type("text").send(`Unauthorized: invalid token (${err && err.name})`);
       return;
     }
 
-    const userId = String(decoded._id || decoded.id || decoded.userId || "");
+    const userId = String(decoded._id || decoded.id || decoded.userId || decoded.sub || "");
     if (!userId) {
-      console.error("❌ JWT missing user id field:", decoded);
-      if (!res.headersSent) {
-        res.status(401).type("text").send("Unauthorized: invalid payload");
-      } else {
-        sseWrite(res, { event: "error", data: { message: "Unauthorized: invalid payload" } });
-        res.end();
-      }
+      debug("JWT missing user id/payload", decoded);
+      res.status(401).type("text").send("Unauthorized: token missing user id");
       return;
     }
 
     const role = roleFromDecoded(decoded);
     const isAdmin = role === "ADMIN";
-
-    // admin can opt into admin channel with ?scope=admin
     const scope = String(req.query?.scope || "user").toLowerCase();
     const channel = isAdmin && scope === "admin" ? "admin" : userId;
 
@@ -175,158 +125,357 @@ export const sseHandler = async (req, res) => {
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    // optionally advertise retry to client (ms)
+    // retry hint
     res.write("retry: 10000\n\n");
     res.flushHeaders?.();
 
-    // Enforce soft cap
+    // enforce client limit per channel
     const current = global.sseClients.get(channel) || new Set();
     if (current.size >= MAX_CLIENTS_PER_USER) {
       sseWrite(res, { event: "error", data: { message: "too_many_connections" } });
       return res.end();
     }
 
-    // Register client
+    // register
     current.add(res);
     global.sseClients.set(channel, current);
-    console.log(`🔗 SSE connection established for channel: ${channel} (clients=${current.size})`);
+    debug(`SSE connected channel=${channel} clients=${current.size}`);
 
-    // mark writable-check helper (optional)
+    // helper to check aliveness
     res._isSseAlive = () => !res.writableEnded && !res.destroyed;
 
-    // send connected event (use a small payload)
+    // send connected event
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-    // INIT: send recent items (trim projection to keep size reasonable)
-    const limit = Math.min(Number(req.query?.limit) || 20, 100);
-    const or =
-      channel === "admin"
-        ? [{ audience: "ADMIN" }, { audience: "ALL" }]
-        : [
-            { user: userId, $or: [{ audience: { $exists: false } }, { audience: null }, { audience: "USER" }] },
-            { audience: "ALL" },
-          ];
-
-    let initial = [];
+    // send small init: try load notifications (if Notification model present)
+    let Notification = null;
     try {
-      initial = await Notification.find({ $or: or }).select("-__v").sort({ createdAt: -1 }).limit(limit).lean();
+      Notification = mongoose.models.Notification || (await import("./models/Notification.js").then((m) => m.default)).model || mongoose.model("Notification");
     } catch (err) {
-      // If DB read fails, send a small error event but keep the stream open
-      console.error("SSE: failed to load initial notifications:", err && err.message);
-      sseWrite(res, { event: "error", data: { message: "init_load_failed" } });
+      // ignore if not present
     }
-
-    sseWrite(res, { event: "init", data: { notifications: initial } });
+    if (Notification) {
+      try {
+        const limit = Math.min(Number(req.query?.limit) || 20, 100);
+        const or =
+          channel === "admin"
+            ? [{ audience: "ADMIN" }, { audience: "ALL" }]
+            : [{ user: userId }, { audience: "ALL" }];
+        const initial = await Notification.find({ $or: or }).sort({ createdAt: -1 }).limit(limit).lean();
+        sseWrite(res, { event: "init", data: { notifications: initial } });
+      } catch (err) {
+        sseWrite(res, { event: "error", data: { message: "init_failed" } });
+      }
+    } else {
+      // simple marker payload if no Notification model exists
+      sseWrite(res, { event: "init", data: { message: "init_ok", model: false } });
+    }
 
     // heartbeat
     const ping = setInterval(() => {
-      if (res.writableEnded || res.destroyed) return;
+      if (!res._isSseAlive()) return;
       sseWriteRaw(res, `: heartbeat ${Date.now()}\n\n`);
     }, HEARTBEAT_MS);
 
-    // cleanup helper
+    // cleanup
     const cleanup = () => {
-      try {
-        clearInterval(ping);
-      } catch {}
+      clearInterval(ping);
       const bucket = global.sseClients.get(channel);
       if (bucket) {
         bucket.delete(res);
         if (bucket.size === 0) global.sseClients.delete(channel);
       }
-      console.log(
-        `❌ SSE disconnected for channel: ${channel} (remaining=${global.sseClients.get(channel)?.size ?? 0})`
-      );
+      debug(`SSE disconnected channel=${channel} remaining=${global.sseClients.get(channel)?.size ?? 0}`);
     };
 
     req.on("close", cleanup);
     req.on("end", cleanup);
     res.on("error", (err) => {
-      // socket-level error; remove client
-      console.warn("SSE socket error:", err && err.message);
+      debug("SSE socket error", err && err.message);
       cleanup();
     });
 
-    // Optionally handle Last-Event-ID from client to resume (req.headers['last-event-id'])
-    // const lastEventId = req.headers["last-event-id"] || req.query.lastEventId;
-
-    // DO NOT end the response here; keep it open for streaming
+    // keep the response open
+    return;
   } catch (err) {
-    console.error("SSE handler error:", err && err.message);
+    debug("sseHandler error", err && err.message);
     if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
   }
 };
 
-/** Push helpers that remove dead clients when writes fail */
-function pushToChannel(channelKey, payload) {
-  const set = global.sseClients?.get(String(channelKey));
+/* ------------------------ push helpers ------------------------------ */
+function pushToChannel(channelKey, payload, { eventName } = {}) {
+  const set = global.sseClients.get(String(channelKey));
   if (!set || set.size === 0) return 0;
-
-  const isNotification = payload && (payload.type || payload._id);
-  const event = isNotification ? "notification" : "message";
-  const id = payload?._id;
-
+  const event = eventName || (payload && payload.type ? payload.type : "message");
+  const id = payload && (payload._id || payload.id) ? String(payload._id || payload.id) : undefined;
   let delivered = 0;
   for (const res of Array.from(set)) {
     try {
       const ok = sseWrite(res, { event, id, data: payload });
       if (!ok) {
-        // remove broken stream
         set.delete(res);
         continue;
       }
       delivered++;
     } catch (err) {
-      // remove on any failure
       set.delete(res);
     }
   }
-  // cleanup empty bucket
   if (set.size === 0) global.sseClients.delete(String(channelKey));
   return delivered;
 }
+export const pushToUser = (userId, payload, opts = {}) => pushToChannel(String(userId), payload, opts);
+export const pushToAdmins = (payload, opts = {}) => pushToChannel("admin", payload, opts);
 
-export const pushToUser = (userId, payload) => pushToChannel(String(userId), payload);
-export const pushToAdmins = (payload) => pushToChannel("admin", payload);
-
+/* push Notification shape helper (accepts mongoose doc or POJO) */
 export const pushNotification = (doc) => {
   if (!doc) return 0;
-  // doc may already be a POJO or a mongoose doc
   const payload = doc.toObject ? doc.toObject() : doc;
-  const audience = payload.audience;
-  if (audience === "ADMIN") {
-    return pushToAdmins(payload);
+  if (payload.audience === "ADMIN") return pushToAdmins(payload, { eventName: "notification" });
+  if (payload.audience === "ALL") {
+    let n = 0;
+    n += pushToAdmins(payload, { eventName: "notification" });
+    if (payload.user) n += pushToUser(String(payload.user), payload, { eventName: "notification" });
+    return n;
   }
-  if (audience === "ALL") {
-    let delivered = 0;
-    delivered += pushToAdmins(payload);
-    if (payload.user) delivered += pushToUser(String(payload.user), payload);
-    return delivered;
-  }
-  const userId = payload.user ? String(payload.user._id || payload.user) : null;
-  return userId ? pushToUser(userId, payload) : 0;
+  if (payload.user) return pushToUser(String(payload.user), payload, { eventName: "notification" });
+  return 0;
 };
 
+/* ------------------ analytics snapshot emitter ---------------------- */
 /**
- * Optional: wire a mongoose "watch" or post-save hook to auto-publish notifications
- * Example (in your Notification model init code):
+ * emitAnalyticsSnapshot() computes the same aggregations as analytics.routes.js
+ * and sends a 'snapshot' event payload to admin channel.
  *
- * // 1) post-save hook
- * NotificationSchema.post("save", function(doc) {
- *   import { pushNotification } from "./improved-sse.js"; // relative path as needed
- *   // choose to send only when published flag or created
- *   pushNotification(doc);
- * });
- *
- * // 2) Or use change streams (if you run a replica set / atlas).
- * const changeStream = Notification.watch();
- * changeStream.on("change", (change) => {
- *   if (change.operationType === "insert") {
- *     const doc = change.fullDocument;
- *     pushNotification(doc);
- *   }
- * });
- *
- * Note: change streams require a replica set (or atlas).
+ * It is defensive: if models do not exist, it will send a minimal heartbeat instead.
  */
+export async function emitAnalyticsSnapshot(options = {}) {
+  try {
+    // try to load models robustly
+    let Booking = mongoose.models.Booking;
+    let Showtime = mongoose.models.Showtime;
+    let Theater = mongoose.models.Theater;
+    let Movie = mongoose.models.Movie;
 
+    // fallback permissive schemas if models unavailable
+    if (!Booking) Booking = mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
+    if (!Showtime) Showtime = mongoose.model("Showtime", new mongoose.Schema({}, { strict: false, timestamps: true }));
+    if (!Theater) Theater = mongoose.model("Theater", new mongoose.Schema({}, { strict: false, timestamps: true }));
+    if (!Movie) Movie = mongoose.model("Movie", new mongoose.Schema({}, { strict: false, timestamps: true }));
+
+    const days = Number(options.days || 30);
+    const since = new Date(Date.now() - days * 864e5);
+
+    const AMOUNT_SAFE = {
+      $ifNull: [
+        {
+          $switch: {
+            branches: [
+              { case: { $isNumber: "$totalAmount" }, then: "$totalAmount" },
+              { case: { $isNumber: "$amount" }, then: "$amount" },
+            ],
+            default: {
+              $toDouble: { $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }] },
+            },
+          },
+        },
+        0,
+      ],
+    };
+
+    const dayProject = [{ $addFields: { _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } } } }];
+
+    const revenue = await Booking.aggregate([
+      { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
+      ...dayProject,
+      { $addFields: { __amount_safe: AMOUNT_SAFE } },
+      { $group: { _id: "$_d", totalRevenue: { $sum: "$__amount_safe" }, bookings: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+      { $project: { date: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
+    ]).catch((e) => {
+      debug("revenue aggregate failed", e && e.message);
+      return [];
+    });
+
+    const users = await Booking.aggregate([
+      { $match: { createdAt: { $gte: since } } },
+      ...dayProject,
+      { $group: { _id: "$_d", users: { $addToSet: { $ifNull: ["$user", "$userId"] } } } },
+      { $project: { date: "$_id", dau: { $size: "$users" }, _id: 0 } },
+      { $sort: { date: 1 } },
+    ]).catch((e) => {
+      debug("users aggregate failed", e && e.message);
+      return [];
+    });
+
+    const occupancy = await Showtime.aggregate([
+      { $match: { startTime: { $gte: since } } },
+      { $lookup: { from: "bookings", localField: "_id", foreignField: "showtime", as: "bks" } },
+      {
+        $project: {
+          theater: 1,
+          totalSeats: { $size: { $ifNull: ["$seats", []] } },
+          booked: {
+            $sum: {
+              $map: {
+                input: "$bks",
+                as: "b",
+                in: { $size: { $ifNull: ["$$b.seats", { $ifNull: ["$$b.seatsBooked", []] }] } },
+              },
+            },
+          },
+        },
+      },
+      { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
+      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: "$t.name",
+          avgOccupancy: { $avg: { $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0] } },
+        },
+      },
+      { $project: { theaterName: "$_id", avgOccupancy: 1, _id: 0 } },
+      { $sort: { avgOccupancy: -1 } },
+    ]).catch((e) => {
+      debug("occupancy aggregate failed", e && e.message);
+      return [];
+    });
+
+    const popularMovies = await Booking.aggregate([
+      { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
+      { $group: { _id: { $ifNull: ["$movie", "$movieId"] }, bookings: { $sum: 1 }, revenue: { $sum: AMOUNT_SAFE } } },
+      { $sort: { bookings: -1 } },
+      { $limit: 8 },
+      {
+        $lookup: {
+          from: "movies",
+          let: { mid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$mid"] },
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                    { $eq: ["$_id", { $toObjectId: "$$mid" }] },
+                  ],
+                },
+              },
+            },
+            { $project: { title: 1 } },
+          ],
+          as: "movie",
+        },
+      },
+      { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
+      { $project: { movie: { $ifNull: ["$movie.title", "Unknown"] }, bookings: 1, revenue: 1 } },
+    ]).catch((e) => {
+      debug("popularMovies aggregate failed", e && e.message);
+      return [];
+    });
+
+    const snapshot = {
+      revenueDaily: revenue,
+      dauDaily: users,
+      occupancy,
+      movies: popularMovies,
+      debug: { emittedAt: new Date().toISOString(), days },
+    };
+
+    // publish snapshot to admin channel
+    const delivered = pushToChannel("admin", snapshot, { eventName: "snapshot" });
+    debug(`emitAnalyticsSnapshot delivered=${delivered}`);
+    return delivered;
+  } catch (err) {
+    debug("emitAnalyticsSnapshot error", err && err.message);
+    // fallback: push a heartbeat
+    const d = pushToChannel("admin", { message: "snapshot_failed", error: err && err.message, ts: Date.now() }, { eventName: "snapshot" });
+    return d;
+  }
+}
+
+/* ---------------------- auto-publish on bookings (change stream) ------- */
+/**
+ * startBookingWatcher will attempt to open a change stream on 'bookings'
+ * and publish small delta events to admins when insert occurs.
+ * Call this during server startup (optional).
+ */
+export function startBookingWatcher() {
+  try {
+    if (!mongoose.connection || mongoose.connection.readyState !== 1) {
+      debug("startBookingWatcher: mongoose not connected");
+      return;
+    }
+    const BookingColl = mongoose.connection.collection("bookings");
+    if (!BookingColl) {
+      debug("startBookingWatcher: bookings collection not found");
+      return;
+    }
+    if (!BookingColl.watch) {
+      debug("startBookingWatcher: change streams not supported in this deployment");
+      return;
+    }
+    const pipeline = [
+      { $match: { operationType: "insert" } },
+      // optionally restrict fields with $project here
+    ];
+    const stream = BookingColl.watch(pipeline, { fullDocument: "updateLookup" });
+    stream.on("change", (change) => {
+      try {
+        if (change.operationType === "insert") {
+          const doc = change.fullDocument || change;
+          const total = Number(doc.totalAmount ?? doc.amount ?? 0);
+          const seats = (doc.seats || doc.seatsBooked || []).length || 1;
+          const dayISO = doc.createdAt ? new Date(doc.createdAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+
+          const payload = {
+            dayISO,
+            revenueDelta: Number(total),
+            bookingsDelta: 1,
+            bookingId: String(doc._id),
+            bookingSummary: {
+              user: doc.user,
+              movie: doc.movie,
+              seats,
+              totalAmount: Number(total),
+            },
+            ts: Date.now(),
+          };
+
+          // publish revenue delta event (admins)
+          pushToAdmins(payload, { eventName: "revenue" });
+          // publish summary short event as well
+          pushToAdmins({ revenueDelta: payload.revenueDelta, bookingsDelta: 1, dayISO }, { eventName: "summary" });
+
+          debug("Booking watcher published deltas", payload.bookingId);
+        }
+      } catch (err) {
+        debug("booking watcher change handling error", err && err.message);
+      }
+    });
+
+    stream.on("error", (err) => {
+      debug("booking change stream error", err && err.message);
+      try { stream.close(); } catch {}
+      // do not crash - consider restarting watcher after a backoff if desired
+    });
+
+    debug("Booking change stream started");
+    return stream;
+  } catch (err) {
+    debug("startBookingWatcher failed", err && err.message);
+    return null;
+  }
+}
+
+/* --------------------------- export defaults ------------------------- */
+export default {
+  sseHandler,
+  ssePreflight,
+  pushToUser,
+  pushToAdmins,
+  pushNotification,
+  emitAnalyticsSnapshot,
+  startBookingWatcher,
+};
