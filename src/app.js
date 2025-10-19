@@ -113,7 +113,8 @@ try {
 
 // ─────────────────────────────── FIX DOUBLE /api/api BUG ───────────────────────────────
 app.use((req, _res, next) => {
-  req.url = req.url.replace(/\\/api\\/api(\\/|$)/g, "/api$1");
+  req.url = req.url.replace(/\/api\/api(\/|$)/g, "/api$1");
+
   next();
 });
 
