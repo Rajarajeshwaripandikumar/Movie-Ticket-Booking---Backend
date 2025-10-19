@@ -3,33 +3,35 @@ import { Router } from "express";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
 
 /* ----------------------------------------------------------------------------
- * Config
- * --------------------------------------------------------------------------*/
+ * 📁 Directory & Base URL Config
+ * -------------------------------------------------------------------------- */
 
-// Directory to store uploads (filesystem is ephemeral on many hosts)
+// Where uploads are stored locally
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Public base (set in .env for absolute URLs)
+// Set your backend URL here (used for absolute URLs)
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
 
-// Allowed mime-types and max size
+/* ----------------------------------------------------------------------------
+ * ⚙️ Upload Settings
+ * -------------------------------------------------------------------------- */
+
 const ALLOWED_MIMES = new Set([
   "image/jpeg",
   "image/png",
   "image/webp",
   "image/gif",
 ]);
-const MAX_FILE_SIZE_BYTES = 3 * 1024 * 1024; // 3MB
 
-/* ----------------------------------------------------------------------------
- * Multer setup
- * --------------------------------------------------------------------------*/
+const MAX_FILE_SIZE_BYTES = 3 * 1024 * 1024; // 3 MB
 
+// Multer storage engine
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
   filename: (_req, file, cb) => {
@@ -45,7 +47,7 @@ const storage = multer.diskStorage({
 
 const fileFilter = (_req, file, cb) => {
   if (!ALLOWED_MIMES.has(file.mimetype)) {
-    return cb(new Error("Only JPG, PNG, WEBP, or GIF are allowed"));
+    return cb(new Error("Only JPG, PNG, WEBP, or GIF files allowed"));
   }
   cb(null, true);
 };
@@ -57,8 +59,8 @@ const upload = multer({
 });
 
 /* ----------------------------------------------------------------------------
- * Helpers
- * --------------------------------------------------------------------------*/
+ * 🌐 Helpers
+ * -------------------------------------------------------------------------- */
 
 function toPublicUrl(filename) {
   const rel = `/uploads/${filename}`;
@@ -66,17 +68,23 @@ function toPublicUrl(filename) {
 }
 
 /* ----------------------------------------------------------------------------
- * Routes
- * --------------------------------------------------------------------------*/
+ * 🩵 Routes
+ * -------------------------------------------------------------------------- */
 
-// Health/ping: GET /api/upload/ping
+/**
+ * GET /api/upload/ping
+ * Health check
+ */
 router.get("/ping", (_req, res) => {
-  res.json({ ok: true, where: "upload.routes.js" });
+  res.json({ ok: true, where: "upload.routes.js", timestamp: new Date().toISOString() });
 });
 
-// Single upload: POST /api/upload
-// Field name must be "image"
-router.post("/", (req, res) => {
+/**
+ * POST /api/upload
+ * Single file upload
+ * Field name: "image"
+ */
+router.post("/", requireAuth, requireAdmin, (req, res) => {
   upload.single("image")(req, res, (err) => {
     if (err) {
       if (err.code === "LIMIT_FILE_SIZE") {
@@ -85,22 +93,28 @@ router.post("/", (req, res) => {
       return res.status(400).json({ error: err.message || "Upload failed" });
     }
     if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded (field: image)" });
+      return res.status(400).json({ error: "No file uploaded (field name: image)" });
     }
 
     const payload = {
       url: toPublicUrl(req.file.filename),
+      relative: `/uploads/${req.file.filename}`,
       filename: req.file.filename,
       size: req.file.size,
       mimetype: req.file.mimetype,
     };
+
+    console.log("[upload] saved:", req.file.filename);
     return res.status(201).json(payload);
   });
 });
 
-// Multi upload (optional): POST /api/upload/multiple
-// Field name must be "images" (array)
-router.post("/multiple", (req, res) => {
+/**
+ * POST /api/upload/multiple
+ * Multiple file upload
+ * Field name: "images" (array)
+ */
+router.post("/multiple", requireAuth, requireAdmin, (req, res) => {
   upload.array("images", 6)(req, res, (err) => {
     if (err) {
       if (err.code === "LIMIT_FILE_SIZE") {
@@ -108,22 +122,56 @@ router.post("/multiple", (req, res) => {
       }
       return res.status(400).json({ error: err.message || "Upload failed" });
     }
+
     const files = req.files || [];
-    if (!files.length) return res.status(400).json({ error: "No files uploaded (field: images[])" });
+    if (!files.length) {
+      return res.status(400).json({ error: "No files uploaded (field name: images[])" });
+    }
 
     const data = files.map((f) => ({
       url: toPublicUrl(f.filename),
+      relative: `/uploads/${f.filename}`,
       filename: f.filename,
       size: f.size,
       mimetype: f.mimetype,
     }));
-    return res.status(201).json({ files: data, count: data.length });
+
+    console.log(`[upload] uploaded ${files.length} file(s)`);
+    return res.status(201).json({ ok: true, files: data, count: data.length });
   });
 });
 
+/**
+ * DELETE /api/upload/:filename
+ * Delete an uploaded file (admin-only)
+ */
+router.delete("/:filename", requireAuth, requireAdmin, (req, res) => {
+  try {
+    const { filename } = req.params;
+    if (!filename || typeof filename !== "string") {
+      return res.status(400).json({ error: "Filename required" });
+    }
+
+    const absPath = path.join(UPLOAD_DIR, filename);
+    if (!absPath.startsWith(UPLOAD_DIR)) {
+      return res.status(400).json({ error: "Invalid filename" });
+    }
+    if (!fs.existsSync(absPath)) {
+      return res.status(404).json({ error: "File not found" });
+    }
+
+    fs.unlinkSync(absPath);
+    console.log("[upload] deleted:", filename);
+    return res.json({ ok: true, message: "File deleted", filename });
+  } catch (err) {
+    console.error("[upload] delete error:", err);
+    return res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
 /* ----------------------------------------------------------------------------
- * Multer-specific error handler (kept local to this router)
- * --------------------------------------------------------------------------*/
+ * ❗ Multer Error Handling
+ * -------------------------------------------------------------------------- */
 router.use((err, _req, res, next) => {
   if (err && err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ error: "Max file size is 3MB" });
