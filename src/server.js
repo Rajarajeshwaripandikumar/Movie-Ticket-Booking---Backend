@@ -1,15 +1,46 @@
 // backend/src/server.js
 import dotenv from "dotenv";
-// load .env right away so imports below see env vars
 dotenv.config();
 
 import http from "http";
 import mongoose from "mongoose";
 import path from "path";
 import fs from "fs";
-import express from "express"; // needed for static serving
+import express from "express";
+import cors from "cors";
 import { v2 as cloudinary } from "cloudinary";
 import app from "./app.js";
+
+/* -------------------------------------------------------------------------- */
+/*                             ✅ CORS FIX START                              */
+/* -------------------------------------------------------------------------- */
+
+// ✅ Define allowed frontend origins
+const allowedOrigins = [
+  "https://movieticketbooking-rajy.netlify.app",
+  "http://localhost:5173", // dev
+];
+
+// ⚙️ Add before routes/static
+app.use(
+  cors({
+    origin(origin, callback) {
+      // allow mobile apps or curl (no origin)
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      console.warn("[CORS] Blocked origin:", origin);
+      return callback(new Error("CORS not allowed for origin: " + origin));
+    },
+    credentials: true,
+    exposedHeaders: ["Content-Length", "Content-Type"],
+  })
+);
+
+// Optional headers for SSE + security
+app.use((req, res, next) => {
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  next();
+});
 
 /* -------------------------------------------------------------------------- */
 /*                      Quick runtime env checks (debug)                      */
@@ -29,7 +60,6 @@ console.log("  CLOUDINARY_FOLDER =", process.env.CLOUDINARY_FOLDER || "(default 
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
 const uploadsPath = path.join(process.cwd(), UPLOADS_DIR);
 
-// Ensure folder exists
 try {
   if (!fs.existsSync(uploadsPath)) {
     fs.mkdirSync(uploadsPath, { recursive: true });
@@ -39,7 +69,7 @@ try {
   console.warn("[startup] Could not ensure uploads dir:", err?.message || err);
 }
 
-// Mount static /uploads route before anything else
+// Serve uploaded files
 app.use(
   "/uploads",
   express.static(uploadsPath, {
@@ -51,7 +81,7 @@ app.use(
 console.log(`🖼️  Serving static uploads from: ${uploadsPath}`);
 
 /* -------------------------------------------------------------------------- */
-/*                         Cloudinary SDK config (for test route)             */
+/*                         Cloudinary SDK config                              */
 /* -------------------------------------------------------------------------- */
 try {
   cloudinary.config({
@@ -65,16 +95,10 @@ try {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                         Temporary debug route: test Cloudinary             */
+/*                      Temporary Cloudinary test route                       */
 /* -------------------------------------------------------------------------- */
-/**
- * POST /api/movies/test-cloud
- * No auth. uploads a public sample image to your Cloudinary account and returns result.
- * Remove this route after debugging.
- */
 app.post("/api/movies/test-cloud", async (_req, res) => {
   try {
-    // sample remote image url (Cloudinary demo)
     const sampleUrl = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
     const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
     const result = await cloudinary.uploader.upload(sampleUrl, {
@@ -101,20 +125,18 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                             ENV + DB CONFIG                                */
+/*                             DB CONFIG + SERVER                             */
 /* -------------------------------------------------------------------------- */
 const PORT = Number(process.env.PORT) || 8080;
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
 if (!MONGO_URI) {
-  console.error(
-    "❌ MONGO_URI (or MONGODB_URI) is not set. Put it in .env (do NOT hardcode credentials)."
-  );
+  console.error("❌ Missing MONGO_URI in .env");
   process.exit(1);
 }
 
 /* -------------------------------------------------------------------------- */
-/*                           MongoDB Connect Helper                           */
+/*                         MongoDB Connect Helper                             */
 /* -------------------------------------------------------------------------- */
 async function connectWithRetry(uri, maxAttempts = 6) {
   let attempt = 0;
@@ -122,9 +144,7 @@ async function connectWithRetry(uri, maxAttempts = 6) {
   while (attempt < maxAttempts) {
     try {
       attempt++;
-      console.log(
-        `🔌 Attempting MongoDB connection (attempt ${attempt}/${maxAttempts})...`
-      );
+      console.log(`🔌 MongoDB connect attempt ${attempt}/${maxAttempts}...`);
       await mongoose.connect(uri, {
         serverSelectionTimeoutMS: 10_000,
         connectTimeoutMS: 10_000,
@@ -137,14 +157,14 @@ async function connectWithRetry(uri, maxAttempts = 6) {
       console.error(`MongoDB connect attempt ${attempt} failed: ${msg}`);
       if (attempt >= maxAttempts) throw err;
       const delay = Math.min(30_000, baseDelay * 2 ** attempt);
-      console.log(`⏳ Waiting ${delay}ms before retrying...`);
+      console.log(`⏳ Retrying in ${delay}ms...`);
       await new Promise((res) => setTimeout(res, delay));
     }
   }
 }
 
 /* -------------------------------------------------------------------------- */
-/*                             HTTP Server Boot                               */
+/*                           HTTP Server Boot                                 */
 /* -------------------------------------------------------------------------- */
 let server;
 let shuttingDown = false;
@@ -153,11 +173,12 @@ async function start() {
   try {
     app.locals.dbReady = false;
     server = http.createServer(app);
+
+    // Keep-alive config
     server.requestTimeout = 0;
     server.headersTimeout = 0;
     server.keepAliveTimeout = 2 * 60 * 60 * 1000;
     server.maxRequestsPerSocket = 0;
-
     server.on("connection", (socket) => {
       try {
         socket.setKeepAlive(true, 30_000);
@@ -165,17 +186,11 @@ async function start() {
       } catch {}
     });
 
-    server.listen(PORT, () => {
-      console.log(
-        `🚀 API running on http://localhost:${PORT} (env=${
-          process.env.NODE_ENV || "development"
-        })`
-      );
-    });
-
-    mongoose.connection.on("error", (err) =>
-      console.error("MongoDB connection error:", err)
+    server.listen(PORT, () =>
+      console.log(`🚀 API running on http://localhost:${PORT}`)
     );
+
+    mongoose.connection.on("error", (err) => console.error("MongoDB error:", err));
     mongoose.connection.on("disconnected", () => {
       console.warn("MongoDB disconnected");
       app.locals.dbReady = false;
@@ -191,48 +206,27 @@ async function start() {
         console.log("✅ MongoDB ready");
       })
       .catch((err) => {
-        console.error("❌ MongoDB failed after retries:", err);
+        console.error("❌ MongoDB failed:", err);
       });
 
+    // graceful shutdown
     const shutdown = async (signal) => {
-      if (shuttingDown) {
-        console.warn("Shutdown already in progress; ignoring duplicate signal.");
-        return;
-      }
+      if (shuttingDown) return;
       shuttingDown = true;
-      console.log(`\n⚠️ Received ${signal} — starting graceful shutdown...`);
-
+      console.log(`⚠️ Received ${signal} — shutting down...`);
       try {
-        if (server) {
-          await new Promise((resolve) => server.close(resolve));
-          console.log("HTTP server closed.");
-        }
-
-        const GRACE_PERIOD_MS = Number(process.env.SHUTDOWN_GRACE_MS) || 10_000;
-        console.log(
-          `Waiting up to ${GRACE_PERIOD_MS}ms for in-flight requests to finish...`
-        );
-        await new Promise((res) => setTimeout(res, GRACE_PERIOD_MS));
-
+        if (server) await new Promise((resolve) => server.close(resolve));
         await mongoose.disconnect();
-        console.log("✅ MongoDB disconnected. Bye!");
+        console.log("✅ Shutdown complete");
         process.exit(0);
       } catch (err) {
-        console.error("Error during shutdown:", err);
+        console.error("Shutdown error:", err);
         process.exit(1);
       }
     };
 
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("unhandledRejection", (reason) => {
-      console.error("Unhandled Rejection:", reason);
-      shutdown("unhandledRejection").catch(() => process.exit(1));
-    });
-    process.on("uncaughtException", (err) => {
-      console.error("Uncaught Exception:", err);
-      shutdown("uncaughtException").catch(() => process.exit(1));
-    });
   } catch (err) {
     console.error("❌ Failed to start app:", err);
     process.exit(1);
