@@ -4,10 +4,20 @@ import path from "path";
 import fs from "fs";
 import multer from "multer";
 import mongoose from "mongoose";
+import { v2 as cloudinary } from "cloudinary";
 import Theater from "../models/Theater.js";
 import Screen from "../models/Screen.js";
 
 const router = express.Router();
+
+/* -------------------------------------------------------------------------- */
+/*                        Cloudinary configuration                             */
+/* -------------------------------------------------------------------------- */
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 /* -------------------------------------------------------------------------- */
 /*                               Multer setup                                 */
@@ -16,7 +26,7 @@ const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadDir),
+  destination: (_req, _file, cb) => cb(null, uploadDir),
   filename: (_, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const base = path
@@ -27,7 +37,6 @@ const storage = multer.diskStorage({
   },
 });
 
-// return MulterError for invalid file -> consistent handling later
 const fileFilter = (_, file, cb) => {
   const ok = ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype);
   if (ok) return cb(null, true);
@@ -46,12 +55,9 @@ const upload = multer({
 /*                                   Helpers                                  */
 /* -------------------------------------------------------------------------- */
 const isId = (id) => mongoose.isValidObjectId(id);
-
 const toLower = (v) => String(v || "").trim().toLowerCase();
-
 const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Safe unlink that refuses to unlink outside uploadDir
 const safeUnlink = (rel) => {
   try {
     if (!rel) return;
@@ -69,7 +75,52 @@ const safeUnlink = (rel) => {
   }
 };
 
-// Try to find existing by lowers; if not present in DB, fallback to i-regex
+/* Extract Cloudinary public_id from URL or accept a public_id */
+function extractPublicId(urlOrId) {
+  if (!urlOrId) return null;
+  try {
+    const s = String(urlOrId).trim();
+    if (/^https?:\/\//i.test(s)) {
+      const u = new URL(s);
+      const p = u.pathname;
+      const idx = p.indexOf("/upload/");
+      if (idx >= 0) {
+        let after = p.slice(idx + "/upload/".length);
+        // remove version like v12345/
+        after = after.replace(/^v\d+\//, "");
+        // strip extension
+        after = after.replace(/\.[a-z0-9]+$/i, "");
+        return after;
+      }
+      return null;
+    }
+    return s;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Delete a Cloudinary image if the ref is a cloudinary id/url */
+async function deleteCloudImageIfAny(ref) {
+  if (!ref) return;
+  const publicId = extractPublicId(ref);
+  if (!publicId) {
+    // maybe local path; try to unlink
+    safeUnlink(ref);
+    return;
+  }
+  try {
+    const res = await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
+    console.log("[Cloudinary] destroy result:", publicId, res);
+  } catch (e) {
+    console.warn("[Cloudinary] destroy failed for", publicId, e?.message || e);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Helpers (db)                              */
+/* -------------------------------------------------------------------------- */
+// find existing theater by case-insensitive name+city (fast path uses lower fields)
 async function findExistingTheaterByNameCity(name, city) {
   const nameLower = toLower(name);
   const cityLower = toLower(city);
@@ -77,12 +128,11 @@ async function findExistingTheaterByNameCity(name, city) {
   let existing = await Theater.findOne({ nameLower, cityLower }).lean();
   if (existing) return existing;
 
-  // Fallback for legacy docs without lower fields
+  // legacy fallback: case-insensitive regex
   existing = await Theater.findOne({
     name: { $regex: `^${esc(name)}$`, $options: "i" },
     city: { $regex: `^${esc(city)}$`, $options: "i" },
   }).lean();
-
   return existing;
 }
 
@@ -92,16 +142,14 @@ async function findExistingTheaterByNameCity(name, city) {
 
 /**
  * POST /api/theaters
- * Create new theater (accepts JSON or multipart form)
- * - Idempotent: pre-check existing by (name, city) case-insensitively
- * - If duplicate → 409 with existing doc
+ * Create new theater (accepts multipart `image` or JSON `imageUrl`)
+ * Idempotent pre-check by (name, city)
+ *
+ * NOTE: consider adding `requireAuth, requireAdmin` to protect this endpoint.
  */
 router.post("/", upload.single("image"), async (req, res) => {
-  // Build image URL from either multipart `image` or JSON `imageUrl`
-  const uploadedImageUrl = req.file ? `/uploads/${req.file.filename}` : "";
-  const cleanupNewUpload = () => {
-    if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-  };
+  const uploadedImagePath = req.file ? `/uploads/${req.file.filename}` : "";
+  const cleanupNewUpload = () => { if (req.file) safeUnlink(`/uploads/${req.file.filename}`); };
 
   try {
     const { name, address = "", city, amenities = "", screens = 1, imageUrl: bodyImageUrl = "" } = req.body;
@@ -123,8 +171,30 @@ router.post("/", upload.single("image"), async (req, res) => {
       });
     }
 
-    // choose final image
-    const finalImage = uploadedImageUrl || String(bodyImageUrl || "");
+    // Decide final image: upload first (Cloudinary) if req.file present
+    let finalImage = bodyImageUrl || "";
+    let finalPublicId = null;
+
+    if (req.file) {
+      const localPath = path.join(uploadDir, req.file.filename);
+      try {
+        const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+        const result = await cloudinary.uploader.upload(localPath, {
+          folder,
+          use_filename: true,
+          unique_filename: true,
+          resource_type: "image",
+        });
+        // remove local temp
+        safeUnlink(localPath);
+        finalImage = result.secure_url;
+        finalPublicId = result.public_id;
+      } catch (e) {
+        cleanupNewUpload();
+        console.error("[Theaters] cloud upload failed:", e);
+        return res.status(500).json({ ok: false, error: "Failed to upload image" });
+      }
+    }
 
     // normalize amenities
     const parsedAmenities = Array.isArray(amenities)
@@ -141,8 +211,8 @@ router.post("/", upload.single("image"), async (req, res) => {
       imageUrl: finalImage || "",
       posterUrl: finalImage || undefined,
       theaterImage: finalImage || undefined,
+      posterPublicId: finalPublicId || undefined, // optional
       screens: Number(screens) || 1,
-      // In case your model's pre('save') sets these, it's fine; otherwise set explicitly:
       nameLower: toLower(name),
       cityLower: toLower(city),
     };
@@ -150,11 +220,10 @@ router.post("/", upload.single("image"), async (req, res) => {
     const theater = await Theater.create(doc);
     return res.status(201).json({ ok: true, data: theater });
   } catch (err) {
-    // Duplicate key from DB (race condition) → map to 409 and return existing
+    if (req.file) cleanupNewUpload();
     if (err?.code === 11000) {
       const { name, city } = req.body;
       const existing = await findExistingTheaterByNameCity(name, city);
-      if (req.file) cleanupNewUpload();
       return res.status(409).json({
         ok: false,
         error: "Theater with this name & city already exists",
@@ -163,34 +232,63 @@ router.post("/", upload.single("image"), async (req, res) => {
       });
     }
     console.error("[Theaters] POST / error:", err);
-    if (req.file) cleanupNewUpload();
     return res.status(500).json({ ok: false, error: "Failed to create theater" });
   }
 });
 
 /**
  * PUT /api/theaters/:id
- * Update theater; deletes old image if replaced
- * - pre('save') on model may keep lower fields in sync; we also sync explicitly
+ * Update theater; if image replaced, delete old image (Cloudinary or local) and set new
+ *
+ * NOTE: consider adding requireAuth/requireAdmin here too.
  */
 router.put("/:id", upload.single("image"), async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isId(id)) return res.status(400).json({ ok: false, error: "Invalid theater id" });
+    if (!isId(id)) {
+      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+      return res.status(400).json({ ok: false, error: "Invalid theater id" });
+    }
 
     const existing = await Theater.findById(id);
-    if (!existing) return res.status(404).json({ ok: false, error: "Theater not found" });
+    if (!existing) {
+      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+      return res.status(404).json({ ok: false, error: "Theater not found" });
+    }
 
     const { name, address, city, amenities, imageUrl: bodyImageUrl } = req.body;
 
-    // handle image
+    // handle image: if new file -> cloud upload; if bodyImageUrl provided -> use it
     let imageUrl = existing.imageUrl || existing.posterUrl || existing.theaterImage || "";
+    let newPublicId = existing.posterPublicId || null;
+    let oldImageRef = null;
+
     if (req.file) {
-      if (imageUrl) safeUnlink(imageUrl);
-      imageUrl = `/uploads/${req.file.filename}`;
+      // upload new to cloud
+      const localPath = path.join(uploadDir, req.file.filename);
+      try {
+        const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+        const result = await cloudinary.uploader.upload(localPath, {
+          folder,
+          use_filename: true,
+          unique_filename: true,
+          resource_type: "image",
+        });
+        safeUnlink(localPath);
+        oldImageRef = existing.posterPublicId || existing.imageUrl || existing.posterUrl;
+        imageUrl = result.secure_url;
+        newPublicId = result.public_id;
+      } catch (e) {
+        safeUnlink(localPath);
+        console.error("[Theaters] cloud upload failed (update):", e);
+        return res.status(500).json({ ok: false, error: "Failed to upload image" });
+      }
     } else if (typeof bodyImageUrl === "string" && bodyImageUrl && bodyImageUrl !== imageUrl) {
-      // allow replacing via JSON string
+      // user provided a new URL (string) to replace current image
+      oldImageRef = existing.posterPublicId || existing.imageUrl || existing.posterUrl;
       imageUrl = bodyImageUrl;
+      // clear publicId if bodyImageUrl is not cloudinary (we won't attempt deletion by public id later)
+      newPublicId = extractPublicId(bodyImageUrl) || undefined;
     }
 
     // normalize amenities
@@ -218,13 +316,18 @@ router.put("/:id", upload.single("image"), async (req, res) => {
       existing.imageUrl = imageUrl;
       existing.posterUrl = imageUrl;
       existing.theaterImage = imageUrl;
+      existing.posterPublicId = newPublicId;
     }
 
     try {
-      const saved = await existing.save(); // pre('save') will also run if defined
+      const saved = await existing.save();
+      // If we replaced the image, attempt to delete the old one (cloud or local)
+      if (oldImageRef && oldImageRef !== existing.imageUrl && oldImageRef !== existing.posterPublicId) {
+        // delete if cloud or local
+        await deleteCloudImageIfAny(oldImageRef);
+      }
       return res.json({ ok: true, data: saved });
     } catch (err) {
-      // If user tries to rename to a duplicate name+city
       if (err?.code === 11000) {
         return res.status(409).json({ ok: false, error: "Another theater with same name & city exists." });
       }
@@ -239,6 +342,7 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 /**
  * DELETE /api/theaters/:id
  * Remove theater + image + screens
+ * NOTE: this will delete cloud image if stored as cloudinary url/public_id.
  */
 router.delete("/:id", async (req, res) => {
   try {
@@ -248,8 +352,10 @@ router.delete("/:id", async (req, res) => {
     const theater = await Theater.findById(id);
     if (!theater) return res.status(404).json({ ok: false, error: "Theater not found" });
 
-    const oldImg = theater.imageUrl || theater.posterUrl || theater.theaterImage;
-    if (oldImg) safeUnlink(oldImg);
+    const oldImg = theater.posterPublicId || theater.imageUrl || theater.posterUrl || theater.theaterImage;
+    if (oldImg) {
+      await deleteCloudImageIfAny(oldImg);
+    }
 
     await Screen.deleteMany({ theater: id });
     await theater.deleteOne();
@@ -261,20 +367,15 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-/**
- * GET /api/theaters
- * Paginated, newest-first list with city list and screen counts
- * - Uses lower-case fields for exact filters
- */
+/* ---------- Remaining GET routes (unchanged) ---------- */
+
 router.get("/", async (req, res) => {
   try {
-    // no-cache headers
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.set("Pragma", "no-cache");
     res.set("Expires", "0");
 
     const { q, city, name, page = 1, limit = 12 } = req.query;
-
     const filter = {};
 
     if (q) {
@@ -284,8 +385,6 @@ router.get("/", async (req, res) => {
         { address: new RegExp(q, "i") },
       ];
     }
-
-    // Exact filters (normalized)
     if (name) filter.nameLower = toLower(name);
     if (city && city !== "All") filter.cityLower = toLower(city);
 
@@ -294,43 +393,22 @@ router.get("/", async (req, res) => {
     const skip = (safePage - 1) * safeLimit;
 
     const [theaters, totalCount, cities] = await Promise.all([
-      Theater.find(filter)
-        .sort({ updatedAt: -1, _id: -1 }) // newest first
-        .skip(skip)
-        .limit(safeLimit)
-        .lean(),
+      Theater.find(filter).sort({ updatedAt: -1, _id: -1 }).skip(skip).limit(safeLimit).lean(),
       Theater.countDocuments(filter),
       Theater.distinct("city"),
     ]);
 
-    // attach screen counts
     const screenCounts = await Screen.aggregate([{ $group: { _id: "$theater", count: { $sum: 1 } } }]);
     const countMap = new Map(screenCounts.map((c) => [String(c._id), c.count]));
 
-    const enriched = theaters.map((t) => ({
-      ...t,
-      screensCount: countMap.get(String(t._id)) || 0,
-    }));
-
-    res.json({
-      ok: true,
-      theaters: enriched,
-      count: totalCount,
-      cities,
-      page: safePage,
-      limit: safeLimit,
-      hasMore: skip + enriched.length < totalCount,
-    });
+    const enriched = theaters.map((t) => ({ ...t, screensCount: countMap.get(String(t._id)) || 0 }));
+    res.json({ ok: true, theaters: enriched, count: totalCount, cities, page: safePage, limit: safeLimit, hasMore: skip + enriched.length < totalCount });
   } catch (err) {
     console.error("[Theaters] GET / error:", err);
     res.status(500).json({ ok: false, message: "Failed to fetch theaters" });
   }
 });
 
-/**
- * GET /api/theaters/:id
- * Single theater + screen count
- */
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -347,10 +425,6 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-/**
- * GET /api/theaters/:theaterId/screens
- * List screens for one theater
- */
 router.get("/:theaterId/screens", async (req, res) => {
   try {
     const { theaterId } = req.params;
@@ -364,17 +438,12 @@ router.get("/:theaterId/screens", async (req, res) => {
   }
 });
 
-/**
- * POST /api/theaters/:theaterId/screens
- * Quick add screen for a theater
- */
 router.post("/:theaterId/screens", async (req, res) => {
   try {
     const { theaterId } = req.params;
     const { name = "Screen 1", rows = 10, columns = 15 } = req.body;
 
     if (!isId(theaterId)) return res.status(400).json({ ok: false, error: "Invalid theater id" });
-
     const theater = await Theater.findById(theaterId);
     if (!theater) return res.status(404).json({ ok: false, error: "Theater not found" });
 
@@ -390,15 +459,10 @@ router.post("/:theaterId/screens", async (req, res) => {
 router.use((err, _req, res, next) => {
   if (!err) return next();
   if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({ ok: false, error: "File too large (max 3MB)" });
-    }
-    if (err.code === "LIMIT_UNEXPECTED_FILE") {
-      return res.status(400).json({ ok: false, error: err.message || "Invalid file" });
-    }
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ ok: false, error: "File too large (max 3MB)" });
+    if (err.code === "LIMIT_UNEXPECTED_FILE") return res.status(400).json({ ok: false, error: err.message || "Invalid file" });
     return res.status(400).json({ ok: false, error: err.message || "File upload error" });
   }
-  // Generic fallback
   console.error("[Theaters router] unhandled error:", err);
   return res.status(500).json({ ok: false, error: "Server error" });
 });
