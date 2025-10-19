@@ -1,3 +1,4 @@
+// backend/src/routes/movies.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import path from "path";
@@ -38,43 +39,43 @@ cloudinary.config({
 /*                                MULTER SETUP                                */
 /* -------------------------------------------------------------------------- */
 const memoryStorage = multer.memoryStorage();
-
 const fileFilter = (_, file, cb) => {
   const ok = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"].includes(file.mimetype);
-  ok
-    ? cb(null, true)
-    : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only image files are allowed"));
+  ok ? cb(null, true) : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only image files allowed"));
 };
-
-const upload = multer({
-  storage: memoryStorage,
-  fileFilter,
-  limits: { fileSize: 3 * 1024 * 1024 }, // 3 MB
-});
+const upload = multer({ storage: memoryStorage, fileFilter, limits: { fileSize: 3 * 1024 * 1024 } });
 
 function logUpload(req, _res, next) {
-  if (req.file) console.log("[uploads] buffer received:", req.file.originalname, "size:", req.file.size);
-  else console.log("[uploads] no file on this request");
+  if (req.file) console.log("[uploads] received:", req.file.originalname, "size:", req.file.size);
+  else console.log("[uploads] no file");
   next();
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                HELPERS                                     */
+/*                                  HELPERS                                   */
 /* -------------------------------------------------------------------------- */
 const isValidId = (id) => mongoose.isValidObjectId(id);
-
-function castToStringArray(anyCast) {
-  if (!anyCast) return [];
-  if (Array.isArray(anyCast)) return anyCast.map((c) => String(c).trim()).filter(Boolean);
-  if (typeof anyCast === "string") return anyCast.split(",").map((x) => x.trim()).filter(Boolean);
+function castToStringArray(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val.map((v) => String(v).trim()).filter(Boolean);
+  if (typeof val === "string") return val.split(",").map((x) => x.trim()).filter(Boolean);
   return [];
 }
-
 const castResponseObjects = (anyCast) => castToStringArray(anyCast).map((name) => ({ actorName: name }));
 
-/* -------------------------------------------------------------------------- */
-/*                       Cloudinary Upload Utility                            */
-/* -------------------------------------------------------------------------- */
+async function deleteCloudinaryImageMaybe(ref) {
+  if (!ref) return;
+  try {
+    const publicId = typeof ref === "string" && ref.includes("/")
+      ? ref.split("/").slice(-2).join("/").replace(/\.[a-z0-9]+$/i, "")
+      : ref;
+    const res = await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
+    console.log("[Cloudinary] deleted:", publicId, res.result);
+  } catch (e) {
+    console.warn("[Cloudinary] failed to delete:", e.message);
+  }
+}
+
 function uploadBufferToCloudinary(buffer, folder = "movie-posters") {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
@@ -105,10 +106,7 @@ router.get("/", async (req, res) => {
       Movie.find().sort({ releaseDate: -1, createdAt: -1 }).skip(skip).limit(limit).lean(),
       Movie.countDocuments(),
     ]);
-    res.json({
-      movies: docs.map((m) => ({ ...m, cast: castResponseObjects(m.cast) })),
-      count,
-    });
+    res.json({ movies: docs.map((m) => ({ ...m, cast: castResponseObjects(m.cast) })), count });
   } catch (err) {
     console.error("[Movies] GET / error:", err);
     res.status(500).json({ message: "Failed to load movies", error: err.message });
@@ -153,23 +151,20 @@ router.get("/:id", async (req, res) => {
 /*                            ADMIN ROUTES (/admin)                           */
 /* -------------------------------------------------------------------------- */
 
-// POST /api/movies/admin — Create
-router.post("/admin", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
+// POST /api/admin/movies — Create
+router.post("/admin/movies", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const payload = req.body || {};
     if (!payload.title) return res.status(400).json({ message: "Title is required" });
-
     payload.cast = castToStringArray(payload.cast);
 
     if (req.file) {
-      const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-      const result = await uploadBufferToCloudinary(req.file.buffer, folder);
+      const result = await uploadBufferToCloudinary(req.file.buffer);
       payload.posterUrl = result.secure_url;
       payload.posterPublicId = result.public_id;
     }
 
     if (payload.durationMins) payload.durationMins = Number(payload.durationMins);
-
     if (req.user) {
       payload.uploaderId = req.user.id || req.user._id;
       payload.uploaderRole = req.user.role || "admin";
@@ -178,13 +173,13 @@ router.post("/admin", requireAuth, requireAdmin, upload.single("image"), logUplo
     const movie = await Movie.create(payload);
     res.status(201).json({ ok: true, data: movie });
   } catch (err) {
-    console.error("[Movies] POST /admin error:", err);
+    console.error("[Movies] POST /admin/movies error:", err);
     res.status(500).json({ message: "Failed to create movie", error: err.message });
   }
 });
 
-// PUT /api/movies/admin/:id — Update
-router.put("/admin/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
+// PUT /api/admin/movies/:id — Update
+router.put("/admin/movies/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
@@ -196,30 +191,34 @@ router.put("/admin/:id", requireAuth, requireAdmin, upload.single("image"), logU
     payload.cast = castToStringArray(payload.cast);
 
     if (req.file) {
-      const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-      const result = await uploadBufferToCloudinary(req.file.buffer, folder);
+      const result = await uploadBufferToCloudinary(req.file.buffer);
       payload.posterUrl = result.secure_url;
       payload.posterPublicId = result.public_id;
+      // Delete old one if exists
+      if (existing.posterPublicId) await deleteCloudinaryImageMaybe(existing.posterPublicId);
     }
 
     const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
     res.json({ ok: true, data: updated });
   } catch (err) {
-    console.error("[Movies] PUT /admin/:id error:", err);
+    console.error("[Movies] PUT /admin/movies/:id error:", err);
     res.status(500).json({ message: "Failed to update movie", error: err.message });
   }
 });
 
-// DELETE /api/movies/admin/:id — Delete
-router.delete("/admin/:id", requireAuth, requireAdmin, async (req, res) => {
+// DELETE /api/admin/movies/:id — Delete
+router.delete("/admin/movies/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
+
     const deleted = await Movie.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ message: "Movie not found" });
+
+    if (deleted.posterPublicId) await deleteCloudinaryImageMaybe(deleted.posterPublicId);
     res.json({ ok: true, message: "Movie deleted", id });
   } catch (err) {
-    console.error("[Movies] DELETE /admin/:id error:", err);
+    console.error("[Movies] DELETE /admin/movies/:id error:", err);
     res.status(500).json({ message: "Failed to delete movie", error: err.message });
   }
 });
