@@ -4,9 +4,13 @@ import mongoose from "mongoose";
 import path from "path";
 import fs from "fs";
 import multer from "multer";
+import streamifier from "streamifier";
 import { v2 as cloudinary } from "cloudinary";
 import Movie from "../models/Movie.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const router = Router();
 
@@ -31,28 +35,20 @@ const MIME_EXT = {
 };
 
 /* -------------------------------------------------------------------------- */
-/*                         Cloudinary configuration                            */
+/*                         Cloudinary configuration                           */
 /* -------------------------------------------------------------------------- */
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
 });
 
 /* -------------------------------------------------------------------------- */
 /*                                MULTER SETUP                                */
 /* -------------------------------------------------------------------------- */
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadDir),
-  filename: (_, file, cb) => {
-    let ext = (path.extname(file.originalname || "") || "").toLowerCase();
-    if (!ext) ext = MIME_EXT[file.mimetype] || ".jpg";
-    const base = (path.parse(file.originalname || "").name || "poster")
-      .replace(/\s+/g, "-")
-      .replace(/[^a-zA-Z0-9-_]/g, "");
-    cb(null, `${base}-${Date.now()}${ext}`);
-  },
-});
+// We'll use memory storage so we can stream to Cloudinary without writing temp files
+const memoryStorage = multer.memoryStorage();
 
 const fileFilter = (_, file, cb) => {
   const ok = [
@@ -68,14 +64,15 @@ const fileFilter = (_, file, cb) => {
 };
 
 const upload = multer({
-  storage,
+  storage: memoryStorage,
   fileFilter,
   limits: { fileSize: 3 * 1024 * 1024 }, // 3 MB
 });
 
 function logUpload(req, _res, next) {
   if (req.file) {
-    console.log("[uploads] saved:", req.file.filename, "->", path.join(uploadDir, req.file.filename));
+    const name = req.file.originalname || "(unnamed)";
+    console.log("[uploads] buffer received:", name, "size:", req.file.size);
   } else {
     console.log("[uploads] no file on this request");
   }
@@ -104,7 +101,7 @@ const toRelativePoster = (u) => {
       return a.pathname;
     }
   } catch {}
-  return u.startsWith("/") ? u : `/${u}`;
+  return u && typeof u === "string" ? (u.startsWith("/") ? u : `/${u}`) : "";
 };
 
 const onlyUploads = (relish) => {
@@ -178,19 +175,23 @@ function extractPublicIdFromUrlOrId(urlOrId) {
   if (!urlOrId) return null;
   try {
     const s = String(urlOrId).trim();
+    // if looks like a full url, parse and extract path after /upload/
     if (/^https?:\/\//i.test(s)) {
       const u = new URL(s);
-      const p = u.pathname;
+      const p = u.pathname; // e.g. /<cloudname>/image/upload/v123/folder/sub/name.jpg
       const idx = p.indexOf("/upload/");
       if (idx >= 0) {
-        let after = p.slice(idx + "/upload/".length);
+        let after = p.slice(idx + "/upload/".length); // e.g. v123/folder/sub/name.jpg
+        // strip version like v123/ at start
         after = after.replace(/^v\d+\//, "");
+        // remove extension if present
         after = after.replace(/\.[a-z0-9]+$/i, "");
-        return after;
+        return after; // e.g. folder/sub/name
       }
       return null;
     }
-    return s;
+    // otherwise assume a public_id (possibly folder/sub/name)
+    return s || null;
   } catch (e) {
     return null;
   }
@@ -208,7 +209,27 @@ async function deleteCloudinaryImageMaybe(ref) {
     }
     return;
   }
+  // if not a cloudinary public id/url, try local unlink
   safeUnlink(ref);
+}
+
+/* ---------------- helper: upload buffer to Cloudinary -------------------- */
+function uploadBufferToCloudinary(buffer, folder = "movie-posters") {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: "image",
+        use_filename: true,
+        unique_filename: true,
+      },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      }
+    );
+    streamifier.createReadStream(buffer).pipe(uploadStream);
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -294,35 +315,29 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ------------------------- POST: create (admin only) ---------------------- */
+/**
+ * Accepts multipart/form-data with field "image" for poster file.
+ */
 router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const payload = req.body || {};
 
     if (!payload.title || typeof payload.title !== "string") {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
       return res.status(400).json({ message: "Title is required" });
     }
 
     // normalize cast
     payload.cast = castToStringArray(payload.cast);
 
-    // If a file was uploaded -> push to Cloudinary, then delete local temp
+    // If a file was uploaded -> stream to Cloudinary
     if (req.file) {
-      const localPath = path.join(uploadDir, req.file.filename);
       try {
         const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-        const result = await cloudinary.uploader.upload(localPath, {
-          folder,
-          use_filename: true,
-          unique_filename: true,
-          resource_type: "image",
-        });
-        safeUnlink(localPath);
+        const result = await uploadBufferToCloudinary(req.file.buffer, folder);
         payload.posterUrl = result.secure_url;
         payload.posterPublicId = result.public_id;
         console.log("[Movies] cloudinary upload result (create):", result.secure_url, result.public_id);
       } catch (e) {
-        safeUnlink(localPath);
         console.error("[Movies] cloudinary upload failed (create):", e?.message || e);
         return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
       }
@@ -332,7 +347,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
     if (payload.durationMins !== undefined && payload.durationMins !== "") {
       const n = Number(payload.durationMins);
       if (Number.isNaN(n)) {
-        if (req.file && payload.posterPublicId) {
+        if (payload.posterPublicId) {
           await deleteCloudinaryImageMaybe(payload.posterPublicId);
         }
         return res.status(400).json({ message: "durationMins must be a number" });
@@ -353,23 +368,29 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
     res.status(201).json({ ok: true, data: out });
   } catch (err) {
     console.error("[Movies] POST / error:", err);
-    if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+    // cleanup if we uploaded to cloudinary earlier
+    if (req.file && err && err.posterPublicId) {
+      try {
+        await deleteCloudinaryImageMaybe(err.posterPublicId);
+      } catch {}
+    }
     res.status(400).json({ message: "Failed to create movie", error: err.message });
   }
 });
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
+/**
+ * Accepts multipart/form-data with optional field "image" for replacing poster file.
+ */
 router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
       return res.status(400).json({ message: "Invalid movie id" });
     }
 
     const existing = await Movie.findById(id).lean();
     if (!existing) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
       return res.status(404).json({ message: "Movie not found" });
     }
 
@@ -390,24 +411,14 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload,
 
     let oldPosterRef = null;
     if (req.file) {
-      const localPath = path.join(uploadDir, req.file.filename);
       try {
         const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-        const result = await cloudinary.uploader.upload(localPath, {
-          folder,
-          use_filename: true,
-          unique_filename: true,
-          resource_type: "image",
-        });
-        safeUnlink(localPath);
-        // set new poster URL/public id
+        const result = await uploadBufferToCloudinary(req.file.buffer, folder);
         payload.posterUrl = result.secure_url;
         payload.posterPublicId = result.public_id;
-        // remember reference to delete old one (public id preferred)
         oldPosterRef = existing.posterPublicId || existing.posterUrl;
         console.log("[Movies] cloudinary upload result (update):", result.secure_url, result.public_id);
       } catch (e) {
-        safeUnlink(localPath);
         console.error("[Movies] cloudinary upload failed (update):", e?.message || e);
         return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
       }
@@ -422,11 +433,14 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload,
     const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
 
     // If we replaced the poster, delete the old one (Cloudinary or local)
-    if (updated && oldPosterRef && oldPosterRef !== payload.posterUrl && oldPosterRef !== payload.posterPublicId) {
-      try {
-        await deleteCloudinaryImageMaybe(oldPosterRef);
-      } catch (e) {
-        console.warn("[Movies] failed to delete previous poster:", e?.message || e);
+    if (updated && oldPosterRef) {
+      const newRef = updated.posterPublicId || updated.posterUrl;
+      if (oldPosterRef && oldPosterRef !== newRef) {
+        try {
+          await deleteCloudinaryImageMaybe(oldPosterRef);
+        } catch (e) {
+          console.warn("[Movies] failed to delete previous poster:", e?.message || e);
+        }
       }
     }
 
