@@ -47,7 +47,6 @@ cloudinary.config({
 /* -------------------------------------------------------------------------- */
 /*                                MULTER SETUP                                */
 /* -------------------------------------------------------------------------- */
-// We'll use memory storage so we can stream to Cloudinary without writing temp files
 const memoryStorage = multer.memoryStorage();
 
 const fileFilter = (_, file, cb) => {
@@ -175,22 +174,18 @@ function extractPublicIdFromUrlOrId(urlOrId) {
   if (!urlOrId) return null;
   try {
     const s = String(urlOrId).trim();
-    // if looks like a full url, parse and extract path after /upload/
     if (/^https?:\/\//i.test(s)) {
       const u = new URL(s);
-      const p = u.pathname; // e.g. /<cloudname>/image/upload/v123/folder/sub/name.jpg
+      const p = u.pathname;
       const idx = p.indexOf("/upload/");
       if (idx >= 0) {
-        let after = p.slice(idx + "/upload/".length); // e.g. v123/folder/sub/name.jpg
-        // strip version like v123/ at start
+        let after = p.slice(idx + "/upload/".length);
         after = after.replace(/^v\d+\//, "");
-        // remove extension if present
         after = after.replace(/\.[a-z0-9]+$/i, "");
-        return after; // e.g. folder/sub/name
+        return after;
       }
       return null;
     }
-    // otherwise assume a public_id (possibly folder/sub/name)
     return s || null;
   } catch (e) {
     return null;
@@ -209,13 +204,13 @@ async function deleteCloudinaryImageMaybe(ref) {
     }
     return;
   }
-  // if not a cloudinary public id/url, try local unlink
   safeUnlink(ref);
 }
 
-/* ---------------- helper: upload buffer to Cloudinary -------------------- */
-function uploadBufferToCloudinary(buffer, folder = "movie-posters") {
+/* ---------------- helper: upload buffer to Cloudinary (DEBUG) -------------- */
+function uploadBufferToCloudinaryDebug(buffer, folder = "movie-posters") {
   return new Promise((resolve, reject) => {
+    const start = Date.now();
     const uploadStream = cloudinary.uploader.upload_stream(
       {
         folder,
@@ -224,13 +219,61 @@ function uploadBufferToCloudinary(buffer, folder = "movie-posters") {
         unique_filename: true,
       },
       (err, result) => {
-        if (err) return reject(err);
+        const took = Date.now() - start;
+        if (err) {
+          console.error("[Cloudinary DEBUG] upload failed after", took, "ms");
+          try {
+            console.error("  err.message:", err.message);
+            console.error("  err.http_code:", err.http_code);
+            console.error("  err.http_body:", err.http_body);
+            console.error("  err.stack:", err.stack ? err.stack.split("\n").slice(0,5).join("\n") : "");
+          } catch (x) {
+            console.error("[Cloudinary DEBUG] error printing error details:", x);
+          }
+          return reject(err);
+        }
+        console.log("[Cloudinary DEBUG] upload success after", took, "ms");
+        console.log("  secure_url:", result.secure_url);
+        console.log("  public_id :", result.public_id);
         resolve(result);
       }
     );
-    streamifier.createReadStream(buffer).pipe(uploadStream);
+
+    try {
+      streamifier.createReadStream(buffer).pipe(uploadStream);
+    } catch (pipeErr) {
+      console.error("[Cloudinary DEBUG] stream pipe error:", pipeErr);
+      reject(pipeErr);
+    }
   });
 }
+
+/* -------------------------------------------------------------------------- */
+/*                          Temporary test route (debug)                      */
+/* -------------------------------------------------------------------------- */
+/**
+ * POST /api/movies/test-cloud
+ * NO AUTH. Attempts to upload a public sample image into your Cloudinary account.
+ * Use this to confirm the running process can reach Cloudinary and creds are correct.
+ * Remove when finished debugging.
+ */
+router.post("/test-cloud", async (req, res) => {
+  try {
+    const sample = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
+    const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+    const result = await cloudinary.uploader.upload(sample, { folder, resource_type: "image" });
+    return res.json({ ok: true, secure_url: result.secure_url, public_id: result.public_id, raw: result });
+  } catch (err) {
+    console.error("[test-cloud] error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Cloudinary test upload failed",
+      error: err?.message,
+      http_code: err?.http_code,
+      http_body: err?.http_body,
+    });
+  }
+});
 
 /* -------------------------------------------------------------------------- */
 /*                                ROUTES                                      */
@@ -326,19 +369,23 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
       return res.status(400).json({ message: "Title is required" });
     }
 
-    // normalize cast
     payload.cast = castToStringArray(payload.cast);
 
-    // If a file was uploaded -> stream to Cloudinary
+    // If a file was uploaded -> stream to Cloudinary (debug uploader used)
     if (req.file) {
       try {
+        console.log("[Movies] starting cloudinary upload (create) ...");
         const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-        const result = await uploadBufferToCloudinary(req.file.buffer, folder);
+        const result = await uploadBufferToCloudinaryDebug(req.file.buffer, folder);
         payload.posterUrl = result.secure_url;
         payload.posterPublicId = result.public_id;
         console.log("[Movies] cloudinary upload result (create):", result.secure_url, result.public_id);
       } catch (e) {
-        console.error("[Movies] cloudinary upload failed (create):", e?.message || e);
+        // print any Cloudinary fields we can
+        console.error("[Movies] cloudinary upload failed (create) - details:");
+        console.error("  message:", e?.message);
+        console.error("  http_code:", e?.http_code);
+        console.error("  http_body:", e?.http_body);
         return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
       }
     }
@@ -368,7 +415,6 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
     res.status(201).json({ ok: true, data: out });
   } catch (err) {
     console.error("[Movies] POST / error:", err);
-    // cleanup if we uploaded to cloudinary earlier
     if (req.file && err && err.posterPublicId) {
       try {
         await deleteCloudinaryImageMaybe(err.posterPublicId);
@@ -379,9 +425,6 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
 });
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
-/**
- * Accepts multipart/form-data with optional field "image" for replacing poster file.
- */
 router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const { id } = req.params;
@@ -412,19 +455,22 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload,
     let oldPosterRef = null;
     if (req.file) {
       try {
+        console.log("[Movies] starting cloudinary upload (update) ...");
         const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-        const result = await uploadBufferToCloudinary(req.file.buffer, folder);
+        const result = await uploadBufferToCloudinaryDebug(req.file.buffer, folder);
         payload.posterUrl = result.secure_url;
         payload.posterPublicId = result.public_id;
         oldPosterRef = existing.posterPublicId || existing.posterUrl;
         console.log("[Movies] cloudinary upload result (update):", result.secure_url, result.public_id);
       } catch (e) {
-        console.error("[Movies] cloudinary upload failed (update):", e?.message || e);
+        console.error("[Movies] cloudinary upload failed (update) - details:");
+        console.error("  message:", e?.message);
+        console.error("  http_code:", e?.http_code);
+        console.error("  http_body:", e?.http_body);
         return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
       }
     }
 
-    // record uploader info
     if (req.user) {
       payload.uploaderId = req.user.id || req.user._id || req.user.sub;
       payload.uploaderRole = req.user.role || "admin";
@@ -462,7 +508,6 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
     const removed = await Movie.findByIdAndDelete(id).lean();
     if (!removed) return res.status(404).json({ message: "Movie not found" });
 
-    // remove poster (cloudinary public id or url OR local uploads path)
     if (removed.posterPublicId) {
       await deleteCloudinaryImageMaybe(removed.posterPublicId);
     } else if (removed.posterUrl) {
