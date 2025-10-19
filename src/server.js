@@ -11,57 +11,43 @@ import cors from "cors";
 import helmet from "helmet";
 import { v2 as cloudinary } from "cloudinary";
 
-// If you have a central app.js that already builds express app, you can import it.
-// Otherwise, this file creates the app here and mounts routes directly.
-import appRoutes from "./app.js"; // if your app.js exports an express app
-// If app.js does NOT export an app, you can set `const app = express();` and mount routers here.
-// For safety, we'll detect if appRoutes is a function/app or not.
+// import your app if it exports one (optional)
+import appRoutes from "./app.js";
 
 let app;
-if (appRoutes && typeof appRoutes === "function" && appRoutes.name === "app") {
-  // unlikely; fallback to require pattern below
-  app = appRoutes;
-} else if (appRoutes && Object.prototype.toString.call(appRoutes) === "[object Function]") {
-  // If app.js exports a function that returns an app
+if (appRoutes && typeof appRoutes.use === "function") {
+  app = appRoutes; // app.js exported an express app
+} else if (typeof appRoutes === "function") {
   try {
     app = appRoutes();
   } catch {
-    // fallback
     app = express();
   }
-} else if (appRoutes && typeof appRoutes.use === "function") {
-  app = appRoutes; // app.js exported express app
 } else {
-  // fallback: build a minimal app here
   app = express();
-  // add a simple route if none provided
-  // NOTE: If you have routers, import and mount them below manually
 }
 
-// basic middlewares that are safe to add here
+// basic middlewares
 app.set("trust proxy", true);
 app.use(helmet());
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
-/* -------------------------------------------------------------------------- */
-/*                            CORS & Origins config                            */
-/* -------------------------------------------------------------------------- */
+/* ----------------------------- CORS config -------------------------------- */
 const envOrigins = (process.env.FRONTEND_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
 const allowedOrigins = [
-  "https://movieticketbooking-rajy.netlify.app",
+  process.env.FRONTEND_ORIGIN || "https://movieticketbooking-rajy.netlify.app",
   "http://localhost:5173",
   ...envOrigins,
 ];
 
-// Friendly blocking middleware for disallowed origins (returns 403)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (!origin) return next(); // allow non-browser or server-to-server requests
+  if (!origin) return next();
   if (allowedOrigins.includes(origin)) return next();
 
   console.warn(`[CORS] blocked origin ${origin}`);
@@ -69,7 +55,6 @@ app.use((req, res, next) => {
   return res.status(403).json({ ok: false, message: "CORS: origin not allowed" });
 });
 
-// Apply cors for allowed origins + preflight handling
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -84,11 +69,11 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
+
+// Ensure preflight works
 app.options("*", cors());
 
-/* -------------------------------------------------------------------------- */
-/*                         Optional COOP / COEP headers                        */
-/* -------------------------------------------------------------------------- */
+/* -------------------------- Optional COOP / COEP --------------------------- */
 if (process.env.ENABLE_COOP_COEP === "true") {
   console.log("COOP/COEP enabled (cross-origin isolation). Make sure resources are CORP-compatible.");
   app.use((req, res, next) => {
@@ -97,13 +82,11 @@ if (process.env.ENABLE_COOP_COEP === "true") {
     next();
   });
 } else {
-  console.log("COOP/COEP disabled (default). Enable with ENABLE_COOP_COEP=true");
+  console.log("COOP/COEP disabled (default). Set ENABLE_COOP_COEP=true to enable.");
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                Uploads dir                                  */
-/* -------------------------------------------------------------------------- */
-// Use /tmp/uploads in production (writable on Render), local 'uploads' for dev
+/* ------------------------------ Uploads dir -------------------------------- */
+// prefer /tmp/uploads in production; local 'uploads' for dev
 const UPLOADS_DIR =
   process.env.UPLOADS_DIR ||
   (process.env.NODE_ENV === "production" ? "/tmp/uploads" : "uploads");
@@ -113,12 +96,13 @@ try {
   if (fs.existsSync(uploadsPath)) {
     const st = fs.statSync(uploadsPath);
     if (st.isFile()) {
-      // rename file to avoid ENOTDIR
       const backup = `${uploadsPath}.bak-${Date.now()}`;
       fs.renameSync(uploadsPath, backup);
       console.warn(`[startup] Found file at uploads path; renamed to ${backup}`);
       fs.mkdirSync(uploadsPath, { recursive: true });
       console.log(`[startup] Created uploads directory after renaming file: ${uploadsPath}`);
+    } else {
+      console.log(`[startup] uploads path exists and is a directory: ${uploadsPath}`);
     }
   } else {
     fs.mkdirSync(uploadsPath, { recursive: true });
@@ -127,6 +111,15 @@ try {
 } catch (err) {
   console.warn("[startup] Could not ensure uploads dir (may be read-only):", err?.message || err);
 }
+
+// Add header so static uploaded files can be embedded cross-origin
+app.use("/uploads", (req, res, next) => {
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN || "https://movieticketbooking-rajy.netlify.app");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 if (fs.existsSync(uploadsPath) && fs.statSync(uploadsPath).isDirectory()) {
   app.use(
@@ -142,9 +135,7 @@ if (fs.existsSync(uploadsPath) && fs.statSync(uploadsPath).isDirectory()) {
   console.log("🖼️  Uploads directory not available — /uploads will 404 (use Cloudinary preferred in production)");
 }
 
-/* -------------------------------------------------------------------------- */
-/*                         Cloudinary configuration                            */
-/* -------------------------------------------------------------------------- */
+/* ------------------------- Cloudinary configuration ------------------------ */
 try {
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -157,9 +148,7 @@ try {
   console.warn("[cloudinary] config warning:", e?.message || e);
 }
 
-/* -------------------------------------------------------------------------- */
-/*                         Simple Cloudinary test route                        */
-/* -------------------------------------------------------------------------- */
+/* ------------------------ Cloudinary test route (optional) ----------------- */
 app.post("/api/movies/test-cloud", async (_req, res) => {
   try {
     const sampleUrl = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
@@ -187,25 +176,45 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*                     Mount application routers (if any)                      */
-/* -------------------------------------------------------------------------- */
+/* ----------------------------- /api/upload route --------------------------- */
+// Streams uploaded file to Cloudinary; expects field name "image"
+import multer from "multer";
+import streamifier from "streamifier";
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+
+app.post("/api/upload", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, message: "No image file provided (field name must be 'image')" });
+
+    const result = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: process.env.CLOUDINARY_FOLDER || "uploads", resource_type: "image" },
+        (err, out) => (err ? reject(err) : resolve(out))
+      );
+      streamifier.createReadStream(req.file.buffer).pipe(stream);
+    });
+
+    res.json({ ok: true, url: result.secure_url, public_id: result.public_id });
+  } catch (err) {
+    console.error("[/api/upload] upload error:", err);
+    res.status(500).json({ ok: false, message: "Upload failed", error: err?.message });
+  }
+});
+
+/* --------------------------- Mount other routers --------------------------- */
 /*
-  If you have route files like routes/theaters.routes.js and routes/movies.routes.js,
-  import and mount them here, e.g.:
+  If your app.js already mounted routes you can skip mounting here.
+  Otherwise import and mount them like:
 
   import theatersRouter from "./routes/theaters.routes.js";
   import moviesRouter from "./routes/movies.routes.js";
-
   app.use("/api/theaters", theatersRouter);
   app.use("/api/movies", moviesRouter);
 */
 
-// If app.js already mounted routes, this is not needed. The import at top attempted to use it.
+// If app.js exported an app with routes already, they will be used.
 
-/* -------------------------------------------------------------------------- */
-/*                       Runtime environment debug info                         */
-/* -------------------------------------------------------------------------- */
+/* ---------------------- Runtime environment debug info --------------------- */
 console.log("🔍 Runtime env check (sensitive values hidden)");
 console.log("  NODE_ENV =", process.env.NODE_ENV || "development");
 console.log("  PORT     =", process.env.PORT || "8080");
@@ -216,18 +225,14 @@ console.log("  CLOUDINARY_API_SECRET present =", !!process.env.CLOUDINARY_API_SE
 console.log("  CLOUDINARY_FOLDER =", process.env.CLOUDINARY_FOLDER || "(default movie-posters)");
 console.log("  FRONTEND_ORIGINS =", process.env.FRONTEND_ORIGINS || "(none)");
 
-// quick health endpoint
 app.get("/_health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime(), env: process.env.NODE_ENV || "development" });
 });
 
-/* -------------------------------------------------------------------------- */
-/*                          MongoDB connection helper                          */
-/* -------------------------------------------------------------------------- */
+/* ------------------------- MongoDB connect helper ------------------------- */
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 if (!MONGO_URI) {
   console.error("❌ Missing MONGO_URI in environment");
-  // depending on preference you can exit or continue; here we exit to avoid half-baked server
   process.exit(1);
 }
 
@@ -242,7 +247,6 @@ async function connectWithRetry(uri, maxAttempts = 6) {
         serverSelectionTimeoutMS: 10_000,
         connectTimeoutMS: 10_000,
         socketTimeoutMS: 30_000,
-        // useNewUrlParser, useUnifiedTopology are default in mongoose 6+
       });
       console.log("✅ MongoDB connected");
       return;
@@ -257,11 +261,8 @@ async function connectWithRetry(uri, maxAttempts = 6) {
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/*                           HTTP Server Boot                                  */
-/* -------------------------------------------------------------------------- */
+/* ----------------------------- Server boot -------------------------------- */
 const PORT = Number(process.env.PORT) || 8080;
-
 let server;
 let shuttingDown = false;
 
@@ -270,7 +271,6 @@ async function start() {
     app.locals.dbReady = false;
     server = http.createServer(app);
 
-    // Tunable keep-alive / socket settings
     server.requestTimeout = 0;
     server.headersTimeout = 0;
     server.keepAliveTimeout = 2 * 60 * 60 * 1000;
@@ -306,7 +306,6 @@ async function start() {
   }
 }
 
-// graceful shutdown
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
