@@ -27,10 +27,14 @@ const storage = multer.diskStorage({
   },
 });
 
-const fileFilter = (_, file, cb) =>
-  ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype)
-    ? cb(null, true)
-    : cb(new Error("Only image files are allowed"));
+// return MulterError for invalid file -> consistent handling later
+const fileFilter = (_, file, cb) => {
+  const ok = ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype);
+  if (ok) return cb(null, true);
+  const err = new multer.MulterError("LIMIT_UNEXPECTED_FILE", file.fieldname);
+  err.message = "Only image files are allowed";
+  cb(err);
+};
 
 const upload = multer({
   storage,
@@ -47,14 +51,22 @@ const toLower = (v) => String(v || "").trim().toLowerCase();
 
 const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Safe unlink that refuses to unlink outside uploadDir
 const safeUnlink = (rel) => {
   try {
     if (!rel) return;
-    // Turn "/uploads/foo.jpg" into "<cwd>/uploads/foo.jpg"
     const relClean = rel.startsWith("/") ? rel.slice(1) : rel;
     const abs = path.join(process.cwd(), relClean);
+    const normalizedUploadDir = path.resolve(uploadDir) + path.sep;
+    const normalizedAbs = path.resolve(abs);
+    if (!normalizedAbs.startsWith(normalizedUploadDir)) {
+      console.warn("[safeUnlink] refused to unlink outside uploadDir:", abs);
+      return;
+    }
     if (fs.existsSync(abs)) fs.unlinkSync(abs);
-  } catch {}
+  } catch (e) {
+    console.warn("[safeUnlink] error:", e?.message || e);
+  }
 };
 
 // Try to find existing by lowers; if not present in DB, fallback to i-regex
@@ -372,6 +384,23 @@ router.post("/:theaterId/screens", async (req, res) => {
     console.error("[Theaters] POST /:theaterId/screens error:", err);
     res.status(500).json({ ok: false, error: "Failed to create screen" });
   }
+});
+
+/* ----------------------- Multer-specific error handler -------------------- */
+router.use((err, _req, res, next) => {
+  if (!err) return next();
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ ok: false, error: "File too large (max 3MB)" });
+    }
+    if (err.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({ ok: false, error: err.message || "Invalid file" });
+    }
+    return res.status(400).json({ ok: false, error: err.message || "File upload error" });
+  }
+  // Generic fallback
+  console.error("[Theaters router] unhandled error:", err);
+  return res.status(500).json({ ok: false, error: "Server error" });
 });
 
 export default router;
