@@ -24,6 +24,8 @@ import notificationsRoutes from "./routes/notifications.routes.js";
 import notificationPrefRoutes from "./routes/notificationPref.routes.js";
 import analyticsRoutes from "./routes/analytics.routes.js";
 import screensRoutes from "./routes/screens.routes.js";
+import pricingRoutes from "./routes/pricing.routes.js";
+
 
 // Middleware
 import { requireAuth, requireAdmin } from "./middleware/auth.js";
@@ -130,6 +132,9 @@ app.use("/api/theaters", theatersRouter);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
+// Pricing (protected admin)
+app.use("/api/pricing", requireAuth, requireAdmin, pricingRoutes);
+
 
 // Notifications
 app.use("/api/notifications", notificationsRoutes);
