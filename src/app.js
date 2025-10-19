@@ -9,7 +9,7 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 
-// Routes
+// ─────────────────────────────── ROUTES ───────────────────────────────
 import authRoutes from "./routes/auth.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
 import moviesRoutes from "./routes/movies.routes.js";
@@ -26,24 +26,23 @@ import analyticsRoutes from "./routes/analytics.routes.js";
 import screensRoutes from "./routes/screens.routes.js";
 import pricingRoutes from "./routes/pricing.routes.js";
 
-
-// Middleware
+// ─────────────────────────────── MIDDLEWARE ───────────────────────────────
 import { requireAuth, requireAdmin } from "./middleware/auth.js";
 
 const app = express();
 
-/* ─────────────────────────────── CORE APP SETTINGS ───────────────────────────── */
+// ─────────────────────────────── CORE APP SETTINGS ───────────────────────────────
 app.set("trust proxy", 1); // Render / Netlify / ELB
 
-/* ─────────────────────────────── SECURITY HEADERS ────────────────────────────── */
+// ─────────────────────────────── SECURITY HEADERS ───────────────────────────────
 app.use(
   helmet({
-    crossOriginResourcePolicy: false, // allow /uploads cross-origin
-    contentSecurityPolicy: false,     // relaxed for dev (tighten in prod)
+    crossOriginResourcePolicy: false, // allow uploads cross-origin
+    contentSecurityPolicy: false, // relaxed for dev
   })
 );
 
-/* ─────────────────────────────────── CORS ────────────────────────────────────── */
+// ─────────────────────────────── CORS CONFIG ───────────────────────────────
 const DEV_ORIGINS = [
   process.env.APP_ORIGIN || "http://localhost:5173",
   "http://127.0.0.1:5173",
@@ -53,8 +52,8 @@ const DEV_ORIGINS = [
 ];
 
 const PROD_ORIGINS = [
-  "https://movieticketbooking-rajy.netlify.app",            // frontend
-  "https://movie-ticket-booking-backend-o1m2.onrender.com", // backend self
+  "https://movieticketbooking-rajy.netlify.app", // frontend
+  "https://movie-ticket-booking-backend-o1m2.onrender.com", // backend (self)
   ...(process.env.APP_ORIGINS_PROD
     ? process.env.APP_ORIGINS_PROD.split(",").map((s) => s.trim()).filter(Boolean)
     : []),
@@ -62,11 +61,21 @@ const PROD_ORIGINS = [
 
 const ALLOWED_ORIGINS = [...DEV_ORIGINS, ...PROD_ORIGINS];
 
+console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
+
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) cb(null, true);
-      else cb(new Error(`CORS blocked for origin: ${origin}`));
+      if (!origin) {
+        console.log("[CORS] No origin (likely same-origin/preflight)");
+        return cb(null, true);
+      }
+      if (ALLOWED_ORIGINS.includes(origin)) {
+        console.log("[CORS] ✅ Allowed:", origin);
+        return cb(null, true);
+      }
+      console.warn("[CORS] ❌ Blocked:", origin);
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -82,21 +91,19 @@ app.use(
   })
 );
 
-// Preflight
+// Preflight handler
 app.options("*", cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
-/* ───────────────────────────── LOGGING & PARSERS ─────────────────────────────── */
+// ─────────────────────────────── LOGGING & PARSERS ───────────────────────────────
 app.use(morgan("dev"));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/* ─────────────────────────────── STATIC FILES ───────────────────────────────── */
-// Serve uploaded images
+// ─────────────────────────────── STATIC FILES ───────────────────────────────
 const uploadsPath = path.resolve(process.env.UPLOADS_DIR || "uploads");
 if (!fs.existsSync(uploadsPath)) fs.mkdirSync(uploadsPath, { recursive: true });
 app.use("/uploads", express.static(uploadsPath));
 
-// Debug log for Render file visibility
 console.log("[app] Serving static uploads from:", uploadsPath);
 try {
   console.log("[app] Found files:", fs.readdirSync(uploadsPath));
@@ -104,13 +111,13 @@ try {
   console.warn("[app] Cannot read uploads dir:", e.message);
 }
 
-/* ─────────── Defensive: normalize accidental /api/api/... → /api/... ────────── */
+// ─────────────────────────────── FIX DOUBLE /api/api BUG ───────────────────────────────
 app.use((req, _res, next) => {
-  req.url = req.url.replace(/\/api\/api(\/|$)/g, "/api$1");
+  req.url = req.url.replace(/\\/api\\/api(\\/|$)/g, "/api$1");
   next();
 });
 
-/* ─────────────────────────────────── ROUTES ──────────────────────────────────── */
+// ─────────────────────────────── ROUTES ───────────────────────────────
 // Health check
 app.get("/api/health", (_req, res) =>
   res.json({
@@ -132,9 +139,9 @@ app.use("/api/theaters", theatersRouter);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
+
 // Pricing (protected admin)
 app.use("/api/pricing", requireAuth, requireAdmin, pricingRoutes);
-
 
 // Notifications
 app.use("/api/notifications", notificationsRoutes);
@@ -153,7 +160,7 @@ app.use("/api/screens", screensRoutes);
 // Analytics (protected)
 app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
 
-/* ────────────────────────────── 404 FALLTHROUGH ──────────────────────────────── */
+// ─────────────────────────────── 404 HANDLER ───────────────────────────────
 app.use((req, res, next) => {
   if (req.path.startsWith("/api")) {
     return res.status(404).json({ message: "Not Found", path: req.path });
@@ -161,7 +168,7 @@ app.use((req, res, next) => {
   return next();
 });
 
-/* ─────────────────────────────── ERROR HANDLER ───────────────────────────────── */
+// ─────────────────────────────── ERROR HANDLER ───────────────────────────────
 app.use((err, req, res, next) => {
   console.error("💥 Uncaught error:", err);
   if (res.headersSent) return next(err);
