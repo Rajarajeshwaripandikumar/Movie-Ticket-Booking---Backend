@@ -1,17 +1,31 @@
+// backend/src/server.js
+import dotenv from "dotenv";
+// load .env right away so imports below see env vars
+dotenv.config();
+
 import http from "http";
 import mongoose from "mongoose";
-import dotenv from "dotenv";
 import path from "path";
 import fs from "fs";
-import express from "express"; // ✅ Needed for static file serving
+import express from "express"; // needed for static serving
+import { v2 as cloudinary } from "cloudinary";
 import app from "./app.js";
 
-dotenv.config();
+/* -------------------------------------------------------------------------- */
+/*                      Quick runtime env checks (debug)                      */
+/* -------------------------------------------------------------------------- */
+console.log("🔍 Runtime env check (sensitive values hidden)");
+console.log("  NODE_ENV =", process.env.NODE_ENV || "development");
+console.log("  PORT     =", process.env.PORT || "8080");
+console.log("  MONGO_URI present =", !!process.env.MONGO_URI || !!process.env.MONGODB_URI);
+console.log("  CLOUDINARY_CLOUD_NAME =", process.env.CLOUDINARY_CLOUD_NAME || "(missing)");
+console.log("  CLOUDINARY_API_KEY present =", !!process.env.CLOUDINARY_API_KEY);
+console.log("  CLOUDINARY_API_SECRET present =", !!process.env.CLOUDINARY_API_SECRET);
+console.log("  CLOUDINARY_FOLDER =", process.env.CLOUDINARY_FOLDER || "(default movie-posters)");
 
 /* -------------------------------------------------------------------------- */
 /*                          STATIC FILES: /uploads                            */
 /* -------------------------------------------------------------------------- */
-// Serve the local uploads folder (for legacy movie posters)
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
 const uploadsPath = path.join(process.cwd(), UPLOADS_DIR);
 
@@ -29,12 +43,62 @@ try {
 app.use(
   "/uploads",
   express.static(uploadsPath, {
-    maxAge: "30d", // cache for performance
+    maxAge: "30d",
     index: false,
     dotfiles: "ignore",
   })
 );
 console.log(`🖼️  Serving static uploads from: ${uploadsPath}`);
+
+/* -------------------------------------------------------------------------- */
+/*                         Cloudinary SDK config (for test route)             */
+/* -------------------------------------------------------------------------- */
+try {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true,
+  });
+} catch (e) {
+  console.warn("[cloudinary] config warning:", e?.message || e);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Temporary debug route: test Cloudinary             */
+/* -------------------------------------------------------------------------- */
+/**
+ * POST /api/movies/test-cloud
+ * No auth. uploads a public sample image to your Cloudinary account and returns result.
+ * Remove this route after debugging.
+ */
+app.post("/api/movies/test-cloud", async (_req, res) => {
+  try {
+    // sample remote image url (Cloudinary demo)
+    const sampleUrl = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
+    const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+    const result = await cloudinary.uploader.upload(sampleUrl, {
+      folder,
+      resource_type: "image",
+    });
+    return res.json({
+      ok: true,
+      message: "Cloudinary test upload succeeded",
+      secure_url: result.secure_url,
+      public_id: result.public_id,
+      raw: result,
+    });
+  } catch (err) {
+    console.error("[test-cloud] error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Cloudinary test upload failed",
+      error: err?.message,
+      http_code: err?.http_code,
+      http_body: err?.http_body,
+    });
+  }
+});
 
 /* -------------------------------------------------------------------------- */
 /*                             ENV + DB CONFIG                                */
@@ -52,14 +116,9 @@ if (!MONGO_URI) {
 /* -------------------------------------------------------------------------- */
 /*                           MongoDB Connect Helper                           */
 /* -------------------------------------------------------------------------- */
-/**
- * Exponential backoff with capped delay; tighter client-side timeouts
- * so cold/blocked DB doesn't stall boot.
- */
 async function connectWithRetry(uri, maxAttempts = 6) {
   let attempt = 0;
-  const baseDelay = 1000; // 1s
-
+  const baseDelay = 1000;
   while (attempt < maxAttempts) {
     try {
       attempt++;
@@ -67,10 +126,9 @@ async function connectWithRetry(uri, maxAttempts = 6) {
         `🔌 Attempting MongoDB connection (attempt ${attempt}/${maxAttempts})...`
       );
       await mongoose.connect(uri, {
-        serverSelectionTimeoutMS: 10_000, // fail fast
+        serverSelectionTimeoutMS: 10_000,
         connectTimeoutMS: 10_000,
         socketTimeoutMS: 30_000,
-        // dbName: process.env.MONGO_DB,
       });
       console.log("✅ MongoDB connected");
       return;
@@ -78,8 +136,7 @@ async function connectWithRetry(uri, maxAttempts = 6) {
       const msg = err?.message || String(err);
       console.error(`MongoDB connect attempt ${attempt} failed: ${msg}`);
       if (attempt >= maxAttempts) throw err;
-
-      const delay = Math.min(30_000, baseDelay * 2 ** attempt); // cap at 30s
+      const delay = Math.min(30_000, baseDelay * 2 ** attempt);
       console.log(`⏳ Waiting ${delay}ms before retrying...`);
       await new Promise((res) => setTimeout(res, delay));
     }
@@ -94,29 +151,20 @@ let shuttingDown = false;
 
 async function start() {
   try {
-    // Flag for readiness checks
     app.locals.dbReady = false;
-
-    // Explicit HTTP server (SSE / socket friendly)
     server = http.createServer(app);
-
-    // SSE / keep-alive friendly server settings
     server.requestTimeout = 0;
     server.headersTimeout = 0;
-    server.keepAliveTimeout = 2 * 60 * 60 * 1000; // 2h
+    server.keepAliveTimeout = 2 * 60 * 60 * 1000;
     server.maxRequestsPerSocket = 0;
 
-    // Keep-alive TCP
     server.on("connection", (socket) => {
       try {
         socket.setKeepAlive(true, 30_000);
         socket.setNoDelay(true);
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     });
 
-    // Start listening immediately
     server.listen(PORT, () => {
       console.log(
         `🚀 API running on http://localhost:${PORT} (env=${
@@ -125,7 +173,6 @@ async function start() {
       );
     });
 
-    // MongoDB connection events
     mongoose.connection.on("error", (err) =>
       console.error("MongoDB connection error:", err)
     );
@@ -138,7 +185,6 @@ async function start() {
       app.locals.dbReady = true;
     });
 
-    // Connect DB in background
     connectWithRetry(MONGO_URI, 6)
       .then(() => {
         app.locals.dbReady = true;
@@ -148,32 +194,26 @@ async function start() {
         console.error("❌ MongoDB failed after retries:", err);
       });
 
-    // Graceful shutdown
     const shutdown = async (signal) => {
       if (shuttingDown) {
-        console.warn(
-          "Shutdown already in progress; ignoring duplicate signal."
-        );
+        console.warn("Shutdown already in progress; ignoring duplicate signal.");
         return;
       }
       shuttingDown = true;
       console.log(`\n⚠️ Received ${signal} — starting graceful shutdown...`);
 
       try {
-        // Stop accepting new connections
         if (server) {
           await new Promise((resolve) => server.close(resolve));
           console.log("HTTP server closed.");
         }
 
-        // Allow inflight requests
         const GRACE_PERIOD_MS = Number(process.env.SHUTDOWN_GRACE_MS) || 10_000;
         console.log(
           `Waiting up to ${GRACE_PERIOD_MS}ms for in-flight requests to finish...`
         );
         await new Promise((res) => setTimeout(res, GRACE_PERIOD_MS));
 
-        // Disconnect DB
         await mongoose.disconnect();
         console.log("✅ MongoDB disconnected. Bye!");
         process.exit(0);
