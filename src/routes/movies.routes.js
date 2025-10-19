@@ -1,16 +1,17 @@
-// backend/src/routes/movies.routes.js
-import { Router } from "express";
+// backend/src/routes/theaters.routes.js
+import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
 import streamifier from "streamifier";
 import { v2 as cloudinary } from "cloudinary";
-import Movie from "../models/Movie.js";
-import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import dotenv from "dotenv";
+import Theater from "../models/Theater.js";
+import Screen from "../models/Screen.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 dotenv.config();
 
-const router = Router();
+const router = express.Router();
 
 /* --------------------------- Cloudinary config --------------------------- */
 cloudinary.config({
@@ -22,7 +23,7 @@ cloudinary.config({
 
 /* ------------------------------ Multer ---------------------------------- */
 const memoryStorage = multer.memoryStorage();
-const allowedMimes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
+const allowedMimes = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
 
 const fileFilter = (_, file, cb) => {
   const ok = allowedMimes.includes(file.mimetype);
@@ -32,7 +33,7 @@ const fileFilter = (_, file, cb) => {
 const upload = multer({
   storage: memoryStorage,
   fileFilter,
-  limits: { fileSize: 3 * 1024 * 1024 }, // 3MB
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
 });
 
 /* ----------------------------- Helpers ---------------------------------- */
@@ -43,7 +44,6 @@ const toArray = (v) => {
   if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
   if (typeof v === "string") {
     try {
-      // attempt JSON parse (frontend may send JSON)
       const parsed = JSON.parse(v);
       return Array.isArray(parsed) ? parsed.map(String).map((s) => s.trim()).filter(Boolean) : v.split(",").map((s) => s.trim()).filter(Boolean);
     } catch {
@@ -53,10 +53,7 @@ const toArray = (v) => {
   return [];
 };
 
-const castToStringArray = (anyCast) => toArray(anyCast);
-
-/* -------------------- Cloudinary buffer uploader ------------------------ */
-function uploadBufferToCloudinary(buffer, folder = "movie-posters") {
+function uploadBufferToCloudinary(buffer, folder = "theaters") {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       { folder, resource_type: "image", use_filename: true, unique_filename: true },
@@ -72,93 +69,135 @@ function uploadBufferToCloudinary(buffer, folder = "movie-posters") {
   });
 }
 
-/* ----------------------------- PUBLIC API -------------------------------- */
+/* ----------------------------- Public API -------------------------------- */
 
-// GET /            -> list movies (limit/skip)
+/**
+ * GET /api/theaters
+ * Public endpoint — paginated list for users
+ */
 router.get("/", async (req, res) => {
   try {
-    const limit = Math.min(100, Number(req.query.limit) || 20);
-    const skip = Number(req.query.skip) || 0;
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
 
-    const [docs, count] = await Promise.all([
-      Movie.find().sort({ releaseDate: -1, createdAt: -1 }).skip(skip).limit(limit).lean(),
-      Movie.countDocuments(),
+    const { q, city, page = 1, limit = 12 } = req.query;
+    const filter = {};
+
+    if (q) {
+      const rx = new RegExp(String(q), "i");
+      filter.$or = [{ name: rx }, { city: rx }, { address: rx }];
+    }
+    if (city && city !== "All") filter.city = city;
+
+    const safeLimit = Math.min(Number(limit) || 12, 1000);
+    const safePage = Math.max(Number(page) || 1, 1);
+    const skip = (safePage - 1) * safeLimit;
+
+    const [theaters, totalCount, cities] = await Promise.all([
+      Theater.find(filter).sort({ updatedAt: -1, _id: -1 }).skip(skip).limit(safeLimit).lean(),
+      Theater.countDocuments(filter),
+      Theater.distinct("city"),
     ]);
 
-    res.json({ ok: true, movies: docs, count });
+    // Attach screen counts
+    const screenCounts = await Screen.aggregate([{ $group: { _id: "$theater", count: { $sum: 1 } } }]);
+    const countMap = new Map(screenCounts.map((c) => [String(c._id), c.count]));
+
+    const enriched = theaters.map((t) => ({
+      ...t,
+      screensCount: countMap.get(String(t._id)) || 0,
+    }));
+
+    res.json({
+      ok: true,
+      theaters: enriched,
+      count: totalCount,
+      cities,
+      page: safePage,
+      limit: safeLimit,
+      hasMore: skip + enriched.length < totalCount,
+    });
   } catch (err) {
-    console.error("[Movies] GET / error:", err);
-    res.status(500).json({ ok: false, message: "Failed to load movies", error: err.message });
+    console.error("[Theaters] GET / error:", err);
+    res.status(500).json({ ok: false, message: "Failed to fetch theaters", error: err.message });
   }
 });
 
-// GET /search?q=...&genre=...&limit=50
-router.get("/search", async (req, res) => {
-  try {
-    const { q, genre, limit = 50 } = req.query;
-    const filter = {};
-    if (q) {
-      const rx = new RegExp(q, "i");
-      filter.$or = [{ title: rx }, { description: rx }, { director: rx }, { cast: rx }, { genre: rx }];
-    }
-    if (genre) {
-      const g = toArray(genre);
-      if (g.length) filter.genre = { $in: g };
-    }
-    const docs = await Movie.find(filter).sort({ releaseDate: -1, createdAt: -1 }).limit(Math.min(200, Number(limit))).lean();
-    res.json({ ok: true, movies: docs, count: docs.length });
-  } catch (err) {
-    console.error("[Movies] GET /search error:", err);
-    res.status(500).json({ ok: false, message: "Failed to search movies", error: err.message });
-  }
-});
-
-// GET /:id
+/**
+ * GET /api/theaters/:id
+ * Single theater + screen count
+ */
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
-    const movie = await Movie.findById(id).lean();
-    if (!movie) return res.status(404).json({ ok: false, message: "Movie not found" });
-    res.json({ ok: true, data: movie });
+    if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid theater id" });
+
+    const theater = await Theater.findById(id).lean();
+    if (!theater) return res.status(404).json({ ok: false, message: "Theater not found" });
+
+    const screensCount = await Screen.countDocuments({ theater: new mongoose.Types.ObjectId(id) });
+    res.json({ ok: true, data: { ...theater, screensCount } });
   } catch (err) {
-    console.error("[Movies] GET /:id error:", err);
-    res.status(500).json({ ok: false, message: "Failed to fetch movie", error: err.message });
+    console.error("[Theaters] GET /:id error:", err);
+    res.status(500).json({ ok: false, message: "Failed to fetch theater", error: err.message });
   }
 });
 
-/* ---------------------------- ADMIN ROUTES ------------------------------- */
-/* These routes are protected by requireAuth + requireAdmin when mounted at
-   /api/admin/movies (recommended). We also expose them under /admin/* so the
-   same router can be mounted on /api/movies and still provide admin paths. */
+/**
+ * GET /api/theaters/:theaterId/screens
+ * List all screens for a theater
+ */
+router.get("/:theaterId/screens", async (req, res) => {
+  try {
+    const { theaterId } = req.params;
+    if (!isValidId(theaterId)) return res.status(400).json({ ok: false, error: "Invalid theater id" });
 
-/* POST /           (admin) create movie
-   Accepts multipart form-data with field "image" (binary) or posterUrl string */
+    const screens = await Screen.find({ theater: theaterId }).lean();
+    res.json({ ok: true, data: screens || [] });
+  } catch (err) {
+    console.error("[Theaters] GET /:theaterId/screens error:", err);
+    res.status(500).json({ ok: false, error: "Failed to load screens", details: err.message });
+  }
+});
+
+/* ------------------------------- Admin Routes ---------------------------- */
+
+/**
+ * GET /api/theaters/admin/list
+ * Admin — full list (protected)
+ */
+router.get("/admin/list", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const theaters = await Theater.find().sort({ createdAt: -1 }).lean();
+    res.json({ ok: true, data: theaters });
+  } catch (err) {
+    console.error("[Theaters] GET /admin/list error:", err);
+    res.status(500).json({ ok: false, message: "Failed to fetch theaters", error: err.message });
+  }
+});
+
+/**
+ * POST /api/theaters/admin
+ * Admin — create with Cloudinary image
+ * Accepts multipart/form-data with field "image" or regular JSON with posterUrl
+ */
 router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
+  // This route is meant to be mounted at /api/theaters (so POST "/" is admin create).
   try {
     const payload = req.body || {};
-    if (!payload.title || typeof payload.title !== "string") {
-      return res.status(400).json({ ok: false, message: "Title is required" });
-    }
-
-    payload.cast = castToStringArray(payload.cast);
+    payload.amenities = toArray(payload.amenities);
 
     if (req.file) {
       try {
-        const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+        const folder = process.env.CLOUDINARY_FOLDER || "theaters";
         const result = await uploadBufferToCloudinary(req.file.buffer, folder);
-        payload.posterUrl = result.secure_url;
-        payload.posterPublicId = result.public_id;
+        payload.imageUrl = result.secure_url;
+        payload.imagePublicId = result.public_id;
       } catch (e) {
-        console.error("[Movies] Cloudinary upload failed (create):", e?.message || e);
-        return res.status(500).json({ ok: false, message: "Failed to upload poster", error: e?.message || e });
+        console.error("[Theaters] Cloudinary upload failed (create):", e?.message || e);
+        return res.status(500).json({ ok: false, message: "Failed to upload image", error: e?.message || String(e) });
       }
-    }
-
-    if (payload.durationMins !== undefined && payload.durationMins !== "") {
-      const n = Number(payload.durationMins);
-      if (Number.isNaN(n)) return res.status(400).json({ ok: false, message: "durationMins must be a number" });
-      payload.durationMins = n;
     }
 
     if (req.user) {
@@ -166,49 +205,48 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, 
       payload.uploaderRole = req.user.role || "admin";
     }
 
-    const movie = await Movie.create(payload);
-    res.status(201).json({ ok: true, data: movie });
+    const created = await Theater.create(payload);
+    res.status(201).json({ ok: true, data: created });
   } catch (err) {
-    console.error("[Movies] POST / error:", err);
-    res.status(500).json({ ok: false, message: "Failed to create movie", error: err.message });
+    console.error("[Theaters] POST / error:", err);
+    res.status(500).json({ ok: false, message: "Failed to create theater", error: err.message });
   }
 });
 
-// PUT /:id  (admin) update movie (supports multipart image)
+/**
+ * PUT /api/theaters/admin/:id
+ * Admin — update + optional image replace
+ */
 router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
+    if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid theater ID" });
 
-    const existing = await Movie.findById(id).lean();
-    if (!existing) return res.status(404).json({ ok: false, message: "Movie not found" });
+    const existing = await Theater.findById(id);
+    if (!existing) return res.status(404).json({ ok: false, message: "Theater not found" });
 
     const body = req.body || {};
     const payload = {
-      title: body.title ?? existing.title,
-      description: body.description ?? existing.description,
-      genre: body.genre ?? existing.genre,
-      language: body.language ?? existing.language,
-      director: body.director ?? existing.director,
-      rating: body.rating ?? existing.rating,
-      durationMins: body.durationMins ?? existing.durationMins,
-      releaseDate: body.releaseDate ?? existing.releaseDate,
-      cast: body.cast ? castToStringArray(body.cast) : existing.cast,
-      posterUrl: body.posterUrl ?? existing.posterUrl,
-      posterPublicId: existing.posterPublicId,
+      name: body.name ?? existing.name,
+      city: body.city ?? existing.city,
+      address: body.address ?? existing.address,
+      amenities: body.amenities ? toArray(body.amenities) : existing.amenities,
+      phone: body.phone ?? existing.phone,
+      imageUrl: body.imageUrl ?? existing.imageUrl,
+      imagePublicId: existing.imagePublicId,
     };
 
-    let oldPosterRef = null;
+    let oldImageRef = null;
     if (req.file) {
       try {
-        const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+        const folder = process.env.CLOUDINARY_FOLDER || "theaters";
         const result = await uploadBufferToCloudinary(req.file.buffer, folder);
-        payload.posterUrl = result.secure_url;
-        payload.posterPublicId = result.public_id;
-        oldPosterRef = existing.posterPublicId || existing.posterUrl;
+        payload.imageUrl = result.secure_url;
+        payload.imagePublicId = result.public_id;
+        oldImageRef = existing.imagePublicId || existing.imageUrl;
       } catch (e) {
-        console.error("[Movies] Cloudinary upload failed (update):", e?.message || e);
-        return res.status(500).json({ ok: false, message: "Failed to upload poster", error: e?.message || e });
+        console.error("[Theaters] Cloudinary upload failed (update):", e?.message || e);
+        return res.status(500).json({ ok: false, message: "Failed to upload image", error: e?.message || String(e) });
       }
     }
 
@@ -217,61 +255,61 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req
       payload.uploaderRole = req.user.role || "admin";
     }
 
-    const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+    const updated = await Theater.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
 
-    // optionally delete old poster (best-effort)
-    if (updated && oldPosterRef && oldPosterRef !== (updated.posterPublicId || updated.posterUrl)) {
+    // best-effort delete old image if replaced
+    if (updated && oldImageRef && oldImageRef !== (updated.imagePublicId || updated.imageUrl)) {
       try {
-        const maybeId = typeof oldPosterRef === "string" ? oldPosterRef : null;
-        // try destroy by public_id if it looks like one (cloudinary will ignore otherwise)
-        if (maybeId) {
-          try { await cloudinary.uploader.destroy(maybeId); console.log("[Cloudinary] destroyed old:", maybeId); } catch {}
+        if (typeof oldImageRef === "string") {
+          await cloudinary.uploader.destroy(oldImageRef);
+          console.log("[Cloudinary] destroyed old image:", oldImageRef);
         }
       } catch (e) {
-        console.warn("[Movies] failed to delete previous poster:", e?.message || e);
+        console.warn("[Theaters] failed to delete previous image:", e?.message || e);
       }
     }
 
     res.json({ ok: true, data: updated });
   } catch (err) {
-    console.error("[Movies] PUT /:id error:", err);
-    res.status(500).json({ ok: false, message: "Failed to update movie", error: err.message });
+    console.error("[Theaters] PUT /:id error:", err);
+    res.status(500).json({ ok: false, message: "Failed to update theater", error: err.message });
   }
 });
 
-// DELETE /:id (admin)
+/**
+ * DELETE /api/theaters/admin/:id
+ * Admin — delete + remove Cloudinary image
+ */
 router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
+    if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid theater ID" });
 
-    const removed = await Movie.findByIdAndDelete(id).lean();
-    if (!removed) return res.status(404).json({ ok: false, message: "Movie not found" });
+    const deleted = await Theater.findByIdAndDelete(id).lean();
+    if (!deleted) return res.status(404).json({ ok: false, message: "Theater not found" });
 
-    // best-effort delete from Cloudinary if posterPublicId exists
-    if (removed.posterPublicId) {
+    if (deleted.imagePublicId) {
       try {
-        await cloudinary.uploader.destroy(removed.posterPublicId);
-        console.log("[Cloudinary] deleted:", removed.posterPublicId);
-      } catch (e) {
-        console.warn("[Cloudinary] failed to delete:", e?.message || e);
+        await cloudinary.uploader.destroy(deleted.imagePublicId);
+        console.log("[Cloudinary] deleted:", deleted.imagePublicId);
+      } catch (err) {
+        console.warn("[Cloudinary] Failed to delete theater image:", err?.message || err);
       }
     }
 
-    res.json({ ok: true, message: "Movie deleted", id: removed._id });
+    res.json({ ok: true, message: "Deleted", id: deleted._id });
   } catch (err) {
-    console.error("[Movies] DELETE /:id error:", err);
-    res.status(500).json({ ok: false, message: "Failed to delete movie", error: err.message });
+    console.error("[Theaters] DELETE /:id error:", err);
+    res.status(500).json({ ok: false, message: "Failed to delete theater", error: err.message });
   }
 });
 
 /* ------------------------ Admin-prefixed routes --------------------------- */
-/* These make the same admin handlers accessible under /admin/* when the router
-   is mounted at /api/movies (so both mounting styles work). */
+/* If the router is mounted at /api/theaters we also want /admin/* paths to work.
+   These forward to the base handlers above (same technique used in movies.routes). */
 
 router.post("/admin", requireAuth, requireAdmin, upload.single("image"), async (req, res, next) => {
-  // forward to the same create handler above
-  req.url = "/"; // set to root so the first POST "/" handler runs
+  req.url = "/";
   return router.handle(req, res, next);
 });
 
@@ -289,7 +327,7 @@ router.delete("/admin/:id", requireAuth, requireAdmin, async (req, res, next) =>
 router.use((err, _req, res, next) => {
   if (!err) return next();
   if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ ok: false, message: "File too large (max 3MB)" });
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ ok: false, message: "File too large (max 5MB)" });
     return res.status(400).json({ ok: false, message: err.message || "File upload error" });
   }
   next(err);
