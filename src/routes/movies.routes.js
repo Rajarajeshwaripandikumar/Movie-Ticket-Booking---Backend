@@ -11,11 +11,11 @@ const router = Router();
 
 /* --------------------------- BASE URL for Render --------------------------- */
 const BASE_URL =
+  process.env.PUBLIC_BASE_URL ||
   process.env.BASE_URL ||
   "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
 /* ------------------------------ Paths & Multer ----------------------------- */
-// configurable uploads dir so you can point to a persistent mount later
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
 const uploadDir = path.resolve(UPLOADS_DIR);
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -48,7 +48,7 @@ const fileFilter = (_, file, cb) => {
     "image/webp",
     "image/gif",
   ].includes(file.mimetype);
-  ok ? cb(null, true) : cb(new Error("Only image files are allowed"));
+  ok ? cb(null, true) : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only image files are allowed"));
 };
 
 const upload = multer({
@@ -57,15 +57,9 @@ const upload = multer({
   limits: { fileSize: 3 * 1024 * 1024 }, // 3 MB
 });
 
-// tiny middleware to log uploads for debugging
 function logUpload(req, _res, next) {
   if (req.file) {
-    console.log(
-      "[uploads] saved:",
-      req.file.filename,
-      "->",
-      path.join(uploadDir, req.file.filename)
-    );
+    console.log("[uploads] saved:", req.file.filename, "->", path.join(uploadDir, req.file.filename));
   } else {
     console.log("[uploads] no file on this request");
   }
@@ -103,7 +97,9 @@ function safeUnlink(anyUrlOrPath) {
     const rel = toRelativePoster(anyUrlOrPath);
     const abs = path.join(process.cwd(), rel.replace(/^\/+/, ""));
     if (abs.startsWith(uploadDir) && fs.existsSync(abs)) fs.unlinkSync(abs);
-  } catch {}
+  } catch (e) {
+    console.warn("[safeUnlink] error:", e?.message || e);
+  }
 }
 
 const toArray = (v) =>
@@ -227,7 +223,8 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ------------------------- POST: create (admin only) ---------------------- */
-router.post("/", requireAuth, requireAdmin, upload.single("poster"), logUpload, async (req, res) => {
+// NOTE: accept field name "image" for compatibility with frontend
+router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const payload = req.body || {};
 
@@ -239,6 +236,16 @@ router.post("/", requireAuth, requireAdmin, upload.single("poster"), logUpload, 
     payload.cast = castToStringArray(payload.cast);
     if (req.file) payload.posterUrl = `/uploads/${req.file.filename}`;
 
+    // basic validation: durationMins numeric
+    if (payload.durationMins !== undefined) {
+      const n = Number(payload.durationMins);
+      if (Number.isNaN(n)) {
+        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+        return res.status(400).json({ message: "durationMins must be a number" });
+      }
+      payload.durationMins = n;
+    }
+
     // record uploader info
     if (req.user) {
       payload.uploaderId = req.user.id || req.user._id || req.user.sub;
@@ -249,7 +256,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("poster"), logUpload, 
     const out = movie.toObject();
     out.posterUrl = toPublicUrl(onlyUploads(out.posterUrl));
     out.cast = castResponseObjects(out.cast);
-    res.status(201).json(out);
+    res.status(201).json({ ok: true, data: out });
   } catch (err) {
     console.error("[Movies] POST / error:", err);
     if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
@@ -258,7 +265,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("poster"), logUpload, 
 });
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
-router.put("/:id", requireAuth, requireAdmin, upload.single("poster"), logUpload, async (req, res) => {
+router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
@@ -309,7 +316,7 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("poster"), logUpload
 
     updated.posterUrl = toPublicUrl(onlyUploads(updated.posterUrl));
     updated.cast = castResponseObjects(updated.cast);
-    res.json(updated);
+    res.json({ ok: true, data: updated });
   } catch (err) {
     console.error("[Movies] PUT /:id error:", err);
     res.status(400).json({ message: "Failed to update movie", error: err.message });
@@ -327,11 +334,23 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
 
     if (removed.posterUrl) safeUnlink(removed.posterUrl);
 
-    res.json({ message: "Movie deleted", id: removed._id });
+    res.json({ ok: true, message: "Movie deleted", id: removed._id });
   } catch (err) {
     console.error("[Movies] DELETE /:id error:", err);
     res.status(500).json({ message: "Failed to delete movie", error: err.message });
   }
+});
+
+/* ----------------------- Multer-specific error handler -------------------- */
+router.use((err, _req, res, next) => {
+  if (!err) return next();
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ message: "File too large (max 3MB)" });
+    }
+    return res.status(400).json({ message: err.message || "File upload error" });
+  }
+  return next(err);
 });
 
 export default router;
