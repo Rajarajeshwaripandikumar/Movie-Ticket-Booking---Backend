@@ -9,13 +9,14 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
 
-/* --------------------------- BASE URL for Render --------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                CONFIG SETUP                                */
+/* -------------------------------------------------------------------------- */
 const BASE_URL =
   process.env.PUBLIC_BASE_URL ||
   process.env.BASE_URL ||
   "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
-/* ------------------------------ Paths & Multer ----------------------------- */
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
 const uploadDir = path.resolve(UPLOADS_DIR);
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -28,6 +29,9 @@ const MIME_EXT = {
   "image/gif": ".gif",
 };
 
+/* -------------------------------------------------------------------------- */
+/*                                MULTER SETUP                                */
+/* -------------------------------------------------------------------------- */
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, uploadDir),
   filename: (_, file, cb) => {
@@ -48,7 +52,14 @@ const fileFilter = (_, file, cb) => {
     "image/webp",
     "image/gif",
   ].includes(file.mimetype);
-  ok ? cb(null, true) : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only image files are allowed"));
+  ok
+    ? cb(null, true)
+    : cb(
+        new multer.MulterError(
+          "LIMIT_UNEXPECTED_FILE",
+          "Only image files are allowed"
+        )
+      );
 };
 
 const upload = multer({
@@ -59,17 +70,33 @@ const upload = multer({
 
 function logUpload(req, _res, next) {
   if (req.file) {
-    console.log("[uploads] saved:", req.file.filename, "->", path.join(uploadDir, req.file.filename));
+    console.log(
+      "[uploads] saved:",
+      req.file.filename,
+      "->",
+      path.join(uploadDir, req.file.filename)
+    );
   } else {
     console.log("[uploads] no file on this request");
   }
   next();
 }
 
-/* ------------------------------ Helpers ----------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                DEBUG LOGGER                                */
+/* -------------------------------------------------------------------------- */
+router.use((req, res, next) => {
+  console.log("[Movies API]", req.method, req.originalUrl);
+  console.log("   Authorization:", req.headers.authorization ? "✅ present" : "❌ missing");
+  next();
+});
+
+/* -------------------------------------------------------------------------- */
+/*                                HELPERS                                     */
+/* -------------------------------------------------------------------------- */
 const isValidId = (id) => mongoose.isValidObjectId(id);
 
-function toRelativePoster(u) {
+const toRelativePoster = (u) => {
   if (!u) return "";
   try {
     if (/^https?:\/\//i.test(u)) {
@@ -78,20 +105,20 @@ function toRelativePoster(u) {
     }
   } catch {}
   return u.startsWith("/") ? u : `/${u}`;
-}
+};
 
-function onlyUploads(relish) {
+const onlyUploads = (relish) => {
   const p = toRelativePoster(relish);
   return p.startsWith("/uploads/") ? p : "";
-}
+};
 
-function toPublicUrl(u) {
+const toPublicUrl = (u) => {
   if (!u) return "";
   const rel = toRelativePoster(u);
   return `${BASE_URL}${rel}`;
-}
+};
 
-function safeUnlink(anyUrlOrPath) {
+const safeUnlink = (anyUrlOrPath) => {
   try {
     if (!anyUrlOrPath) return;
     const rel = toRelativePoster(anyUrlOrPath);
@@ -100,16 +127,18 @@ function safeUnlink(anyUrlOrPath) {
   } catch (e) {
     console.warn("[safeUnlink] error:", e?.message || e);
   }
-}
+};
 
 const toArray = (v) =>
   Array.isArray(v)
     ? v
     : typeof v === "string"
-    ? v.split(",").map((s) => s.trim()).filter(Boolean)
+    ? v
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
     : [];
 
-/* ------------------------ Cast Normalization ------------------------------ */
 function castToStringArray(anyCast) {
   if (!anyCast) return [];
   if (Array.isArray(anyCast)) {
@@ -124,7 +153,9 @@ function castToStringArray(anyCast) {
       .filter(Boolean);
   }
   if (typeof anyCast === "object") {
-    return Object.values(anyCast).map((v) => String(v).trim()).filter(Boolean);
+    return Object.values(anyCast)
+      .map((v) => String(v).trim())
+      .filter(Boolean);
   }
   if (typeof anyCast === "string") {
     const s = anyCast.trim();
@@ -141,6 +172,10 @@ function castToStringArray(anyCast) {
 const castResponseObjects = (anyCast) =>
   castToStringArray(anyCast).map((name) => ({ actorName: name }));
 
+/* -------------------------------------------------------------------------- */
+/*                                ROUTES                                      */
+/* -------------------------------------------------------------------------- */
+
 /* ------------------------------ GET: list ---------------------------------- */
 router.get("/", async (req, res) => {
   try {
@@ -148,7 +183,11 @@ router.get("/", async (req, res) => {
     const skip = Number(req.query.skip) || 0;
 
     const [docs, count] = await Promise.all([
-      Movie.find().sort({ releaseDate: -1, createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Movie.find()
+        .sort({ releaseDate: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
       Movie.countDocuments(),
     ]);
 
@@ -161,7 +200,9 @@ router.get("/", async (req, res) => {
     res.json({ movies, count });
   } catch (err) {
     console.error("[Movies] GET / error:", err);
-    res.status(500).json({ message: "Failed to load movies", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to load movies", error: err.message });
   }
 });
 
@@ -173,12 +214,19 @@ router.get("/search", async (req, res) => {
 
     if (q) {
       const rx = new RegExp(q, "i");
-      filter.$or = [{ title: rx }, { description: rx }, { director: rx }, { cast: rx }, { genre: rx }];
+      filter.$or = [
+        { title: rx },
+        { description: rx },
+        { director: rx },
+        { cast: rx },
+        { genre: rx },
+      ];
     }
 
     if (genre) {
       const g = toArray(genre);
-      if (g.length) filter.$or = [...(filter.$or || []), { genre: { $in: g } }];
+      if (g.length)
+        filter.$or = [...(filter.$or || []), { genre: { $in: g } }];
     }
 
     if (date) {
@@ -200,7 +248,9 @@ router.get("/search", async (req, res) => {
     res.json({ movies, count: movies.length });
   } catch (err) {
     console.error("[Movies] GET /search error:", err);
-    res.status(500).json({ message: "Failed to search movies", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to search movies", error: err.message });
   }
 });
 
@@ -208,7 +258,8 @@ router.get("/search", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
+    if (!isValidId(id))
+      return res.status(400).json({ message: "Invalid movie id" });
 
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ message: "Movie not found" });
@@ -218,116 +269,139 @@ router.get("/:id", async (req, res) => {
     res.json(movie);
   } catch (err) {
     console.error("[Movies] GET /:id error:", err);
-    res.status(500).json({ message: "Failed to fetch movie", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to fetch movie", error: err.message });
   }
 });
 
 /* ------------------------- POST: create (admin only) ---------------------- */
-// NOTE: accept field name "image" for compatibility with frontend
-router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
-  try {
-    const payload = req.body || {};
+router.post(
+  "/",
+  requireAuth,
+  requireAdmin,
+  upload.single("image"),
+  logUpload,
+  async (req, res) => {
+    try {
+      const payload = req.body || {};
 
-    if (!payload.title || typeof payload.title !== "string") {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(400).json({ message: "Title is required" });
-    }
-
-    payload.cast = castToStringArray(payload.cast);
-    if (req.file) payload.posterUrl = `/uploads/${req.file.filename}`;
-
-    // basic validation: durationMins numeric
-    if (payload.durationMins !== undefined) {
-      const n = Number(payload.durationMins);
-      if (Number.isNaN(n)) {
+      if (!payload.title || typeof payload.title !== "string") {
         if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-        return res.status(400).json({ message: "durationMins must be a number" });
+        return res.status(400).json({ message: "Title is required" });
       }
-      payload.durationMins = n;
-    }
 
-    // record uploader info
-    if (req.user) {
-      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
-      payload.uploaderRole = req.user.role || "admin";
-    }
+      payload.cast = castToStringArray(payload.cast);
+      if (req.file) payload.posterUrl = `/uploads/${req.file.filename}`;
 
-    const movie = await Movie.create(payload);
-    const out = movie.toObject();
-    out.posterUrl = toPublicUrl(onlyUploads(out.posterUrl));
-    out.cast = castResponseObjects(out.cast);
-    res.status(201).json({ ok: true, data: out });
-  } catch (err) {
-    console.error("[Movies] POST / error:", err);
-    if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-    res.status(400).json({ message: "Failed to create movie", error: err.message });
+      if (payload.durationMins !== undefined) {
+        const n = Number(payload.durationMins);
+        if (Number.isNaN(n)) {
+          if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+          return res
+            .status(400)
+            .json({ message: "durationMins must be a number" });
+        }
+        payload.durationMins = n;
+      }
+
+      if (req.user) {
+        payload.uploaderId = req.user.id || req.user._id || req.user.sub;
+        payload.uploaderRole = req.user.role || "admin";
+      }
+
+      const movie = await Movie.create(payload);
+      const out = movie.toObject();
+      out.posterUrl = toPublicUrl(onlyUploads(out.posterUrl));
+      out.cast = castResponseObjects(out.cast);
+      res.status(201).json({ ok: true, data: out });
+    } catch (err) {
+      console.error("[Movies] POST / error:", err);
+      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+      res
+        .status(400)
+        .json({ message: "Failed to create movie", error: err.message });
+    }
   }
-});
+);
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
-router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!isValidId(id)) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(400).json({ message: "Invalid movie id" });
+router.put(
+  "/:id",
+  requireAuth,
+  requireAdmin,
+  upload.single("image"),
+  logUpload,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!isValidId(id)) {
+        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+        return res.status(400).json({ message: "Invalid movie id" });
+      }
+
+      const existing = await Movie.findById(id).lean();
+      if (!existing) {
+        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+        return res.status(404).json({ message: "Movie not found" });
+      }
+
+      const b = req.body || {};
+      const payload = {
+        title: b.title ?? existing.title,
+        description: b.description ?? existing.description,
+        genre: b.genre ?? existing.genre,
+        language: b.language ?? existing.language,
+        director: b.director ?? existing.director,
+        rating: b.rating ?? existing.rating,
+        durationMins: b.durationMins ?? existing.durationMins,
+        releaseDate: b.releaseDate ?? existing.releaseDate,
+        cast: b.cast ? castToStringArray(b.cast) : existing.cast,
+        posterUrl: existing.posterUrl,
+      };
+
+      let oldPoster = null;
+      if (req.file) {
+        payload.posterUrl = `/uploads/${req.file.filename}`;
+        oldPoster = existing.posterUrl;
+      }
+
+      if (req.user) {
+        payload.uploaderId = req.user.id || req.user._id || req.user.sub;
+        payload.uploaderRole = req.user.role || "admin";
+      }
+
+      const updated = await Movie.findByIdAndUpdate(id, payload, {
+        new: true,
+        runValidators: true,
+      }).lean();
+
+      if (
+        updated &&
+        oldPoster &&
+        onlyUploads(oldPoster) !== onlyUploads(updated.posterUrl)
+      ) {
+        safeUnlink(oldPoster);
+      }
+
+      updated.posterUrl = toPublicUrl(onlyUploads(updated.posterUrl));
+      updated.cast = castResponseObjects(updated.cast);
+      res.json({ ok: true, data: updated });
+    } catch (err) {
+      console.error("[Movies] PUT /:id error:", err);
+      res
+        .status(400)
+        .json({ message: "Failed to update movie", error: err.message });
     }
-
-    const existing = await Movie.findById(id).lean();
-    if (!existing) {
-      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      return res.status(404).json({ message: "Movie not found" });
-    }
-
-    const b = req.body || {};
-    const payload = {
-      title: b.title ?? existing.title,
-      description: b.description ?? existing.description,
-      genre: b.genre ?? existing.genre,
-      language: b.language ?? existing.language,
-      director: b.director ?? existing.director,
-      rating: b.rating ?? existing.rating,
-      durationMins: b.durationMins ?? existing.durationMins,
-      releaseDate: b.releaseDate ?? existing.releaseDate,
-      cast: b.cast ? castToStringArray(b.cast) : existing.cast,
-      posterUrl: existing.posterUrl,
-    };
-
-    let oldPoster = null;
-    if (req.file) {
-      payload.posterUrl = `/uploads/${req.file.filename}`;
-      oldPoster = existing.posterUrl;
-    }
-
-    // record uploader info
-    if (req.user) {
-      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
-      payload.uploaderRole = req.user.role || "admin";
-    }
-
-    const updated = await Movie.findByIdAndUpdate(id, payload, {
-      new: true,
-      runValidators: true,
-    }).lean();
-
-    if (updated && oldPoster && onlyUploads(oldPoster) !== onlyUploads(updated.posterUrl)) {
-      safeUnlink(oldPoster);
-    }
-
-    updated.posterUrl = toPublicUrl(onlyUploads(updated.posterUrl));
-    updated.cast = castResponseObjects(updated.cast);
-    res.json({ ok: true, data: updated });
-  } catch (err) {
-    console.error("[Movies] PUT /:id error:", err);
-    res.status(400).json({ message: "Failed to update movie", error: err.message });
   }
-});
+);
 
-/* -------------------------- DELETE: movie (admin only) ----------------------- */
+/* -------------------------- DELETE: movie (admin only) -------------------- */
 router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
+    if (!isValidId(id))
+      return res.status(400).json({ message: "Invalid movie id" });
 
     const removed = await Movie.findByIdAndDelete(id).lean();
     if (!removed) return res.status(404).json({ message: "Movie not found" });
@@ -337,7 +411,9 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
     res.json({ ok: true, message: "Movie deleted", id: removed._id });
   } catch (err) {
     console.error("[Movies] DELETE /:id error:", err);
-    res.status(500).json({ message: "Failed to delete movie", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to delete movie", error: err.message });
   }
 });
 
@@ -348,7 +424,9 @@ router.use((err, _req, res, next) => {
     if (err.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({ message: "File too large (max 3MB)" });
     }
-    return res.status(400).json({ message: err.message || "File upload error" });
+    return res
+      .status(400)
+      .json({ message: err.message || "File upload error" });
   }
   return next(err);
 });
