@@ -5,7 +5,6 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 /**
  * Middleware: Verify JWT and attach user info to req.user
- * Ensures req.user._id and req.user.sub are ALWAYS strings (to match SSE map keys).
  */
 export const requireAuth = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -19,14 +18,12 @@ export const requireAuth = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    // Pick a canonical user id (prefer the JWT 'sub')
     const rawId = decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId;
     if (!rawId) {
       return res.status(401).json({ message: "Token missing subject (sub)" });
     }
-    const userId = String(rawId); // <- normalize to string
+    const userId = String(rawId);
 
-    // Normalize role for consistent downstream checks
     const rawRole =
       decoded.role ??
       (Array.isArray(decoded.roles) ? decoded.roles[0] : null) ??
@@ -34,20 +31,17 @@ export const requireAuth = (req, res, next) => {
 
     const normalizedRole = rawRole ? String(rawRole).toLowerCase() : "user";
 
-    // Attach verified user to req (ids as strings)
     req.user = {
       _id: userId,
-      id: userId,         // convenience alias
-      sub: userId,        // keep sub aligned for SSE/debug
+      id: userId,
+      sub: userId,
       email: decoded.email || null,
       name: decoded.name || decoded.fullName || null,
       role: normalizedRole,
     };
 
-    // Optional: handy for controllers/logs
     res.locals.userId = userId;
 
-    // Debug (safe to remove later)
     console.log("[Auth] OK", { id: userId, email: req.user.email, role: normalizedRole });
 
     next();
@@ -57,9 +51,6 @@ export const requireAuth = (req, res, next) => {
   }
 };
 
-/**
- * Middleware: Allow only admin users
- */
 export const requireAdmin = (req, res, next) => {
   if (!req.user) {
     console.warn("[Auth] No user on request (requireAuth missing?)");
