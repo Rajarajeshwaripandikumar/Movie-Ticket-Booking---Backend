@@ -140,6 +140,7 @@ app.use("/api/theaters", theatersRouter);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
+app.use("/api/upload", uploadRouter);
 
 // Pricing (protected admin)
 app.use("/api/pricing", requireAuth, requireAdmin, pricingRoutes);
