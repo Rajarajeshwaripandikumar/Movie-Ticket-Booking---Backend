@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import path from "path";
 import fs from "fs";
 import multer from "multer";
+import { v2 as cloudinary } from "cloudinary";
 import Movie from "../models/Movie.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
@@ -17,6 +18,7 @@ const BASE_URL =
   process.env.BASE_URL ||
   "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
+// local temp/upload dir used by multer (we still keep a temp dir)
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
 const uploadDir = path.resolve(UPLOADS_DIR);
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -28,6 +30,15 @@ const MIME_EXT = {
   "image/webp": ".webp",
   "image/gif": ".gif",
 };
+
+/* -------------------------------------------------------------------------- */
+/*                         Cloudinary configuration                            */
+/* -------------------------------------------------------------------------- */
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 /* -------------------------------------------------------------------------- */
 /*                                MULTER SETUP                                */
@@ -114,6 +125,8 @@ const onlyUploads = (relish) => {
 
 const toPublicUrl = (u) => {
   if (!u) return "";
+  // if it's already an absolute URL, return as-is (Cloudinary URLs are absolute)
+  if (/^https?:\/\//i.test(String(u))) return String(u);
   const rel = toRelativePoster(u);
   return `${BASE_URL}${rel}`;
 };
@@ -172,6 +185,46 @@ function castToStringArray(anyCast) {
 const castResponseObjects = (anyCast) =>
   castToStringArray(anyCast).map((name) => ({ actorName: name }));
 
+/* ---------------- Cloudinary helpers ---------------- */
+function extractPublicIdFromUrlOrId(urlOrId) {
+  if (!urlOrId) return null;
+  try {
+    const s = String(urlOrId).trim();
+    if (/^https?:\/\//i.test(s)) {
+      const u = new URL(s);
+      const p = u.pathname;
+      const idx = p.indexOf("/upload/");
+      if (idx >= 0) {
+        let after = p.slice(idx + "/upload/".length);
+        after = after.replace(/^v\d+\//, "");
+        after = after.replace(/\.[a-z0-9]+$/i, "");
+        return after;
+      }
+      return null;
+    }
+    return s;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function deleteCloudinaryImageMaybe(ref) {
+  if (!ref) return;
+  // ref could be a Cloudinary public_id or a full URL, or a local /uploads/ path
+  const publicId = extractPublicIdFromUrlOrId(ref);
+  if (publicId) {
+    try {
+      const result = await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
+      console.log("[Cloudinary] destroy result:", publicId, result);
+    } catch (e) {
+      console.warn("[Cloudinary] failed to destroy", publicId, e?.message || e);
+    }
+    return;
+  }
+  // if not cloudinary, maybe local file
+  safeUnlink(ref);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                ROUTES                                      */
 /* -------------------------------------------------------------------------- */
@@ -183,26 +236,20 @@ router.get("/", async (req, res) => {
     const skip = Number(req.query.skip) || 0;
 
     const [docs, count] = await Promise.all([
-      Movie.find()
-        .sort({ releaseDate: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
+      Movie.find().sort({ releaseDate: -1, createdAt: -1 }).skip(skip).limit(limit).lean(),
       Movie.countDocuments(),
     ]);
 
     const movies = docs.map((m) => ({
       ...m,
-      posterUrl: toPublicUrl(onlyUploads(m.posterUrl || "")),
+      posterUrl: toPublicUrl(m.posterUrl || ""),
       cast: castResponseObjects(m.cast),
     }));
 
     res.json({ movies, count });
   } catch (err) {
     console.error("[Movies] GET / error:", err);
-    res
-      .status(500)
-      .json({ message: "Failed to load movies", error: err.message });
+    res.status(500).json({ message: "Failed to load movies", error: err.message });
   }
 });
 
@@ -214,19 +261,12 @@ router.get("/search", async (req, res) => {
 
     if (q) {
       const rx = new RegExp(q, "i");
-      filter.$or = [
-        { title: rx },
-        { description: rx },
-        { director: rx },
-        { cast: rx },
-        { genre: rx },
-      ];
+      filter.$or = [{ title: rx }, { description: rx }, { director: rx }, { cast: rx }, { genre: rx }];
     }
 
     if (genre) {
       const g = toArray(genre);
-      if (g.length)
-        filter.$or = [...(filter.$or || []), { genre: { $in: g } }];
+      if (g.length) filter.$or = [...(filter.$or || []), { genre: { $in: g } }];
     }
 
     if (date) {
@@ -234,23 +274,18 @@ router.get("/search", async (req, res) => {
       if (!isNaN(d)) filter.releaseDate = { $lte: d };
     }
 
-    const docs = await Movie.find(filter)
-      .sort({ releaseDate: -1, createdAt: -1 })
-      .limit(Math.min(200, Number(limit)))
-      .lean();
+    const docs = await Movie.find(filter).sort({ releaseDate: -1, createdAt: -1 }).limit(Math.min(200, Number(limit))).lean();
 
     const movies = docs.map((m) => ({
       ...m,
-      posterUrl: toPublicUrl(onlyUploads(m.posterUrl || "")),
+      posterUrl: toPublicUrl(m.posterUrl || ""),
       cast: castResponseObjects(m.cast),
     }));
 
     res.json({ movies, count: movies.length });
   } catch (err) {
     console.error("[Movies] GET /search error:", err);
-    res
-      .status(500)
-      .json({ message: "Failed to search movies", error: err.message });
+    res.status(500).json({ message: "Failed to search movies", error: err.message });
   }
 });
 
@@ -258,162 +293,191 @@ router.get("/search", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id))
-      return res.status(400).json({ message: "Invalid movie id" });
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
 
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ message: "Movie not found" });
 
-    movie.posterUrl = toPublicUrl(onlyUploads(movie.posterUrl || ""));
+    movie.posterUrl = toPublicUrl(movie.posterUrl || "");
     movie.cast = castResponseObjects(movie.cast);
     res.json(movie);
   } catch (err) {
     console.error("[Movies] GET /:id error:", err);
-    res
-      .status(500)
-      .json({ message: "Failed to fetch movie", error: err.message });
+    res.status(500).json({ message: "Failed to fetch movie", error: err.message });
   }
 });
 
 /* ------------------------- POST: create (admin only) ---------------------- */
-router.post(
-  "/",
-  requireAuth,
-  requireAdmin,
-  upload.single("image"),
-  logUpload,
-  async (req, res) => {
-    try {
-      const payload = req.body || {};
+router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
+  try {
+    const payload = req.body || {};
 
-      if (!payload.title || typeof payload.title !== "string") {
-        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-        return res.status(400).json({ message: "Title is required" });
-      }
-
-      payload.cast = castToStringArray(payload.cast);
-      if (req.file) payload.posterUrl = `/uploads/${req.file.filename}`;
-
-      if (payload.durationMins !== undefined) {
-        const n = Number(payload.durationMins);
-        if (Number.isNaN(n)) {
-          if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-          return res
-            .status(400)
-            .json({ message: "durationMins must be a number" });
-        }
-        payload.durationMins = n;
-      }
-
-      if (req.user) {
-        payload.uploaderId = req.user.id || req.user._id || req.user.sub;
-        payload.uploaderRole = req.user.role || "admin";
-      }
-
-      const movie = await Movie.create(payload);
-      const out = movie.toObject();
-      out.posterUrl = toPublicUrl(onlyUploads(out.posterUrl));
-      out.cast = castResponseObjects(out.cast);
-      res.status(201).json({ ok: true, data: out });
-    } catch (err) {
-      console.error("[Movies] POST / error:", err);
+    if (!payload.title || typeof payload.title !== "string") {
       if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-      res
-        .status(400)
-        .json({ message: "Failed to create movie", error: err.message });
+      return res.status(400).json({ message: "Title is required" });
     }
+
+    // normalize cast
+    payload.cast = castToStringArray(payload.cast);
+
+    // If a file was uploaded -> push to Cloudinary, then delete local temp
+    if (req.file) {
+      const localPath = path.join(uploadDir, req.file.filename);
+      try {
+        const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+        const result = await cloudinary.uploader.upload(localPath, {
+          folder,
+          use_filename: true,
+          unique_filename: true,
+          resource_type: "image",
+        });
+        // delete local temp file
+        safeUnlink(localPath);
+        payload.posterUrl = result.secure_url;
+        // store public id for easier deletion later (optional field)
+        payload.posterPublicId = result.public_id;
+      } catch (e) {
+        safeUnlink(localPath);
+        console.error("[Movies] cloudinary upload failed:", e);
+        return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
+      }
+    }
+
+    // basic validation: durationMins numeric
+    if (payload.durationMins !== undefined && payload.durationMins !== "") {
+      const n = Number(payload.durationMins);
+      if (Number.isNaN(n)) {
+        if (req.file && payload.posterPublicId) {
+          // remove uploaded cloud image if we created one
+          await deleteCloudinaryImageMaybe(payload.posterPublicId);
+        }
+        return res.status(400).json({ message: "durationMins must be a number" });
+      }
+      payload.durationMins = n;
+    }
+
+    // record uploader info
+    if (req.user) {
+      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
+      payload.uploaderRole = req.user.role || "admin";
+    }
+
+    const movie = await Movie.create(payload);
+    const out = movie.toObject();
+    out.posterUrl = toPublicUrl(out.posterUrl);
+    out.cast = castResponseObjects(out.cast);
+    res.status(201).json({ ok: true, data: out });
+  } catch (err) {
+    console.error("[Movies] POST / error:", err);
+    if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+    res.status(400).json({ message: "Failed to create movie", error: err.message });
   }
-);
+});
 
 /* -------------------------- PUT: update (admin only) ---------------------- */
-router.put(
-  "/:id",
-  requireAuth,
-  requireAdmin,
-  upload.single("image"),
-  logUpload,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      if (!isValidId(id)) {
-        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-        return res.status(400).json({ message: "Invalid movie id" });
-      }
-
-      const existing = await Movie.findById(id).lean();
-      if (!existing) {
-        if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
-        return res.status(404).json({ message: "Movie not found" });
-      }
-
-      const b = req.body || {};
-      const payload = {
-        title: b.title ?? existing.title,
-        description: b.description ?? existing.description,
-        genre: b.genre ?? existing.genre,
-        language: b.language ?? existing.language,
-        director: b.director ?? existing.director,
-        rating: b.rating ?? existing.rating,
-        durationMins: b.durationMins ?? existing.durationMins,
-        releaseDate: b.releaseDate ?? existing.releaseDate,
-        cast: b.cast ? castToStringArray(b.cast) : existing.cast,
-        posterUrl: existing.posterUrl,
-      };
-
-      let oldPoster = null;
-      if (req.file) {
-        payload.posterUrl = `/uploads/${req.file.filename}`;
-        oldPoster = existing.posterUrl;
-      }
-
-      if (req.user) {
-        payload.uploaderId = req.user.id || req.user._id || req.user.sub;
-        payload.uploaderRole = req.user.role || "admin";
-      }
-
-      const updated = await Movie.findByIdAndUpdate(id, payload, {
-        new: true,
-        runValidators: true,
-      }).lean();
-
-      if (
-        updated &&
-        oldPoster &&
-        onlyUploads(oldPoster) !== onlyUploads(updated.posterUrl)
-      ) {
-        safeUnlink(oldPoster);
-      }
-
-      updated.posterUrl = toPublicUrl(onlyUploads(updated.posterUrl));
-      updated.cast = castResponseObjects(updated.cast);
-      res.json({ ok: true, data: updated });
-    } catch (err) {
-      console.error("[Movies] PUT /:id error:", err);
-      res
-        .status(400)
-        .json({ message: "Failed to update movie", error: err.message });
+router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+      return res.status(400).json({ message: "Invalid movie id" });
     }
+
+    const existing = await Movie.findById(id).lean();
+    if (!existing) {
+      if (req.file) safeUnlink(`/uploads/${req.file.filename}`);
+      return res.status(404).json({ message: "Movie not found" });
+    }
+
+    const b = req.body || {};
+    const payload = {
+      title: b.title ?? existing.title,
+      description: b.description ?? existing.description,
+      genre: b.genre ?? existing.genre,
+      language: b.language ?? existing.language,
+      director: b.director ?? existing.director,
+      rating: b.rating ?? existing.rating,
+      durationMins: b.durationMins ?? existing.durationMins,
+      releaseDate: b.releaseDate ?? existing.releaseDate,
+      cast: b.cast ? castToStringArray(b.cast) : existing.cast,
+      posterUrl: existing.posterUrl,
+      // preserve posterPublicId if present
+      posterPublicId: existing.posterPublicId,
+    };
+
+    let oldPosterRef = null;
+    if (req.file) {
+      // upload new poster to Cloudinary
+      const localPath = path.join(uploadDir, req.file.filename);
+      try {
+        const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+        const result = await cloudinary.uploader.upload(localPath, {
+          folder,
+          use_filename: true,
+          unique_filename: true,
+          resource_type: "image",
+        });
+        safeUnlink(localPath);
+        payload.posterUrl = result.secure_url;
+        payload.posterPublicId = result.public_id;
+        oldPosterRef = existing.posterPublicId || existing.posterUrl;
+      } catch (e) {
+        safeUnlink(localPath);
+        console.error("[Movies] cloudinary upload failed (update):", e);
+        return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
+      }
+    }
+
+    // record uploader info
+    if (req.user) {
+      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
+      payload.uploaderRole = req.user.role || "admin";
+    }
+
+    const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+
+    // If we replaced the poster, delete the old one (Cloudinary or local)
+    if (updated && oldPosterRef && oldPosterRef !== payload.posterUrl && oldPosterRef !== payload.posterPublicId) {
+      // delete old poster if it was a cloudinary id or url, or delete local file
+      try {
+        await deleteCloudinaryImageMaybe(oldPosterRef);
+      } catch (e) {
+        console.warn("[Movies] failed to delete previous poster:", e?.message || e);
+      }
+    }
+
+    updated.posterUrl = toPublicUrl(updated.posterUrl);
+    updated.cast = castResponseObjects(updated.cast);
+    res.json({ ok: true, data: updated });
+  } catch (err) {
+    console.error("[Movies] PUT /:id error:", err);
+    res.status(400).json({ message: "Failed to update movie", error: err.message });
   }
-);
+});
 
 /* -------------------------- DELETE: movie (admin only) -------------------- */
 router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidId(id))
-      return res.status(400).json({ message: "Invalid movie id" });
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid movie id" });
 
     const removed = await Movie.findByIdAndDelete(id).lean();
     if (!removed) return res.status(404).json({ message: "Movie not found" });
 
-    if (removed.posterUrl) safeUnlink(removed.posterUrl);
+    // remove poster (cloudinary public id or url OR local uploads path)
+    if (removed.posterPublicId) {
+      await deleteCloudinaryImageMaybe(removed.posterPublicId);
+    } else if (removed.posterUrl) {
+      // if posterUrl is cloudinary url, delete by extracting public id; otherwise unlink local
+      await deleteCloudinaryImageMaybe(removed.posterUrl);
+      // also attempt to unlink local path if it was stored as /uploads/...
+      safeUnlink(removed.posterUrl);
+    }
 
     res.json({ ok: true, message: "Movie deleted", id: removed._id });
   } catch (err) {
     console.error("[Movies] DELETE /:id error:", err);
-    res
-      .status(500)
-      .json({ message: "Failed to delete movie", error: err.message });
+    res.status(500).json({ message: "Failed to delete movie", error: err.message });
   }
 });
 
@@ -424,9 +488,7 @@ router.use((err, _req, res, next) => {
     if (err.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({ message: "File too large (max 3MB)" });
     }
-    return res
-      .status(400)
-      .json({ message: err.message || "File upload error" });
+    return res.status(400).json({ message: err.message || "File upload error" });
   }
   return next(err);
 });
