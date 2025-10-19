@@ -261,6 +261,81 @@ async function connectWithRetry(uri, maxAttempts = 6) {
   }
 }
 
+/***************************************************************
+ * DEBUG HELPERS — add BEFORE start()
+ ***************************************************************/
+function getMountedRoutes() {
+  const routes = [];
+  const stack = app._router && app._router.stack ? app._router.stack : [];
+  stack.forEach((middleware) => {
+    if (middleware.route) {
+      // direct route
+      routes.push({ path: middleware.route.path, methods: Object.keys(middleware.route.methods) });
+    } else if (middleware.name === "router" && middleware.handle && middleware.handle.stack) {
+      // router with nested routes
+      middleware.handle.stack.forEach((handler) => {
+        if (handler.route) {
+          routes.push({ path: handler.route.path, methods: Object.keys(handler.route.methods) });
+        }
+      });
+    }
+  });
+  return routes;
+}
+
+function routeExists(path) {
+  const routes = getMountedRoutes();
+  return routes.some((r) => r.path === path);
+}
+
+// Expose mounted routes for quick verification
+app.get("/debug/routes", (_req, res) => {
+  try {
+    const routes = getMountedRoutes();
+    res.json({ ok: true, count: routes.length, routes });
+  } catch (e) {
+    console.error("/debug/routes error:", e);
+    res.status(500).json({ ok: false, message: "Could not list routes", error: String(e) });
+  }
+});
+
+// Add test-cloud only if not already present to avoid duplicate route errors
+if (!routeExists("/api/movies/test-cloud")) {
+  app.post("/api/movies/test-cloud", async (_req, res) => {
+    try {
+      // quick guard
+      if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+        return res.status(500).json({ ok: false, message: "Cloudinary not configured (missing env vars)" });
+      }
+      const sampleUrl = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
+      const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
+      console.log("[/api/movies/test-cloud] attempting sample upload to Cloudinary...");
+      const result = await cloudinary.uploader.upload(sampleUrl, { folder, resource_type: "image" });
+      console.log("[/api/movies/test-cloud] success:", result && result.secure_url);
+      return res.json({ ok: true, message: "Cloudinary test upload succeeded", secure_url: result.secure_url, public_id: result.public_id });
+    } catch (err) {
+      console.error("[/api/movies/test-cloud] upload error:", err && (err.stack || err));
+      return res.status(500).json({
+        ok: false,
+        message: "Cloudinary test upload failed",
+        error: err?.message ?? String(err),
+        http_code: err?.http_code,
+      });
+    }
+  });
+} else {
+  console.log("[debug] /api/movies/test-cloud already exists; skipping auto-add.");
+}
+
+// Log mounted routes to console at startup
+try {
+  const routes = getMountedRoutes();
+  console.log("DEBUG: mounted routes count =", routes.length);
+  console.log(JSON.stringify(routes, null, 2));
+} catch (e) {
+  console.error("DEBUG: failed to list routes at startup:", e);
+}
+
 /* ----------------------------- Server boot -------------------------------- */
 const PORT = Number(process.env.PORT) || 8080;
 let server;
