@@ -18,7 +18,6 @@ const BASE_URL =
   process.env.BASE_URL ||
   "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
-// local temp/upload dir used by multer (we still keep a temp dir)
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "uploads";
 const uploadDir = path.resolve(UPLOADS_DIR);
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -65,12 +64,7 @@ const fileFilter = (_, file, cb) => {
   ].includes(file.mimetype);
   ok
     ? cb(null, true)
-    : cb(
-        new multer.MulterError(
-          "LIMIT_UNEXPECTED_FILE",
-          "Only image files are allowed"
-        )
-      );
+    : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only image files are allowed"));
 };
 
 const upload = multer({
@@ -81,12 +75,7 @@ const upload = multer({
 
 function logUpload(req, _res, next) {
   if (req.file) {
-    console.log(
-      "[uploads] saved:",
-      req.file.filename,
-      "->",
-      path.join(uploadDir, req.file.filename)
-    );
+    console.log("[uploads] saved:", req.file.filename, "->", path.join(uploadDir, req.file.filename));
   } else {
     console.log("[uploads] no file on this request");
   }
@@ -125,7 +114,6 @@ const onlyUploads = (relish) => {
 
 const toPublicUrl = (u) => {
   if (!u) return "";
-  // if it's already an absolute URL, return as-is (Cloudinary URLs are absolute)
   if (/^https?:\/\//i.test(String(u))) return String(u);
   const rel = toRelativePoster(u);
   return `${BASE_URL}${rel}`;
@@ -210,7 +198,6 @@ function extractPublicIdFromUrlOrId(urlOrId) {
 
 async function deleteCloudinaryImageMaybe(ref) {
   if (!ref) return;
-  // ref could be a Cloudinary public_id or a full URL, or a local /uploads/ path
   const publicId = extractPublicIdFromUrlOrId(ref);
   if (publicId) {
     try {
@@ -221,7 +208,6 @@ async function deleteCloudinaryImageMaybe(ref) {
     }
     return;
   }
-  // if not cloudinary, maybe local file
   safeUnlink(ref);
 }
 
@@ -331,14 +317,13 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
           unique_filename: true,
           resource_type: "image",
         });
-        // delete local temp file
         safeUnlink(localPath);
         payload.posterUrl = result.secure_url;
-        // store public id for easier deletion later (optional field)
         payload.posterPublicId = result.public_id;
+        console.log("[Movies] cloudinary upload result (create):", result.secure_url, result.public_id);
       } catch (e) {
         safeUnlink(localPath);
-        console.error("[Movies] cloudinary upload failed:", e);
+        console.error("[Movies] cloudinary upload failed (create):", e?.message || e);
         return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
       }
     }
@@ -348,7 +333,6 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), logUpload, a
       const n = Number(payload.durationMins);
       if (Number.isNaN(n)) {
         if (req.file && payload.posterPublicId) {
-          // remove uploaded cloud image if we created one
           await deleteCloudinaryImageMaybe(payload.posterPublicId);
         }
         return res.status(400).json({ message: "durationMins must be a number" });
@@ -400,14 +384,12 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload,
       durationMins: b.durationMins ?? existing.durationMins,
       releaseDate: b.releaseDate ?? existing.releaseDate,
       cast: b.cast ? castToStringArray(b.cast) : existing.cast,
-      posterUrl: existing.posterUrl,
-      // preserve posterPublicId if present
+      posterUrl: b.posterUrl ?? existing.posterUrl,
       posterPublicId: existing.posterPublicId,
     };
 
     let oldPosterRef = null;
     if (req.file) {
-      // upload new poster to Cloudinary
       const localPath = path.join(uploadDir, req.file.filename);
       try {
         const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
@@ -418,12 +400,15 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload,
           resource_type: "image",
         });
         safeUnlink(localPath);
+        // set new poster URL/public id
         payload.posterUrl = result.secure_url;
         payload.posterPublicId = result.public_id;
+        // remember reference to delete old one (public id preferred)
         oldPosterRef = existing.posterPublicId || existing.posterUrl;
+        console.log("[Movies] cloudinary upload result (update):", result.secure_url, result.public_id);
       } catch (e) {
         safeUnlink(localPath);
-        console.error("[Movies] cloudinary upload failed (update):", e);
+        console.error("[Movies] cloudinary upload failed (update):", e?.message || e);
         return res.status(500).json({ message: "Failed to upload poster", error: e?.message || e });
       }
     }
@@ -438,7 +423,6 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), logUpload,
 
     // If we replaced the poster, delete the old one (Cloudinary or local)
     if (updated && oldPosterRef && oldPosterRef !== payload.posterUrl && oldPosterRef !== payload.posterPublicId) {
-      // delete old poster if it was a cloudinary id or url, or delete local file
       try {
         await deleteCloudinaryImageMaybe(oldPosterRef);
       } catch (e) {
@@ -468,9 +452,7 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
     if (removed.posterPublicId) {
       await deleteCloudinaryImageMaybe(removed.posterPublicId);
     } else if (removed.posterUrl) {
-      // if posterUrl is cloudinary url, delete by extracting public id; otherwise unlink local
       await deleteCloudinaryImageMaybe(removed.posterUrl);
-      // also attempt to unlink local path if it was stored as /uploads/...
       safeUnlink(removed.posterUrl);
     }
 
