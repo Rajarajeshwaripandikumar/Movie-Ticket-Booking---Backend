@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@sendgrid/mail": "^7.7.0",
+    "cloudinary": "^1.41.3",
     "agenda": "^5.0.0",
     "axios": "^1.12.2",
     "bcrypt": "^6.0.0",
