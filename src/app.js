@@ -3,12 +3,13 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import path from "path";
+import fs from "fs";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 
-// routes
+// Routes
 import authRoutes from "./routes/auth.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
 import moviesRoutes from "./routes/movies.routes.js";
@@ -24,19 +25,19 @@ import notificationPrefRoutes from "./routes/notificationPref.routes.js";
 import analyticsRoutes from "./routes/analytics.routes.js";
 import screensRoutes from "./routes/screens.routes.js";
 
-// middleware
+// Middleware
 import { requireAuth, requireAdmin } from "./middleware/auth.js";
 
 const app = express();
 
 /* ─────────────────────────────── CORE APP SETTINGS ───────────────────────────── */
-app.set("trust proxy", 1); // for Render / Netlify / ELB
+app.set("trust proxy", 1); // Render / Netlify / ELB
 
 /* ─────────────────────────────── SECURITY HEADERS ────────────────────────────── */
 app.use(
   helmet({
     crossOriginResourcePolicy: false, // allow /uploads cross-origin
-    contentSecurityPolicy: false,     // relax CSP (tighten later if needed)
+    contentSecurityPolicy: false,     // relaxed for dev (tighten in prod)
   })
 );
 
@@ -50,8 +51,11 @@ const DEV_ORIGINS = [
 ];
 
 const PROD_ORIGINS = [
-  "https://movieticketbooking-rajy.netlify.app",            // Netlify frontend
+  "https://movieticketbooking-rajy.netlify.app",            // frontend
   "https://movie-ticket-booking-backend-o1m2.onrender.com", // backend self
+  ...(process.env.APP_ORIGINS_PROD
+    ? process.env.APP_ORIGINS_PROD.split(",").map((s) => s.trim()).filter(Boolean)
+    : []),
 ];
 
 const ALLOWED_ORIGINS = [...DEV_ORIGINS, ...PROD_ORIGINS];
@@ -86,9 +90,17 @@ app.use(express.urlencoded({ extended: true }));
 
 /* ─────────────────────────────── STATIC FILES ───────────────────────────────── */
 // Serve uploaded images
-// Serve uploaded images (uses UPLOADS_DIR if set)
-app.use("/uploads", express.static(path.resolve(process.env.UPLOADS_DIR || "uploads")));
+const uploadsPath = path.resolve(process.env.UPLOADS_DIR || "uploads");
+if (!fs.existsSync(uploadsPath)) fs.mkdirSync(uploadsPath, { recursive: true });
+app.use("/uploads", express.static(uploadsPath));
 
+// Debug log for Render file visibility
+console.log("[app] Serving static uploads from:", uploadsPath);
+try {
+  console.log("[app] Found files:", fs.readdirSync(uploadsPath));
+} catch (e) {
+  console.warn("[app] Cannot read uploads dir:", e.message);
+}
 
 /* ─────────── Defensive: normalize accidental /api/api/... → /api/... ────────── */
 app.use((req, _res, next) => {
@@ -97,9 +109,14 @@ app.use((req, _res, next) => {
 });
 
 /* ─────────────────────────────────── ROUTES ──────────────────────────────────── */
-// Health
+// Health check
 app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, uptime: process.uptime(), timestamp: new Date().toISOString() })
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || "development",
+  })
 );
 
 // Uploads
@@ -114,20 +131,19 @@ app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
 
-// Notifications + prefs (SSE at /api/notifications/stream)
+// Notifications
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/notification-prefs", notificationPrefRoutes);
 
 // Profiles
 app.use("/api/profile", profileRoutes);
 
-// Admin (protected)
+// Admin routes (protected)
 app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
 app.use("/api/admin/theaters", requireAuth, requireAdmin, theatersRouter);
 
-// Screens (explicit + legacy mount)
+// Screens
 app.use("/api/screens", screensRoutes);
-
 
 // Analytics (protected)
 app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
