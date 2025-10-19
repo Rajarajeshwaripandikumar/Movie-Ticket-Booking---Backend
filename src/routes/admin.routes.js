@@ -1,6 +1,7 @@
 // backend/src/routes/admin.routes.js
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import mongoose from "mongoose";
 
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
@@ -10,31 +11,19 @@ import Screen from "../models/Screen.js";
 import Showtime from "../models/Showtime.js";
 import Booking from "../models/Booking.js";
 
-// IMPORTANT: reuse the movies router so admin can call /api/admin/movies/...
+// Reuse your movies router for /api/admin/movies
 import moviesRouter from "./movies.routes.js";
 
 const router = Router();
 
-/**
- * NOTE:
- * app.js mounts this file under /api/admin with:
- *   app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
- *
- * That means every route here is already behind auth+admin when mounted.
- * We still keep requireAdmin on sensitive endpoints for clarity/defense-in-depth.
- */
+/* -------------------------------------------------------------------------- */
+/*                          DEBUG / USER PROFILE ROUTES                       */
+/* -------------------------------------------------------------------------- */
 
-/* ----------------------------- DEBUG / INFO ------------------------------- */
-// debug which user (route kept for convenience)
+// Quick sanity check (returns decoded JWT user)
 router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }));
 
-/* --------------------------- Mount admin routers -------------------------- */
-// Mount movies routes under /api/admin/movies
-// This reuses your existing movies router (which contains POST/PUT/DELETE/multer logic).
-// Because app.js wraps /api/admin with requireAuth+requireAdmin, these routes are protected.
-router.use("/movies", moviesRouter);
-
-/* ----------------------------- PROFILE / AUTH ----------------------------- */
+// Get current admin profile
 router.get("/me", requireAdmin, async (req, res) => {
   try {
     const id = req.user?._id || req.user?.sub;
@@ -45,12 +34,13 @@ router.get("/me", requireAdmin, async (req, res) => {
 
     const { _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt } = doc;
     res.json({ id: _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt });
-  } catch (e) {
-    console.error("[Admin] /me error:", e);
+  } catch (err) {
+    console.error("[Admin] /me error:", err);
     res.status(500).json({ message: "Failed to fetch profile" });
   }
 });
 
+// Update admin profile
 router.put("/profile", requireAdmin, async (req, res) => {
   try {
     const id = req.user?._id || req.user?.sub;
@@ -65,17 +55,17 @@ router.put("/profile", requireAdmin, async (req, res) => {
 
     const { _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt } = updated;
     res.json({ id: _id, email, role, name, avatarUrl, phone, city, createdAt, updatedAt });
-  } catch (e) {
-    console.error("[Admin] update profile error:", e);
-    res.status(500).json({ message: "Failed to update profile", error: e.message });
+  } catch (err) {
+    console.error("[Admin] update profile error:", err);
+    res.status(500).json({ message: "Failed to update profile", error: err.message });
   }
 });
 
-/* ------------------------- CHANGE PASSWORD ------------------------- */
+// Change password
 router.post("/change-password", requireAdmin, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body || {};
-    if (!currentPassword || !newPassword || String(newPassword).length < 6) {
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
       return res.status(400).json({ ok: false, message: "Invalid input" });
     }
 
@@ -83,15 +73,16 @@ router.post("/change-password", requireAdmin, async (req, res) => {
     const user = await User.findById(id).select("+password");
     if (!user) return res.status(404).json({ ok: false, message: "User not found" });
 
-    const matches = typeof user.comparePassword === "function"
-      ? await user.comparePassword(currentPassword)
-      : await bcrypt.compare(currentPassword, user.password || "");
+    const matches =
+      typeof user.comparePassword === "function"
+        ? await user.comparePassword(currentPassword)
+        : await bcrypt.compare(currentPassword, user.password || "");
 
     if (!matches) return res.status(400).json({ ok: false, message: "Current password is incorrect" });
 
-    // Hash new password if no pre-save hook
-    if (user.schema?.methods?.comparePassword || user.isModified) {
-      user.password = newPassword; // presave should handle hashing
+    // hash manually if no pre-save hook
+    if (user.schema?.methods?.comparePassword) {
+      user.password = newPassword;
     } else {
       const salt = await bcrypt.genSalt(10);
       user.password = await bcrypt.hash(newPassword, salt);
@@ -99,13 +90,21 @@ router.post("/change-password", requireAdmin, async (req, res) => {
 
     await user.save();
     res.json({ ok: true, message: "Password updated" });
-  } catch (e) {
-    console.error("[Admin] change-password error:", e);
+  } catch (err) {
+    console.error("[Admin] change-password error:", err);
     res.status(500).json({ ok: false, message: "Failed to change password" });
   }
 });
 
-/* -------------------------------- THEATERS -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                              MOVIES MANAGEMENT                             */
+/* -------------------------------------------------------------------------- */
+// Reuse existing movie router — this contains POST/PUT/DELETE/multer logic
+router.use("/movies", moviesRouter);
+
+/* -------------------------------------------------------------------------- */
+/*                               THEATER MANAGEMENT                           */
+/* -------------------------------------------------------------------------- */
 router.post("/theaters", requireAdmin, async (req, res) => {
   try {
     const { name, city, address } = req.body || {};
@@ -116,9 +115,9 @@ router.post("/theaters", requireAdmin, async (req, res) => {
 
     const theater = await Theater.create({ name, city, address });
     res.status(201).json(theater);
-  } catch (e) {
-    console.error("[Admin] create theater error:", e);
-    res.status(500).json({ message: "Failed to create theater", error: e.message });
+  } catch (err) {
+    console.error("[Admin] create theater error:", err);
+    res.status(500).json({ message: "Failed to create theater", error: err.message });
   }
 });
 
@@ -126,9 +125,9 @@ router.get("/theaters", requireAdmin, async (_req, res) => {
   try {
     const theaters = await Theater.find().sort({ createdAt: -1 });
     res.json(theaters);
-  } catch (e) {
-    console.error("[Admin] load theaters error:", e);
-    res.status(500).json({ message: "Failed to load theaters", error: e.message });
+  } catch (err) {
+    console.error("[Admin] load theaters error:", err);
+    res.status(500).json({ message: "Failed to load theaters", error: err.message });
   }
 });
 
@@ -137,9 +136,9 @@ router.get("/theaters/:id", requireAdmin, async (req, res) => {
     const theater = await Theater.findById(req.params.id);
     if (!theater) return res.status(404).json({ message: "Theater not found" });
     res.json(theater);
-  } catch (e) {
-    console.error("[Admin] get theater error:", e);
-    res.status(500).json({ message: "Failed to fetch theater", error: e.message });
+  } catch (err) {
+    console.error("[Admin] get theater error:", err);
+    res.status(500).json({ message: "Failed to fetch theater", error: err.message });
   }
 });
 
@@ -148,24 +147,26 @@ router.delete("/theaters/:id", requireAdmin, async (req, res) => {
     const deleted = await Theater.findByIdAndDelete(req.params.id);
     if (!deleted) return res.status(404).json({ message: "Theater not found" });
     res.json({ message: "Theater deleted successfully" });
-  } catch (e) {
-    console.error("[Admin] delete theater error:", e);
-    res.status(500).json({ message: "Failed to delete theater", error: e.message });
+  } catch (err) {
+    console.error("[Admin] delete theater error:", err);
+    res.status(500).json({ message: "Failed to delete theater", error: err.message });
   }
 });
 
-/* -------------------------------- SCREENS -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                               SCREEN MANAGEMENT                            */
+/* -------------------------------------------------------------------------- */
 router.post("/theaters/:id/screens", requireAdmin, async (req, res) => {
   try {
     const { name, rows, cols } = req.body || {};
-    if (!name || !rows || !cols) {
+    if (!name || !rows || !cols)
       return res.status(400).json({ message: "name, rows, cols are required" });
-    }
+
     const screen = await Screen.create({ theater: req.params.id, name, rows, cols });
     res.status(201).json(screen);
-  } catch (e) {
-    console.error("[Admin] create screen error:", e);
-    res.status(500).json({ message: "Failed to create screen", error: e.message });
+  } catch (err) {
+    console.error("[Admin] create screen error:", err);
+    res.status(500).json({ message: "Failed to create screen", error: err.message });
   }
 });
 
@@ -173,13 +174,15 @@ router.get("/theaters/:id/screens", requireAdmin, async (req, res) => {
   try {
     const screens = await Screen.find({ theater: req.params.id }).sort({ createdAt: -1 });
     res.json(screens);
-  } catch (e) {
-    console.error("[Admin] load screens error:", e);
-    res.status(500).json({ message: "Failed to load screens", error: e.message });
+  } catch (err) {
+    console.error("[Admin] load screens error:", err);
+    res.status(500).json({ message: "Failed to load screens", error: err.message });
   }
 });
 
-/* ------------------------------- SHOWTIMES ------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                              SHOWTIME MANAGEMENT                           */
+/* -------------------------------------------------------------------------- */
 router.get("/showtimes", requireAdmin, async (_req, res) => {
   try {
     const showtimes = await Showtime.find()
@@ -189,9 +192,9 @@ router.get("/showtimes", requireAdmin, async (_req, res) => {
       .sort({ startTime: -1 });
 
     res.json(showtimes);
-  } catch (e) {
-    console.error("[Admin] load showtimes error:", e);
-    res.status(500).json({ message: "Failed to load showtimes", error: e.message });
+  } catch (err) {
+    console.error("[Admin] load showtimes error:", err);
+    res.status(500).json({ message: "Failed to load showtimes", error: err.message });
   }
 });
 
@@ -211,7 +214,9 @@ router.post("/showtimes", requireAdmin, async (req, res) => {
     if (!R || !C) return res.status(400).json({ message: "rows and cols are required (body or screen)" });
 
     const seats = [];
-    for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) seats.push({ row: r, col: c, status: "AVAILABLE" });
+    for (let r = 1; r <= R; r++) {
+      for (let c = 1; c <= C; c++) seats.push({ row: r, col: c, status: "AVAILABLE" });
+    }
 
     const showtime = await Showtime.create({
       movie,
@@ -224,9 +229,9 @@ router.post("/showtimes", requireAdmin, async (req, res) => {
     });
 
     res.status(201).json(showtime);
-  } catch (e) {
-    console.error("[Admin] create showtime error:", e);
-    res.status(500).json({ message: "Failed to create showtime", error: e.message });
+  } catch (err) {
+    console.error("[Admin] create showtime error:", err);
+    res.status(500).json({ message: "Failed to create showtime", error: err.message });
   }
 });
 
@@ -235,13 +240,15 @@ router.patch("/showtimes/:id", requireAdmin, async (req, res) => {
     const updated = await Showtime.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!updated) return res.status(404).json({ message: "Showtime not found" });
     res.json(updated);
-  } catch (e) {
-    console.error("[Admin] update showtime error:", e);
-    res.status(500).json({ message: "Failed to update showtime", error: e.message });
+  } catch (err) {
+    console.error("[Admin] update showtime error:", err);
+    res.status(500).json({ message: "Failed to update showtime", error: err.message });
   }
 });
 
-/* -------------------------------- PRICING -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                              PRICING MANAGEMENT                            */
+/* -------------------------------------------------------------------------- */
 router.patch("/pricing/:showtimeId", requireAdmin, async (req, res) => {
   try {
     const { basePrice, multipliers } = req.body || {};
@@ -253,13 +260,15 @@ router.patch("/pricing/:showtimeId", requireAdmin, async (req, res) => {
     if (!updated) return res.status(404).json({ message: "Showtime not found" });
 
     res.json({ message: "Pricing updated successfully!", showtime: updated });
-  } catch (e) {
-    console.error("[Admin] update pricing error:", e);
-    res.status(500).json({ message: "Failed to update pricing", error: e.message });
+  } catch (err) {
+    console.error("[Admin] update pricing error:", err);
+    res.status(500).json({ message: "Failed to update pricing", error: err.message });
   }
 });
 
-/* -------------------------------- REPORTS -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                REPORTS API                                 */
+/* -------------------------------------------------------------------------- */
 router.get("/reports", requireAdmin, async (req, res) => {
   try {
     const { from, to } = req.query;
@@ -267,11 +276,7 @@ router.get("/reports", requireAdmin, async (req, res) => {
 
     if (from || to) {
       const createdAt = {};
-      if (from) {
-        const f = new Date(from);
-        f.setHours(0, 0, 0, 0);
-        createdAt.$gte = f;
-      }
+      if (from) createdAt.$gte = new Date(from);
       if (to) {
         const t = new Date(to);
         t.setHours(23, 59, 59, 999);
@@ -298,9 +303,9 @@ router.get("/reports", requireAdmin, async (req, res) => {
     }, {});
 
     res.json({ count: bookings.length, revenue, countsByStatus, bookings });
-  } catch (e) {
-    console.error("[Admin] report error:", e);
-    res.status(500).json({ message: "Failed to generate report", error: e.message });
+  } catch (err) {
+    console.error("[Admin] report error:", err);
+    res.status(500).json({ message: "Failed to generate report", error: err.message });
   }
 });
 
