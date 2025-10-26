@@ -56,6 +56,16 @@ function tokenQueryToHeader(req, _res, next) {
 // Apply it very early
 app.use(tokenQueryToHeader);
 
+// ---------- TEMP DEBUG: simple request logger (remove in production) ----------
+app.use((req, res, next) => {
+  // do not log full token (sensitive) — only show path + method + timestamp
+  try {
+    console.log(`[REQ] ${new Date().toISOString()} ${req.ip} ${req.method} ${req.originalUrl}`);
+  } catch (e) {}
+  next();
+});
+// ---------------------------------------------------------------------------
+
 /* ----------------------------- CORS config -------------------------------- */
 const envOrigins = (process.env.FRONTEND_ORIGINS || "")
   .split(",")
@@ -186,52 +196,95 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
 });
 
 /* ----------------------------- SSE / EventSource --------------------------- */
-// Example SSE endpoint that supports token auth via querystring or Authorization header
-app.get('/api/notifications/stream', (req, res) => {
-  // CORS: allow the requesting origin if allowed
+/*
+  Consolidated SSE handler reused for both /api/notifications/stream and /notifications/stream
+  Supports token via ?token= (copied to Authorization header by tokenQueryToHeader) or Authorization header.
+*/
+function setSseCorsHeaders(req, res) {
   const origin = req.headers.origin;
   if (origin && allowedOrigins.has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader("Access-Control-Allow-Origin", origin);
   } else if (process.env.FRONTEND_ORIGIN) {
-    res.setHeader('Access-Control-Allow-Origin', process.env.FRONTEND_ORIGIN);
+    res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
   } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+}
 
-  // If you expect Authorization header, you can inspect it here (or token query param)
-  const token = req.query.token || req.headers.authorization?.split(' ')[1];
-  // TODO: validate token if necessary (authenticate user)
+function sseStreamHandler(req, res) {
+  try {
+    // Set CORS & SSE headers
+    setSseCorsHeaders(req, res);
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
 
-  // Send initial comment to establish connection
-  res.write(': connected\n\n');
+    // Accept token from ?token= or Authorization header (tokenQueryToHeader already copies ?token into Authorization)
+    const token = req.query.token || (req.headers.authorization ? req.headers.authorization.split(" ")[1] : undefined);
 
-  // send a ping every 15s to keep proxies from closing idle connections
-  const keepAlive = setInterval(() => {
+    // temporary log for debugging
+    console.log("[SSE HIT]", { path: req.originalUrl, hasAuthHeader: Boolean(req.headers.authorization), tokenPresent: Boolean(token) });
+
+    // initial comment to establish connection
+    try { res.write(": connected\n\n"); } catch (err) {}
+
+    // heartbeat (keep connection alive through proxies)
+    const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
+    const keepAlive = setInterval(() => {
+      if (res.writableEnded || res.destroyed) return;
+      try {
+        res.write(`: heartbeat ${Date.now()}\n\n`);
+      } catch (e) {}
+    }, HEARTBEAT_MS);
+
+    // example periodic sample data (replace with real notification push logic)
+    const sampleTicker = setInterval(() => {
+      if (res.writableEnded || res.destroyed) return;
+      try {
+        const data = { msg: "heartbeat", at: new Date().toISOString() };
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch (e) {}
+    }, 60000);
+
+    // cleanup on close/error
+    const cleanup = () => {
+      try { clearInterval(keepAlive); } catch {}
+      try { clearInterval(sampleTicker); } catch {}
+      try { res.end(); } catch {}
+    };
+
+    req.on("close", cleanup);
+    req.on("end", cleanup);
+    res.on("error", (err) => {
+      console.log("[SSE socket error]", err && err.message);
+      cleanup();
+    });
+
+    // keep the response open
+    return;
+  } catch (err) {
+    console.error("[sseStreamHandler] error:", err && err.stack ? err.stack : err);
     try {
-      res.write(`event: ping\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
-    } catch (e) {
-      // ignore write errors
-    }
-  }, 15000);
+      if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
+    } catch {}
+  }
+}
 
-  // Example: send periodic sample data (replace with your notification logic)
-  const sampleTicker = setInterval(() => {
-    try {
-      const data = { msg: 'heartbeat', at: new Date().toISOString() };
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch (e) {}
-  }, 60000);
-
-  req.on('close', () => {
-    clearInterval(keepAlive);
-    clearInterval(sampleTicker);
-    try { res.end(); } catch (e) {}
-  });
+// Register OPTIONS + GET for both /api/notifications/stream and /notifications/stream
+app.options("/api/notifications/stream", (req, res) => {
+  setSseCorsHeaders(req, res);
+  return res.sendStatus(204);
 });
+app.get("/api/notifications/stream", sseStreamHandler);
+
+app.options("/notifications/stream", (req, res) => {
+  setSseCorsHeaders(req, res);
+  return res.sendStatus(204);
+});
+app.get("/notifications/stream", sseStreamHandler);
 
 /* ----------------------------- /api/upload route --------------------------- */
 import multer from "multer";
