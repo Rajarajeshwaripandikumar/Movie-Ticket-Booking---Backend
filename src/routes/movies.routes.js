@@ -54,30 +54,65 @@ function uploadBufferToCloudinary(buffer, folder = "movies") {
 }
 
 /**
- * Normalize incoming value into an array of trimmed strings.
- * Accepts: Array, JSON-array-string, comma-separated string, or undefined/null.
+ * Normalize a request body field into an array.
+ * - If value is an Array of primitives => array of trimmed strings
+ * - If value is an Array of objects => return as-is (preserve object shape)
+ * - If value is a JSON string representing an array (of primitives or objects) => parsed and normalized
+ * - If value is a comma-separated string => split into trimmed strings
+ * - If null/undefined/empty => []
  */
-function normalizeToArray(value) {
-  if (!value && value !== "") return [];
-  if (Array.isArray(value)) return value.map((s) => String(s).trim()).filter(Boolean);
+function normalizeArrayField(value) {
+  if (value == null) return [];
 
-  // try JSON parse
+  // If already an array, inspect its elements
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [];
+    // If array contains objects (cast objects), preserve them (but parse JSON strings inside)
+    if (typeof value[0] === "object" && value[0] !== null) {
+      return value.map((v) => {
+        // if any array entry is a stringified JSON, try to parse
+        if (typeof v === "string") {
+          try {
+            return JSON.parse(v);
+          } catch (e) {
+            return v;
+          }
+        }
+        return v;
+      });
+    }
+    // otherwise convert primitives to trimmed strings
+    return value.map((s) => String(s).trim()).filter(Boolean);
+  }
+
+  // If a string, try JSON parse first
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) return [];
 
+    // try parsing JSON
     try {
       const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) return parsed.map((s) => String(s).trim()).filter(Boolean);
+      if (Array.isArray(parsed)) {
+        // if parsed array contains objects, return as-is
+        if (parsed.length > 0 && typeof parsed[0] === "object" && parsed[0] !== null) {
+          return parsed;
+        }
+        // otherwise return trimmed primitives as strings
+        return parsed.map((s) => String(s).trim()).filter(Boolean);
+      }
     } catch (e) {
-      // not JSON — fallthrough to comma split
+      // not JSON — fallthrough to comma-split
     }
 
     // comma-separated fallback
     return trimmed.split(",").map((s) => s.trim()).filter(Boolean);
   }
 
-  // fallback: convert to single string
+  // If it's an object (single object) — return as single-element array
+  if (typeof value === "object") return [value];
+
+  // fallback scalar => single-string array
   return [String(value).trim()].filter(Boolean);
 }
 
@@ -180,10 +215,10 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
     const payload = req.body || {};
 
     // Normalize array-like fields: genres, cast, crew, languages
-    const genres = normalizeToArray(payload.genres);
-    const cast = normalizeToArray(payload.cast);
-    const crew = normalizeToArray(payload.crew);
-    let languages = normalizeToArray(payload.languages);
+    const genres = normalizeArrayField(payload.genres);
+    const cast = normalizeArrayField(payload.cast);
+    const crew = normalizeArrayField(payload.crew);
+    let languages = normalizeArrayField(payload.languages);
 
     // sensible default if languages not provided
     if (!languages || languages.length === 0) languages = ["English"];
@@ -198,8 +233,12 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
       genres,
       languages,
       releasedAt: payload.releasedAt ? new Date(payload.releasedAt) : payload.releasedAt ?? null,
-      inTheaters: typeof payload.inTheaters !== "undefined" ? payload.inTheaters === "true" || payload.inTheaters === true : false,
-      runtimeMinutes: payload.runtimeMinutes ? Number(payload.runtimeMinutes) : payload.runtimeMinutes ? Number(payload.runtimeMinutes) : payload.runtime ?? null,
+      inTheaters:
+        typeof payload.inTheaters !== "undefined"
+          ? payload.inTheaters === "true" || payload.inTheaters === true
+          : false,
+      runtimeMinutes:
+        payload.runtimeMinutes ? Number(payload.runtimeMinutes) : payload.runtime ? Number(payload.runtime) : null,
       posterUrl: payload.posterUrl ?? null,
       posterPublicId: payload.posterPublicId ?? null,
     };
@@ -243,11 +282,11 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
 
     const body = req.body || {};
 
-    // Normalize arrays (if present)
-    const genres = body.genres ? normalizeToArray(body.genres) : existing.genres || [];
-    const cast = body.cast ? normalizeToArray(body.cast) : existing.cast || [];
-    const crew = body.crew ? normalizeToArray(body.crew) : existing.crew || [];
-    const languages = body.languages ? normalizeToArray(body.languages) : existing.languages || ["English"];
+    // Normalize arrays (if present). If not present, keep existing values.
+    const genres = body.genres ? normalizeArrayField(body.genres) : existing.genres || [];
+    const cast = body.cast ? normalizeArrayField(body.cast) : existing.cast || [];
+    const crew = body.crew ? normalizeArrayField(body.crew) : existing.crew || [];
+    const languages = body.languages ? normalizeArrayField(body.languages) : existing.languages || ["English"];
 
     const payload = {
       title: body.title ?? existing.title,
@@ -258,10 +297,14 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       genres,
       languages,
       releasedAt: body.releasedAt ? new Date(body.releasedAt) : existing.releasedAt,
-      inTheaters: typeof body.inTheaters !== "undefined" ? (body.inTheaters === "true" || body.inTheaters === true) : existing.inTheaters,
+      inTheaters:
+        typeof body.inTheaters !== "undefined"
+          ? body.inTheaters === "true" || body.inTheaters === true
+          : existing.inTheaters,
       posterUrl: body.posterUrl ?? existing.posterUrl,
       posterPublicId: existing.posterPublicId,
-      runtimeMinutes: body.runtimeMinutes ? Number(body.runtimeMinutes) : (body.runtime ? Number(body.runtime) : existing.runtimeMinutes),
+      runtimeMinutes:
+        body.runtimeMinutes ? Number(body.runtimeMinutes) : body.runtime ? Number(body.runtime) : existing.runtimeMinutes,
     };
 
     let oldPosterRef = null;
