@@ -46,12 +46,36 @@ const uploadToCloudinary = (buffer, folder = "theaters") =>
     streamifier.createReadStream(buffer).pipe(uploadStream);
   });
 
+/* -------------------------------------------------------------------------- */
+/*                               Utility Helpers                              */
+/* -------------------------------------------------------------------------- */
 const isValidId = (id) => mongoose.isValidObjectId(id);
+
+/**
+ * Converts any amenity payload into a clean string array
+ * Handles: ["AC","Parking"], "AC,Parking", '["AC","Parking"]'
+ */
 const toArray = (input) => {
-  if (!input) return [];
-  if (Array.isArray(input)) return input.map((v) => String(v).trim());
-  if (typeof input === "string") return input.split(",").map((v) => v.trim()).filter(Boolean);
-  return [];
+  if (!input && input !== 0) return [];
+
+  if (Array.isArray(input))
+    return input.map((v) => String(v).trim()).filter(Boolean);
+
+  const s = String(input).trim();
+
+  // Try to parse JSON-style arrays
+  if (s.startsWith("[") && s.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed))
+        return parsed.map((v) => String(v).trim()).filter(Boolean);
+    } catch {
+      /* fallback */
+    }
+  }
+
+  // Fallback: comma-separated
+  return s.split(",").map((v) => v.trim()).filter(Boolean);
 };
 
 /* -------------------------------------------------------------------------- */
@@ -164,7 +188,7 @@ router.get("/:theaterId/screens", async (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 /**
- * GET /api/admin/theaters
+ * GET /api/theaters/admin/list
  * Admin — full list (protected)
  */
 router.get("/admin/list", requireAuth, requireAdmin, async (_req, res) => {
@@ -178,13 +202,15 @@ router.get("/admin/list", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /**
- * POST /api/admin/theaters
+ * POST /api/theaters/admin
  * Admin — create with Cloudinary image
  */
 router.post("/admin", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
   try {
     const payload = req.body || {};
+
     payload.amenities = toArray(payload.amenities);
+    console.log("[TheaterCreate] amenities parsed:", payload.amenities);
 
     if (req.file) {
       const folder = process.env.CLOUDINARY_FOLDER || "theaters";
@@ -207,7 +233,7 @@ router.post("/admin", requireAuth, requireAdmin, upload.single("image"), async (
 });
 
 /**
- * PUT /api/admin/theaters/:id
+ * PUT /api/theaters/admin/:id
  * Admin — update + optional image replace
  */
 router.put("/admin/:id", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
@@ -220,6 +246,7 @@ router.put("/admin/:id", requireAuth, requireAdmin, upload.single("image"), asyn
 
     const payload = { ...existing.toObject(), ...req.body };
     payload.amenities = toArray(payload.amenities);
+    console.log("[TheaterUpdate] amenities parsed:", payload.amenities);
 
     if (req.file) {
       // delete previous image (optional)
@@ -249,7 +276,7 @@ router.put("/admin/:id", requireAuth, requireAdmin, upload.single("image"), asyn
 });
 
 /**
- * DELETE /api/admin/theaters/:id
+ * DELETE /api/theaters/admin/:id
  * Admin — delete + remove Cloudinary image
  */
 router.delete("/admin/:id", requireAuth, requireAdmin, async (req, res) => {
@@ -275,7 +302,9 @@ router.delete("/admin/:id", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-/* Multer error handler */
+/* -------------------------------------------------------------------------- */
+/*                              Multer Error Handler                          */
+/* -------------------------------------------------------------------------- */
 router.use((err, _req, res, next) => {
   if (err && err.name === "MulterError") {
     if (err.code === "LIMIT_FILE_SIZE")
