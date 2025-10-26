@@ -39,39 +39,31 @@ const envOrigins = (process.env.FRONTEND_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const allowedOrigins = [
+const allowedOrigins = new Set([
   process.env.FRONTEND_ORIGIN || "https://movieticketbooking-rajy.netlify.app",
   "http://localhost:5173",
   ...envOrigins,
-];
+]);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (!origin) return next();
-  if (allowedOrigins.includes(origin)) return next();
+// Centralized CORS options
+const corsOptions = {
+  origin: (origin, cb) => {
+    // allow non-browser requests with no origin (curl, server-to-server)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.has(origin)) return cb(null, true);
+    console.warn(`[CORS] blocked origin ${origin}`);
+    return cb(new Error("Origin not allowed by CORS"), false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  exposedHeaders: ["Content-Length", "Content-Type"],
+  optionsSuccessStatus: 204,
+};
 
-  console.warn(`[CORS] blocked origin ${origin}`);
-  res.setHeader("Access-Control-Allow-Origin", "null");
-  return res.status(403).json({ ok: false, message: "CORS: origin not allowed" });
-});
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      cb(null, false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
-    exposedHeaders: ["Content-Length", "Content-Type"],
-    optionsSuccessStatus: 204,
-  })
-);
-
-// Ensure preflight works
-app.options("*", cors());
+// Use cors middleware early so it always runs before routes
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 /* -------------------------- Optional COOP / COEP --------------------------- */
 if (process.env.ENABLE_COOP_COEP === "true") {
@@ -86,10 +78,8 @@ if (process.env.ENABLE_COOP_COEP === "true") {
 }
 
 /* ------------------------------ Uploads dir -------------------------------- */
-// prefer /tmp/uploads in production; local 'uploads' for dev
 const UPLOADS_DIR =
-  process.env.UPLOADS_DIR ||
-  (process.env.NODE_ENV === "production" ? "/tmp/uploads" : "uploads");
+  process.env.UPLOADS_DIR || (process.env.NODE_ENV === "production" ? "/tmp/uploads" : "uploads");
 const uploadsPath = path.resolve(process.cwd(), UPLOADS_DIR);
 
 try {
@@ -114,8 +104,16 @@ try {
 
 // Add header so static uploaded files can be embedded cross-origin
 app.use("/uploads", (req, res, next) => {
+  // use request origin if allowed, otherwise fallback to FRONTEND_ORIGIN
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (process.env.FRONTEND_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-  res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN || "https://movieticketbooking-rajy.netlify.app");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -151,33 +149,68 @@ try {
 /* ------------------------ Cloudinary test route (optional) ----------------- */
 app.post("/api/movies/test-cloud", async (_req, res) => {
   try {
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+      return res.status(500).json({ ok: false, message: "Cloudinary not configured (missing env vars)" });
+    }
     const sampleUrl = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
     const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-    const result = await cloudinary.uploader.upload(sampleUrl, {
-      folder,
-      resource_type: "image",
-    });
-    return res.json({
-      ok: true,
-      message: "Cloudinary test upload succeeded",
-      secure_url: result.secure_url,
-      public_id: result.public_id,
-      raw: result,
-    });
+    const result = await cloudinary.uploader.upload(sampleUrl, { folder, resource_type: "image" });
+    return res.json({ ok: true, message: "Cloudinary test upload succeeded", secure_url: result.secure_url, public_id: result.public_id });
   } catch (err) {
-    console.error("[test-cloud] error:", err);
-    return res.status(500).json({
-      ok: false,
-      message: "Cloudinary test upload failed",
-      error: err?.message,
-      http_code: err?.http_code,
-      http_body: err?.http_body,
-    });
+    console.error("[/api/movies/test-cloud] upload error:", err && (err.stack || err));
+    return res.status(500).json({ ok: false, message: "Cloudinary test upload failed", error: err?.message ?? String(err), http_code: err?.http_code });
   }
 });
 
+/* ----------------------------- SSE / EventSource --------------------------- */
+// Example SSE endpoint that supports token auth via querystring or Authorization header
+app.get('/api/notifications/stream', (req, res) => {
+  // CORS: allow the requesting origin if allowed
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (process.env.FRONTEND_ORIGIN) {
+    res.setHeader('Access-Control-Allow-Origin', process.env.FRONTEND_ORIGIN);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  // If you expect Authorization header, you can inspect it here (or token query param)
+  const token = req.query.token || req.headers.authorization?.split(' ')[1];
+  // TODO: validate token if necessary (authenticate user)
+
+  // Send initial comment to establish connection
+  res.write(': connected\n\n');
+
+  // send a ping every 15s to keep proxies from closing idle connections
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(`event: ping\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+    } catch (e) {
+      // ignore write errors
+    }
+  }, 15000);
+
+  // Example: send periodic sample data (replace with your notification logic)
+  const sampleTicker = setInterval(() => {
+    try {
+      const data = { msg: 'heartbeat', at: new Date().toISOString() };
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {}
+  }, 60000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    clearInterval(sampleTicker);
+    try { res.end(); } catch (e) {}
+  });
+});
+
 /* ----------------------------- /api/upload route --------------------------- */
-// Streams uploaded file to Cloudinary; expects field name "image"
 import multer from "multer";
 import streamifier from "streamifier";
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -194,25 +227,39 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
       streamifier.createReadStream(req.file.buffer).pipe(stream);
     });
 
+    // ensure CORS header set for the response
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+
     res.json({ ok: true, url: result.secure_url, public_id: result.public_id });
   } catch (err) {
     console.error("[/api/upload] upload error:", err);
-    res.status(500).json({ ok: false, message: "Upload failed", error: err?.message });
+    res.status(err?.http_code || 500).json({ ok: false, message: "Upload failed", error: err?.message });
   }
 });
 
 /* --------------------------- Mount other routers --------------------------- */
-/*
-  If your app.js already mounted routes you can skip mounting here.
-  Otherwise import and mount them like:
-
-  import theatersRouter from "./routes/theaters.routes.js";
-  import moviesRouter from "./routes/movies.routes.js";
-  app.use("/api/theaters", theatersRouter);
-  app.use("/api/movies", moviesRouter);
-*/
-
-// If app.js exported an app with routes already, they will be used.
+// Example: if you have separate router files, import & mount them here
+try {
+  // dynamic mount if file exists
+  const routers = ["./routes/theaters.routes.js", "./routes/movies.routes.js", "./routes/upload.routes.js"];
+  routers.forEach((rpath) => {
+    try {
+      if (fs.existsSync(path.join(process.cwd(), rpath))) {
+        // import dynamically so missing files don't crash startup
+        // eslint-disable-next-line global-require, import/no-dynamic-require
+        const mod = require(rpath);
+        const router = mod.default || mod;
+        app.use(router.routesPrefix || "/api", router); // router may export routesPrefix
+        console.log(`[mount] ${rpath} mounted`);
+      }
+    } catch (e) {
+      console.warn(`[mount] failed to mount ${rpath}:`, e?.message || e);
+    }
+  });
+} catch (e) {
+  console.warn("[mount] router auto-mount skipped:", e?.message || e);
+}
 
 /* ---------------------- Runtime environment debug info --------------------- */
 console.log("🔍 Runtime env check (sensitive values hidden)");
@@ -299,43 +346,6 @@ app.get("/debug/routes", (_req, res) => {
   }
 });
 
-// Add test-cloud only if not already present to avoid duplicate route errors
-if (!routeExists("/api/movies/test-cloud")) {
-  app.post("/api/movies/test-cloud", async (_req, res) => {
-    try {
-      // quick guard
-      if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-        return res.status(500).json({ ok: false, message: "Cloudinary not configured (missing env vars)" });
-      }
-      const sampleUrl = "https://res.cloudinary.com/demo/image/upload/sample.jpg";
-      const folder = process.env.CLOUDINARY_FOLDER || "movie-posters";
-      console.log("[/api/movies/test-cloud] attempting sample upload to Cloudinary...");
-      const result = await cloudinary.uploader.upload(sampleUrl, { folder, resource_type: "image" });
-      console.log("[/api/movies/test-cloud] success:", result && result.secure_url);
-      return res.json({ ok: true, message: "Cloudinary test upload succeeded", secure_url: result.secure_url, public_id: result.public_id });
-    } catch (err) {
-      console.error("[/api/movies/test-cloud] upload error:", err && (err.stack || err));
-      return res.status(500).json({
-        ok: false,
-        message: "Cloudinary test upload failed",
-        error: err?.message ?? String(err),
-        http_code: err?.http_code,
-      });
-    }
-  });
-} else {
-  console.log("[debug] /api/movies/test-cloud already exists; skipping auto-add.");
-}
-
-// Log mounted routes to console at startup
-try {
-  const routes = getMountedRoutes();
-  console.log("DEBUG: mounted routes count =", routes.length);
-  console.log(JSON.stringify(routes, null, 2));
-} catch (e) {
-  console.error("DEBUG: failed to list routes at startup:", e);
-}
-
 /* ----------------------------- Server boot -------------------------------- */
 const PORT = Number(process.env.PORT) || 8080;
 let server;
@@ -346,6 +356,7 @@ async function start() {
     app.locals.dbReady = false;
     server = http.createServer(app);
 
+    // tune keep-alive and headers so SSE and long polling work reliably behind proxies
     server.requestTimeout = 0;
     server.headersTimeout = 0;
     server.keepAliveTimeout = 2 * 60 * 60 * 1000;
