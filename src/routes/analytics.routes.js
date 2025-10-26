@@ -25,7 +25,6 @@ let Theater = tryRequire("../models/Theater.js");
 let Movie = tryRequire("../models/Movie.js");
 
 // Fallbacks: if models already registered elsewhere, use those.
-// If not, create permissive schemas so aggregation queries won't throw.
 if (!Booking) {
   Booking = mongoose.models.Booking || mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
 }
@@ -41,54 +40,75 @@ if (!Movie) {
 
 const router = Router();
 
-/* ------------------------------ helpers ------------------------------ */
+/* ------------------------ analytics config / helpers ---------------------- */
 
-// robust amount expression (supports totalAmount or amount, default 0)
+// timezone for grouping (use IANA timezone names). Default to UTC if not provided.
+const TZ = process.env.ANALYTICS_TZ || "UTC";
+
+// Safely compute a Date `days` in the past (end is now)
+const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
+
+// Robust amount extractor: prefer totalAmount, then amount, otherwise 0.
+// Use $toDouble of the ifNull result so strings/numbers unify to numeric.
 const AMOUNT_SAFE = {
-  $ifNull: [
-    {
-      $switch: {
-        branches: [
-          { case: { $isNumber: "$totalAmount" }, then: "$totalAmount" },
-          { case: { $isNumber: "$amount" }, then: "$amount" },
-        ],
-        default: {
-          $toDouble: { $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }] },
-        },
-      },
-    },
-    0,
-  ],
+  $toDouble: {
+    $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }],
+  },
 };
 
+// Helpful day projection that uses timezone
+const dayProject = [
+  {
+    $addFields: {
+      _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: TZ } },
+    },
+  },
+];
+
+// Helpers to accept either field names for relations
 const SHOWTIME_ID = { $ifNull: ["$showtime", "$showtimeId"] };
 const MOVIE_ID = { $ifNull: ["$movie", "$movieId"] };
 const USER_ID = { $ifNull: ["$user", "$userId"] };
 const BOOKED_SEATS_ARR = { $ifNull: ["$seats", { $ifNull: ["$seatsBooked", []] }] };
 
-const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
-
-const dayProject = [
-  {
-    $addFields: {
-      _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-    },
-  },
-];
+/**
+ * ensureResultsForRange
+ * Given an array of { date: "YYYY-MM-DD", ... } ensure it has an entry
+ * for every date from `start` to `end` (inclusive). Missing dates are filled
+ * with default values (0).
+ */
+function ensureResultsForRange(startDate, endDate, rows, keyName = "date", defaults = {}) {
+  const out = [];
+  const cur = new Date(startDate);
+  cur.setUTCHours(0, 0, 0, 0);
+  const end = new Date(endDate);
+  end.setUTCHours(0, 0, 0, 0);
+  // build map
+  const m = new Map(rows.map((r) => [String(r[keyName]), r]));
+  while (cur <= end) {
+    const iso = cur.toISOString().slice(0, 10); // YYYY-MM-DD
+    if (m.has(iso)) out.push(m.get(iso));
+    else out.push({ [keyName]: iso, ...defaults });
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return out;
+}
 
 /* ========================  PRIMARY COMPOSITE ENDPOINT  ======================= */
 router.get("/", async (req, res, next) => {
   try {
-    const days = Number(req.query.days || 7);
+    const days = Math.max(1, Number(req.query.days || 7));
     const since = toPast(days);
+    const now = new Date();
 
-    const matchBase = { createdAt: { $gte: since } };
-    const totalBookingsSince = await Booking.countDocuments(matchBase).catch((e) => {
+    // quick count (debug)
+    const totalBookingsSince = await Booking.countDocuments({ createdAt: { $gte: since } }).catch((e) => {
       debug("countDocuments error:", e && e.message);
       return 0;
     });
     debug(`Analytics: bookings since ${since.toISOString()}: ${totalBookingsSince}`);
 
+    // revenue by day (only confirmed/paid)
     const revenue = await Booking.aggregate([
       {
         $match: {
@@ -108,17 +128,17 @@ router.get("/", async (req, res, next) => {
       { $sort: { _id: 1 } },
       { $project: { _id: 0, date: "$_id", total: 1, bookings: 1 } },
     ]);
-    debug("Revenue aggregation results sample:", revenue.slice(0, 5));
 
+    // users (unique per day) — use USER_ID which tolerates different field names
     const users = await Booking.aggregate([
       { $match: { createdAt: { $gte: since } } },
       ...dayProject,
       { $group: { _id: "$_d", users: { $addToSet: USER_ID } } },
-      { $project: { _id: 0, date: "$_id", count: { $size: "$users" } } },
+      { $project: { _id: 0, date: "$_id", dau: { $size: "$users" } } },
       { $sort: { date: 1 } },
     ]);
-    debug("Users aggregation sample:", users.slice(0, 5));
 
+    // occupancy by theater (average occupancy across showtimes in range)
     const occupancy = await Showtime.aggregate([
       { $match: { startTime: { $gte: since } } },
       {
@@ -166,8 +186,8 @@ router.get("/", async (req, res, next) => {
       { $project: { _id: 0, theater: "$_id", avgOccupancy: 1 } },
       { $sort: { avgOccupancy: -1 } },
     ]);
-    debug("Occupancy sample:", occupancy.slice(0, 5));
 
+    // popular movies — simpler lookup: group by MOVIE_ID and then join by _id
     const popularMovies = await Booking.aggregate([
       { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
       {
@@ -178,7 +198,8 @@ router.get("/", async (req, res, next) => {
         },
       },
       { $sort: { bookings: -1 } },
-      { $limit: 5 },
+      { $limit: 10 },
+      // try to convert string ids to ObjectId where possible in lookup pipeline
       {
         $lookup: {
           from: "movies",
@@ -188,10 +209,9 @@ router.get("/", async (req, res, next) => {
               $match: {
                 $expr: {
                   $or: [
-                    { $eq: ["$_1d", "$$mid"] },
                     { $eq: ["$_id", "$$mid"] },
                     { $eq: [{ $toString: "$_id" }, "$$mid"] },
-                    { $eq: [{ $toString: "$$mid" }, { $toString: "$_id" }] },
+                    { $eq: ["$_id", { $convert: { input: "$$mid", to: "objectId", onError: null, onNull: null } }] },
                   ],
                 },
               },
@@ -205,21 +225,27 @@ router.get("/", async (req, res, next) => {
       {
         $project: {
           _id: 0,
+          movieId: "$_id",
           movie: { $ifNull: ["$movie.title", "Unknown"] },
           bookings: 1,
           revenue: 1,
         },
       },
     ]);
-    debug("Popular movies:", popularMovies);
+
+    // Ensure contiguous series for frontend charts (fill zeros for missing dates)
+    const startIso = since.toISOString().slice(0, 10);
+    const endIso = now.toISOString().slice(0, 10);
+    const revenueSeries = ensureResultsForRange(startIso, endIso, revenue, "date", { total: 0, bookings: 0 });
+    const usersSeries = ensureResultsForRange(startIso, endIso, users, "date", { dau: 0 });
 
     res.json({
       ok: true,
-      revenue: revenue || [],
-      users: users || [],
+      revenue: revenueSeries,
+      users: usersSeries,
       occupancy: occupancy || [],
       popularMovies: popularMovies || [],
-      debug: { totalBookingsSince }, // remove in production
+      debug: { totalBookingsSince }, // keep temporarily for easy verification
     });
   } catch (err) {
     debug("Analytics error:", err && (err.stack || err.message));
@@ -229,11 +255,12 @@ router.get("/", async (req, res, next) => {
 
 /* ===========================  GRANULAR ENDPOINTS  =========================== */
 
-// (all granular endpoints unchanged from your original file)
 router.get("/revenue/trends", async (req, res, next) => {
   try {
-    const since = toPast(req.query.days || 30);
-    const data = await Booking.aggregate([
+    const days = Math.max(1, Number(req.query.days || 30));
+    const since = toPast(days);
+    const now = new Date();
+    const raw = await Booking.aggregate([
       { $match: { createdAt: { $gte: since }, status: { $in: ["CONFIRMED", "PAID"] } } },
       ...dayProject,
       { $addFields: { __amount_safe: AMOUNT_SAFE } },
@@ -241,6 +268,10 @@ router.get("/revenue/trends", async (req, res, next) => {
       { $sort: { _id: 1 } },
       { $project: { date: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
     ]);
+    const data = ensureResultsForRange(since.toISOString().slice(0, 10), now.toISOString().slice(0, 10), raw, "date", {
+      totalRevenue: 0,
+      bookings: 0,
+    });
     res.json(data);
   } catch (e) {
     debug("revenue/trends error:", e && e.message);
@@ -290,7 +321,7 @@ router.get("/occupancy", async (req, res, next) => {
         },
       },
       { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
-      { $unwind: "$t" },
+      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
       {
         $group: {
           _id: "$t.name",
@@ -338,7 +369,8 @@ router.get("/users/active", async (req, res, next) => {
       { $project: { _id: 0, date: "$_id", dau: { $size: "$users" } } },
       { $sort: { date: 1 } },
     ]);
-    res.json(data);
+    const series = ensureResultsForRange(since.toISOString().slice(0, 10), new Date().toISOString().slice(0, 10), data, "date", { dau: 0 });
+    res.json(series);
   } catch (e) {
     debug("users/active error:", e && e.message);
     next(e);
@@ -362,7 +394,12 @@ router.get("/bookings/summary", async (req, res, next) => {
       { $sort: { _id: 1 } },
       { $project: { _id: 0, date: "$_id", confirmed: 1, cancelled: 1, revenue: 1 } },
     ]);
-    res.json(data);
+    const series = ensureResultsForRange(since.toISOString().slice(0, 10), new Date().toISOString().slice(0, 10), data, "date", {
+      confirmed: 0,
+      cancelled: 0,
+      revenue: 0,
+    });
+    res.json(series);
   } catch (e) {
     debug("bookings/summary error:", e && e.message);
     next(e);
@@ -372,8 +409,6 @@ router.get("/bookings/summary", async (req, res, next) => {
 /* ------------------------------- SSE /stream ------------------------------- */
 let sseHandler = null;
 try {
-  // try common locations (include your socket folder path)
-  // eslint-disable-next-line global-require, import/no-dynamic-require
   sseHandler =
     require("../socket/sse.js").sseHandler ||
     require("../socket/sse.js").default?.sseHandler ||
@@ -381,11 +416,10 @@ try {
     require("../sse/sse.js").sseHandler ||
     require("../sse").sseHandler;
 } catch (err) {
-  debug("No sse handler found at ../socket/sse.js or ../sse.js or ../sse/sse.js - SSE route will return 501 until you add one.");
+  debug("No sse handler found - SSE route will return 501 until you add one.");
 }
 
 if (sseHandler && typeof sseHandler === "function") {
-  // attempt to attach preflight if available
   try {
     const sseModule =
       require("../socket/sse.js")?.default ||
