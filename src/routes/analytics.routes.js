@@ -183,7 +183,7 @@ router.get("/", async (req, res, next) => {
       { $sort: { date: 1 } },
     ]);
 
-    /* ---------- occupancy (handles fallback names) ---------- */
+    /* ---------- occupancy (robust theater name fallback) ---------- */
     const occupancy = await Showtime.aggregate([
       { $match: { startTime: { $gte: since } } },
       {
@@ -220,20 +220,21 @@ router.get("/", async (req, res, next) => {
       { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
       {
         $group: {
-          _id: "$t.name",
-          avgOccupancy: {
+          _id: {
+            name: { $ifNull: ["$t.name", "$t.title", "$t.displayName", "$t.label", "Unknown"] },
+          },
+          occupancyRate: {
             $avg: {
               $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0],
             },
           },
         },
       },
-      // If t.name is missing, later projection will fall back to "Unknown"
-      { $project: { _id: 0, theater: { $ifNull: ["$_id", "Unknown"] }, avgOccupancy: 1 } },
-      { $sort: { avgOccupancy: -1 } },
+      { $project: { _id: 0, theaterName: "$_id.name", occupancyRate: 1 } },
+      { $sort: { occupancyRate: -1 } },
     ]);
 
-    /* ---------- popular movies (robust lookup: handle movie on booking OR on showtime) ---------- */
+    /* ---------- popular movies (robust lookup & embedded title fallback) ---------- */
     const popularMovies = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       // bring showtime doc so we can read embedded movie from there if present
@@ -247,33 +248,48 @@ router.get("/", async (req, res, next) => {
       },
       { $unwind: { path: "$showtime_doc", preserveNullAndEmptyArrays: true } },
 
+      // Resolve movie ref (id or embedded doc) and capture any embedded title fallback
       {
         $addFields: {
-          // prefer explicit movie field, fallback to showtime_doc.movie or movieId
-          resolvedMovieId: {
-            $ifNull: [{ $ifNull: ["$movie", "$movieId"] }, "$showtime_doc.movie"],
-          },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           status: { $ifNull: ["$status", ""] },
+
+          // resolvedRef may be string, ObjectId, or an embedded object
+          resolvedMovieRef: {
+            $ifNull: [{ $ifNull: ["$movie", "$movieId"] }, "$showtime_doc.movie"],
+          },
+
+          // if showtime_doc.movie is an embedded object with title/name, capture it
+          fallbackTitleFromShowtime: {
+            $cond: [
+              { $and: [{ $ne: ["$showtime_doc.movie", null] }, { $eq: [{ $type: "$showtime_doc.movie" }, "object"] }] },
+              { $ifNull: ["$showtime_doc.movie.title", "$showtime_doc.movie.name"] },
+              null,
+            ],
+          },
         },
       },
+
       {
         $match: {
           createdAt: { $gte: since },
           $expr: { $in: [{ $toUpper: "$status" }, ["CONFIRMED", "PAID"]] },
         },
       },
+
       {
         $group: {
-          _id: "$resolvedMovieId",
+          _id: "$resolvedMovieRef",
           bookings: { $sum: 1 },
           revenue: { $sum: AMOUNT_SAFE },
+          fallbackTitles: { $addToSet: "$fallbackTitleFromShowtime" },
         },
       },
-      { $sort: { bookings: -1 } },
-      { $limit: 10 },
 
-      // lookup movie by id (handles string/objectId cases)
+      { $sort: { bookings: -1 } },
+      { $limit: 20 },
+
+      // try to find a movie document (handles ObjectId or string id or embedded object)
       {
         $lookup: {
           from: "movies",
@@ -286,28 +302,52 @@ router.get("/", async (req, res, next) => {
                     { $eq: ["$_id", "$$mid"] },
                     { $eq: [{ $toString: "$_id" }, "$$mid"] },
                     {
-                      $eq: [
-                        "$_id",
-                        {
-                          $convert: { input: "$$mid", to: "objectId", onError: null, onNull: null },
-                        },
+                      $and: [
+                        { $ne: ["$$mid", null] },
+                        { $eq: [{ $type: "$$mid" }, "object"] },
+                        { $eq: ["$_id", "$$mid._id"] },
                       ],
                     },
                   ],
                 },
               },
             },
-            { $project: { title: 1 } },
+            { $project: { title: 1, name: 1 } },
           ],
-          as: "movie",
+          as: "movieDoc",
         },
       },
-      { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
+
+      { $unwind: { path: "$movieDoc", preserveNullAndEmptyArrays: true } },
+
+      // pick the best title available: movieDoc.title > movieDoc.name > fallbackTitle > "Unknown"
       {
         $project: {
           _id: 0,
           movieId: "$_id",
-          movie: { $ifNull: ["$movie.title", "Unknown"] },
+          movieTitle: {
+            $ifNull: [
+              "$movieDoc.title",
+              {
+                $ifNull: [
+                  "$movieDoc.name",
+                  {
+                    $arrayElemAt: [
+                      {
+                        $filter: {
+                          input: "$fallbackTitles",
+                          as: "t",
+                          cond: { $and: [{ $ne: ["$$t", null] }, { $ne: ["$$t", ""] }] },
+                        },
+                      },
+                      0,
+                    ],
+                  },
+                ],
+              },
+              "Unknown",
+            ],
+          },
           bookings: 1,
           revenue: 1,
         },
@@ -327,8 +367,16 @@ router.get("/", async (req, res, next) => {
 
     // Normalize occupancy shape to match frontend expectations: { theater, avgOccupancy }
     const normalizedOccupancy = (occupancy || []).map((r) => ({
-      theater: r.theater || "Unknown",
-      avgOccupancy: typeof r.avgOccupancy === "number" ? r.avgOccupancy : 0,
+      theater: r.theaterName || r.theater || "Unknown",
+      avgOccupancy: typeof r.occupancyRate === "number" ? r.occupancyRate : typeof r.avgOccupancy === "number" ? r.avgOccupancy : 0,
+    }));
+
+    // Normalize popularMovies shape to the frontend-friendly shape used in the UI
+    const normalizedPopular = (popularMovies || []).map((m) => ({
+      movieId: m.movieId,
+      movie: m.movieTitle || m.movie || "Unknown",
+      bookings: m.bookings || 0,
+      revenue: m.revenue || 0,
     }));
 
     res.json({
@@ -336,7 +384,7 @@ router.get("/", async (req, res, next) => {
       revenue: revenueSeries,
       users: usersSeries,
       occupancy: normalizedOccupancy,
-      popularMovies: popularMovies || [],
+      popularMovies: normalizedPopular,
       debug: { totalBookingsSince }, // keep temporarily for easy verification
     });
   } catch (err) {
@@ -387,9 +435,10 @@ router.get("/movies/popular", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
     const limit = Number(req.query.limit || 10);
+
     const data = await Booking.aggregate([
       ...normalizeCreatedAtStage,
-      // include showtime doc for fallback movie id
+      // include showtime doc for fallback movie id/title
       {
         $lookup: {
           from: "showtimes",
@@ -401,7 +450,14 @@ router.get("/movies/popular", async (req, res, next) => {
       { $unwind: { path: "$showtime_doc", preserveNullAndEmptyArrays: true } },
       {
         $addFields: {
-          resolvedMovieId: { $ifNull: [{ $ifNull: ["$movie", "$movieId"] }, "$showtime_doc.movie"] },
+          resolvedMovieRef: { $ifNull: [{ $ifNull: ["$movie", "$movieId"] }, "$showtime_doc.movie"] },
+          fallbackTitleFromShowtime: {
+            $cond: [
+              { $and: [{ $ne: ["$showtime_doc.movie", null] }, { $eq: [{ $type: "$showtime_doc.movie" }, "object"] }] },
+              { $ifNull: ["$showtime_doc.movie.title", "$showtime_doc.movie.name"] },
+              null,
+            ],
+          },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           status: { $ifNull: ["$status", ""] },
         },
@@ -412,7 +468,14 @@ router.get("/movies/popular", async (req, res, next) => {
           $expr: { $in: [{ $toUpper: "$status" }, ["CONFIRMED", "PAID"]] },
         },
       },
-      { $group: { _id: "$resolvedMovieId", totalBookings: { $sum: 1 }, totalRevenue: { $sum: AMOUNT_SAFE } } },
+      {
+        $group: {
+          _id: "$resolvedMovieRef",
+          totalBookings: { $sum: 1 },
+          totalRevenue: { $sum: AMOUNT_SAFE },
+          fallbackTitles: { $addToSet: "$fallbackTitleFromShowtime" },
+        },
+      },
       { $sort: { totalBookings: -1 } },
       { $limit: limit },
       {
@@ -427,26 +490,63 @@ router.get("/movies/popular", async (req, res, next) => {
                     { $eq: ["$_id", "$$mid"] },
                     { $eq: [{ $toString: "$_id" }, "$$mid"] },
                     {
-                      $eq: [
-                        "$_id",
-                        {
-                          $convert: { input: "$$mid", to: "objectId", onError: null, onNull: null },
-                        },
+                      $and: [
+                        { $ne: ["$$mid", null] },
+                        { $eq: [{ $type: "$$mid" }, "object"] },
+                        { $eq: ["$_id", "$$mid._id"] },
                       ],
                     },
                   ],
                 },
               },
             },
-            { $project: { title: 1 } },
+            { $project: { title: 1, name: 1 } },
           ],
           as: "m",
         },
       },
       { $unwind: { path: "$m", preserveNullAndEmptyArrays: true } },
-      { $project: { _id: 0, movieId: "$_id", movieName: { $ifNull: ["$m.title", "Unknown"] }, totalBookings: 1, totalRevenue: 1 } },
+      {
+        $project: {
+          _id: 0,
+          movieId: "$_id",
+          movieName: {
+            $ifNull: [
+              "$m.title",
+              {
+                $ifNull: [
+                  "$m.name",
+                  {
+                    $arrayElemAt: [
+                      {
+                        $filter: {
+                          input: "$fallbackTitles",
+                          as: "t",
+                          cond: { $and: [{ $ne: ["$$t", null] }, { $ne: ["$$t", ""] }] },
+                        },
+                      },
+                      0,
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+          totalBookings: 1,
+          totalRevenue: 1,
+        },
+      },
     ]);
-    res.json(data);
+
+    // normalize to old frontend shape
+    const out = (data || []).map((d) => ({
+      movieId: d.movieId,
+      movieName: d.movieName || "Unknown",
+      totalBookings: d.totalBookings || 0,
+      totalRevenue: d.totalRevenue || 0,
+    }));
+
+    res.json(out);
   } catch (e) {
     debug("movies/popular error:", e && e.message);
     next(e);
