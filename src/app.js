@@ -67,6 +67,7 @@ app.use(
   cors({
     origin: (origin, cb) => {
       if (!origin) {
+        // no origin (server-to-server or same-origin) — allow
         console.log("[CORS] No origin (likely same-origin/preflight)");
         return cb(null, true);
       }
@@ -91,7 +92,7 @@ app.use(
   })
 );
 
-// Preflight handler
+// Preflight handler (allow the common origins list)
 app.options("*", cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
 // ─────────────────────────────── LOGGING & PARSERS ───────────────────────────────
@@ -114,7 +115,6 @@ try {
 // ─────────────────────────────── FIX DOUBLE /api/api BUG ───────────────────────────────
 app.use((req, _res, next) => {
   req.url = req.url.replace(/\/api\/api(\/|$)/g, "/api$1");
-
   next();
 });
 
@@ -129,7 +129,7 @@ app.get("/api/health", (_req, res) =>
   })
 );
 
-// Uploads
+// Uploads (single mount only)
 app.use("/api/upload", uploadRoutes);
 
 // Public/basic routes
@@ -140,7 +140,6 @@ app.use("/api/theaters", theatersRouter);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
-app.use("/api/upload", uploadRoutes);
 
 // Pricing (protected admin)
 app.use("/api/pricing", requireAuth, requireAdmin, pricingRoutes);
@@ -152,9 +151,8 @@ app.use("/api/notification-prefs", notificationPrefRoutes);
 // Profiles
 app.use("/api/profile", profileRoutes);
 
-// Admin routes (protected)
+// Admin (top-level) routes
 app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
-app.use("/api/admin/theaters", requireAuth, requireAdmin, theatersRouter);
 
 // Screens
 app.use("/api/screens", screensRoutes);
