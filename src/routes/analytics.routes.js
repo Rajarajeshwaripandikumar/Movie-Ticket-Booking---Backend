@@ -21,16 +21,24 @@ let Theater = tryRequire("../models/Theater.js");
 let Movie = tryRequire("../models/Movie.js");
 
 if (!Booking) {
-  Booking = mongoose.models.Booking || mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
+  Booking =
+    mongoose.models.Booking ||
+    mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
 }
 if (!Showtime) {
-  Showtime = mongoose.models.Showtime || mongoose.model("Showtime", new mongoose.Schema({}, { strict: false, timestamps: true }));
+  Showtime =
+    mongoose.models.Showtime ||
+    mongoose.model("Showtime", new mongoose.Schema({}, { strict: false, timestamps: true }));
 }
 if (!Theater) {
-  Theater = mongoose.models.Theater || mongoose.model("Theater", new mongoose.Schema({}, { strict: false, timestamps: true }));
+  Theater =
+    mongoose.models.Theater ||
+    mongoose.model("Theater", new mongoose.Schema({}, { strict: false, timestamps: true }));
 }
 if (!Movie) {
-  Movie = mongoose.models.Movie || mongoose.model("Movie", new mongoose.Schema({}, { strict: false, timestamps: true }));
+  Movie =
+    mongoose.models.Movie ||
+    mongoose.model("Movie", new mongoose.Schema({}, { strict: false, timestamps: true }));
 }
 
 const router = Router();
@@ -175,7 +183,7 @@ router.get("/", async (req, res, next) => {
       { $sort: { date: 1 } },
     ]);
 
-    /* ---------- occupancy (unchanged but will work if showtime fields are consistent) ---------- */
+    /* ---------- occupancy (handles fallback names) ---------- */
     const occupancy = await Showtime.aggregate([
       { $match: { startTime: { $gte: since } } },
       {
@@ -220,17 +228,32 @@ router.get("/", async (req, res, next) => {
           },
         },
       },
-      { $project: { _id: 0, theater: "$_id", avgOccupancy: 1 } },
+      // If t.name is missing, later projection will fall back to "Unknown"
+      { $project: { _id: 0, theater: { $ifNull: ["$_id", "Unknown"] }, avgOccupancy: 1 } },
       { $sort: { avgOccupancy: -1 } },
     ]);
 
-    /* ---------- popular movies (normalize createdAt/status/amount fields similarly) ---------- */
+    /* ---------- popular movies (robust lookup: handle movie on booking OR on showtime) ---------- */
     const popularMovies = await Booking.aggregate([
       ...normalizeCreatedAtStage,
+      // bring showtime doc so we can read embedded movie from there if present
+      {
+        $lookup: {
+          from: "showtimes",
+          localField: "showtime",
+          foreignField: "_id",
+          as: "showtime_doc",
+        },
+      },
+      { $unwind: { path: "$showtime_doc", preserveNullAndEmptyArrays: true } },
+
       {
         $addFields: {
+          // prefer explicit movie field, fallback to showtime_doc.movie or movieId
+          resolvedMovieId: {
+            $ifNull: [{ $ifNull: ["$movie", "$movieId"] }, "$showtime_doc.movie"],
+          },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
-          movie: { $ifNull: ["$movie", "$movieId"] },
           status: { $ifNull: ["$status", ""] },
         },
       },
@@ -242,13 +265,15 @@ router.get("/", async (req, res, next) => {
       },
       {
         $group: {
-          _id: MOVIE_ID,
+          _id: "$resolvedMovieId",
           bookings: { $sum: 1 },
           revenue: { $sum: AMOUNT_SAFE },
         },
       },
       { $sort: { bookings: -1 } },
       { $limit: 10 },
+
+      // lookup movie by id (handles string/objectId cases)
       {
         $lookup: {
           from: "movies",
@@ -260,7 +285,14 @@ router.get("/", async (req, res, next) => {
                   $or: [
                     { $eq: ["$_id", "$$mid"] },
                     { $eq: [{ $toString: "$_id" }, "$$mid"] },
-                    { $eq: ["$_id", { $convert: { input: "$$mid", to: "objectId", onError: null, onNull: null } }] },
+                    {
+                      $eq: [
+                        "$_id",
+                        {
+                          $convert: { input: "$$mid", to: "objectId", onError: null, onNull: null },
+                        },
+                      ],
+                    },
                   ],
                 },
               },
@@ -293,11 +325,17 @@ router.get("/", async (req, res, next) => {
     debug("occupancy rows:", (occupancy || []).slice(0, 5));
     debug("popularMovies rows:", (popularMovies || []).slice(0, 5));
 
+    // Normalize occupancy shape to match frontend expectations: { theater, avgOccupancy }
+    const normalizedOccupancy = (occupancy || []).map((r) => ({
+      theater: r.theater || "Unknown",
+      avgOccupancy: typeof r.avgOccupancy === "number" ? r.avgOccupancy : 0,
+    }));
+
     res.json({
       ok: true,
       revenue: revenueSeries,
       users: usersSeries,
-      occupancy: occupancy || [],
+      occupancy: normalizedOccupancy,
       popularMovies: popularMovies || [],
       debug: { totalBookingsSince }, // keep temporarily for easy verification
     });
@@ -351,10 +389,20 @@ router.get("/movies/popular", async (req, res, next) => {
     const limit = Number(req.query.limit || 10);
     const data = await Booking.aggregate([
       ...normalizeCreatedAtStage,
+      // include showtime doc for fallback movie id
+      {
+        $lookup: {
+          from: "showtimes",
+          localField: "showtime",
+          foreignField: "_id",
+          as: "showtime_doc",
+        },
+      },
+      { $unwind: { path: "$showtime_doc", preserveNullAndEmptyArrays: true } },
       {
         $addFields: {
+          resolvedMovieId: { $ifNull: [{ $ifNull: ["$movie", "$movieId"] }, "$showtime_doc.movie"] },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
-          movie: { $ifNull: ["$movie", "$movieId"] },
           status: { $ifNull: ["$status", ""] },
         },
       },
@@ -364,10 +412,37 @@ router.get("/movies/popular", async (req, res, next) => {
           $expr: { $in: [{ $toUpper: "$status" }, ["CONFIRMED", "PAID"]] },
         },
       },
-      { $group: { _id: MOVIE_ID, totalBookings: { $sum: 1 }, totalRevenue: { $sum: AMOUNT_SAFE } } },
+      { $group: { _id: "$resolvedMovieId", totalBookings: { $sum: 1 }, totalRevenue: { $sum: AMOUNT_SAFE } } },
       { $sort: { totalBookings: -1 } },
       { $limit: limit },
-      { $lookup: { from: "movies", localField: "_id", foreignField: "_id", as: "m" } },
+      {
+        $lookup: {
+          from: "movies",
+          let: { mid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$mid"] },
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                    {
+                      $eq: [
+                        "$_id",
+                        {
+                          $convert: { input: "$$mid", to: "objectId", onError: null, onNull: null },
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+            { $project: { title: 1 } },
+          ],
+          as: "m",
+        },
+      },
       { $unwind: { path: "$m", preserveNullAndEmptyArrays: true } },
       { $project: { _id: 0, movieId: "$_id", movieName: { $ifNull: ["$m.title", "Unknown"] }, totalBookings: 1, totalRevenue: 1 } },
     ]);
@@ -403,7 +478,9 @@ router.get("/occupancy", async (req, res, next) => {
       { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
       {
         $group: {
-          _id: "$t.name",
+          _id: {
+            name: { $ifNull: ["$t.name", "$t.title", "Unknown"] },
+          },
           occupancyRate: {
             $avg: {
               $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0],
@@ -411,7 +488,7 @@ router.get("/occupancy", async (req, res, next) => {
           },
         },
       },
-      { $project: { _id: 0, theaterName: "$_id", occupancyRate: 1 } },
+      { $project: { _id: 0, theaterName: "$_id.name", occupancyRate: 1 } },
       { $sort: { occupancyRate: -1 } },
     ]);
     res.json(data);
