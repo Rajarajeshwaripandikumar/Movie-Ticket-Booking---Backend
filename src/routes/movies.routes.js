@@ -53,6 +53,34 @@ function uploadBufferToCloudinary(buffer, folder = "movies") {
   });
 }
 
+/**
+ * Normalize incoming value into an array of trimmed strings.
+ * Accepts: Array, JSON-array-string, comma-separated string, or undefined/null.
+ */
+function normalizeToArray(value) {
+  if (!value && value !== "") return [];
+  if (Array.isArray(value)) return value.map((s) => String(s).trim()).filter(Boolean);
+
+  // try JSON parse
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map((s) => String(s).trim()).filter(Boolean);
+    } catch (e) {
+      // not JSON — fallthrough to comma split
+    }
+
+    // comma-separated fallback
+    return trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+
+  // fallback: convert to single string
+  return [String(value).trim()].filter(Boolean);
+}
+
 /* ----------------------------- Public API -------------------------------- */
 
 /**
@@ -70,7 +98,15 @@ router.get("/", async (req, res) => {
 
     if (q) {
       const rx = new RegExp(String(q), "i");
-      filter.$or = [{ title: rx }, { director: rx }, { cast: rx }, { genres: rx }];
+      // search title, director, cast, crew, genres, languages
+      filter.$or = [
+        { title: rx },
+        { director: rx },
+        { cast: rx },
+        { crew: rx },
+        { genres: rx },
+        { languages: rx },
+      ];
     }
     if (genre) filter.genres = genre;
     if (onlyInTheaters === "true" || onlyInTheaters === true) filter.inTheaters = true;
@@ -143,21 +179,37 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
   try {
     const payload = req.body || {};
 
-    // normalize arrays if sent as JSON strings
-    if (payload.genres && typeof payload.genres === "string") {
-      try {
-        payload.genres = JSON.parse(payload.genres);
-      } catch {
-        payload.genres = payload.genres.split(",").map((s) => s.trim()).filter(Boolean);
-      }
-    }
+    // Normalize array-like fields: genres, cast, crew, languages
+    const genres = normalizeToArray(payload.genres);
+    const cast = normalizeToArray(payload.cast);
+    const crew = normalizeToArray(payload.crew);
+    let languages = normalizeToArray(payload.languages);
+
+    // sensible default if languages not provided
+    if (!languages || languages.length === 0) languages = ["English"];
+
+    // map other scalar fields safely
+    const doc = {
+      title: payload.title ?? "",
+      description: payload.description ?? payload.synopsis ?? "",
+      director: payload.director ?? "",
+      cast,
+      crew,
+      genres,
+      languages,
+      releasedAt: payload.releasedAt ? new Date(payload.releasedAt) : payload.releasedAt ?? null,
+      inTheaters: typeof payload.inTheaters !== "undefined" ? payload.inTheaters === "true" || payload.inTheaters === true : false,
+      runtimeMinutes: payload.runtimeMinutes ? Number(payload.runtimeMinutes) : payload.runtimeMinutes ? Number(payload.runtimeMinutes) : payload.runtime ?? null,
+      posterUrl: payload.posterUrl ?? null,
+      posterPublicId: payload.posterPublicId ?? null,
+    };
 
     if (req.file) {
       try {
         const folder = process.env.CLOUDINARY_FOLDER || "movies";
         const result = await uploadBufferToCloudinary(req.file.buffer, folder);
-        payload.posterUrl = result.secure_url;
-        payload.posterPublicId = result.public_id;
+        doc.posterUrl = result.secure_url;
+        doc.posterPublicId = result.public_id;
       } catch (e) {
         console.error("[Movies][Admin] Cloudinary upload failed (create):", e?.message || e);
         return res.status(500).json({ ok: false, message: "Failed to upload poster", error: e?.message || String(e) });
@@ -165,11 +217,11 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
     }
 
     if (req.user) {
-      payload.uploaderId = req.user.id || req.user._id || req.user.sub;
-      payload.uploaderRole = req.user.role || "admin";
+      doc.uploaderId = req.user.id || req.user._id || req.user.sub;
+      doc.uploaderRole = req.user.role || "admin";
     }
 
-    const created = await Movie.create(payload);
+    const created = await Movie.create(doc);
     res.status(201).json({ ok: true, data: created });
   } catch (err) {
     console.error("[Movies][Admin] POST / error:", err);
@@ -190,17 +242,26 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
     if (!existing) return res.status(404).json({ ok: false, message: "Movie not found" });
 
     const body = req.body || {};
+
+    // Normalize arrays (if present)
+    const genres = body.genres ? normalizeToArray(body.genres) : existing.genres || [];
+    const cast = body.cast ? normalizeToArray(body.cast) : existing.cast || [];
+    const crew = body.crew ? normalizeToArray(body.crew) : existing.crew || [];
+    const languages = body.languages ? normalizeToArray(body.languages) : existing.languages || ["English"];
+
     const payload = {
       title: body.title ?? existing.title,
-      description: body.description ?? existing.description,
+      description: body.description ?? body.synopsis ?? existing.description,
       director: body.director ?? existing.director,
-      cast: body.cast ? (Array.isArray(body.cast) ? body.cast : String(body.cast).split(",").map(s => s.trim())) : existing.cast,
-      genres: body.genres ? (Array.isArray(body.genres) ? body.genres : String(body.genres).split(",").map(s => s.trim())) : existing.genres,
-      releasedAt: body.releasedAt ?? existing.releasedAt,
-      inTheaters: typeof body.inTheaters !== "undefined" ? body.inTheaters : existing.inTheaters,
+      cast,
+      crew,
+      genres,
+      languages,
+      releasedAt: body.releasedAt ? new Date(body.releasedAt) : existing.releasedAt,
+      inTheaters: typeof body.inTheaters !== "undefined" ? (body.inTheaters === "true" || body.inTheaters === true) : existing.inTheaters,
       posterUrl: body.posterUrl ?? existing.posterUrl,
       posterPublicId: existing.posterPublicId,
-      runtimeMinutes: body.runtimeMinutes ?? existing.runtimeMinutes,
+      runtimeMinutes: body.runtimeMinutes ? Number(body.runtimeMinutes) : (body.runtime ? Number(body.runtime) : existing.runtimeMinutes),
     };
 
     let oldPosterRef = null;
@@ -224,10 +285,10 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
 
     const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
 
-    // best-effort delete old poster
+    // best-effort delete old poster if changed
     if (updated && oldPosterRef && oldPosterRef !== (updated.posterPublicId || updated.posterUrl)) {
       try {
-        if (typeof oldPosterRef === "string") {
+        if (typeof oldPosterRef === "string" && oldPosterRef.length) {
           await cloudinary.uploader.destroy(oldPosterRef);
           console.log("[Cloudinary] destroyed old poster:", oldPosterRef);
         }
