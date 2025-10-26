@@ -46,6 +46,27 @@ const AMOUNT_SAFE = {
   },
 };
 
+// Normalize createdAt: accept createdAt or created_at, and convert strings to Date
+const normalizeCreatedAtStage = [
+  {
+    $addFields: {
+      __created_raw: { $ifNull: ["$createdAt", "$created_at"] },
+    },
+  },
+  {
+    $addFields: {
+      createdAt: {
+        $cond: [
+          { $eq: [{ $type: "$__created_raw" }, "date"] },
+          "$__created_raw",
+          { $toDate: "$__created_raw" },
+        ],
+      },
+    },
+  },
+  { $project: { __created_raw: 0 } },
+];
+
 // dayProject still uses 'createdAt' — we'll normalize createdAt early in pipeline
 const dayProject = [
   {
@@ -94,10 +115,10 @@ router.get("/", async (req, res, next) => {
 
     /* ---------- revenue by day (normalized fields) ---------- */
     const revenue = await Booking.aggregate([
-      // normalize common field names into ones pipeline expects:
+      // normalize createdAt and other common field names
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           status: { $ifNull: ["$status", ""] },
           user: { $ifNull: ["$user", "$userId"] },
@@ -128,9 +149,9 @@ router.get("/", async (req, res, next) => {
 
     /* ---------- users (unique per day) ---------- */
     const users = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           user: { $ifNull: ["$user", "$userId"] },
         },
       },
@@ -192,9 +213,9 @@ router.get("/", async (req, res, next) => {
 
     /* ---------- popular movies (normalize createdAt/status/amount fields similarly) ---------- */
     const popularMovies = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           movie: { $ifNull: ["$movie", "$movieId"] },
           status: { $ifNull: ["$status", ""] },
@@ -281,9 +302,9 @@ router.get("/revenue/trends", async (req, res, next) => {
     const since = toPast(days);
     const now = new Date();
     const raw = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           status: { $ifNull: ["$status", ""] },
         },
@@ -316,9 +337,9 @@ router.get("/movies/popular", async (req, res, next) => {
     const since = toPast(req.query.days || 30);
     const limit = Number(req.query.limit || 10);
     const data = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           movie: { $ifNull: ["$movie", "$movieId"] },
           status: { $ifNull: ["$status", ""] },
@@ -391,9 +412,9 @@ router.get("/bookings/by-hour", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 14);
     const data = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           status: { $ifNull: ["$status", ""] },
         },
       },
@@ -414,9 +435,9 @@ router.get("/users/active", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
     const data = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           user: { $ifNull: ["$user", "$userId"] },
         },
       },
@@ -438,9 +459,9 @@ router.get("/bookings/summary", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
     const data = await Booking.aggregate([
+      ...normalizeCreatedAtStage,
       {
         $addFields: {
-          createdAt: { $ifNull: ["$createdAt", "$created_at"] },
           totalAmount: { $ifNull: ["$totalAmount", "$amount", "$price", 0] },
           status: { $ifNull: ["$status", ""] },
         },
