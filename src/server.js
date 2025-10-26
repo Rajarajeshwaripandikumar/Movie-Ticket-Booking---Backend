@@ -33,6 +33,29 @@ app.use(helmet());
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
+/**
+ * Server-level middleware: copy ?token= query param into Authorization header.
+ * This must run early (before any auth middleware or routers that enforce auth),
+ * so EventSource clients that cannot set headers can still authenticate.
+ *
+ * Security note: tokens in querystrings can be leaked via logs/referrers.
+ * Use short-lived tokens for SSE / ensure you do not log the full value.
+ */
+function tokenQueryToHeader(req, _res, next) {
+  try {
+    if (!req.headers.authorization && req.query && req.query.token) {
+      req.headers.authorization = `Bearer ${String(req.query.token)}`;
+      // optional debug while rolling out (comment out in production)
+      // console.debug('[auth] set Authorization header from ?token for', req.originalUrl);
+    }
+  } catch (err) {
+    // ignore defensively
+  }
+  next();
+}
+// Apply it very early
+app.use(tokenQueryToHeader);
+
 /* ----------------------------- CORS config -------------------------------- */
 const envOrigins = (process.env.FRONTEND_ORIGINS || "")
   .split(",")
@@ -239,7 +262,6 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
 });
 
 /* --------------------------- Mount other routers --------------------------- */
-// Example: if you have separate router files, import & mount them here
 try {
   // dynamic mount if file exists
   const routers = ["./routes/theaters.routes.js", "./routes/movies.routes.js", "./routes/upload.routes.js"];
