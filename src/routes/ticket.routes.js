@@ -37,7 +37,7 @@ router.get("/:bookingId/download", async (req, res) => {
       process.env.URL || // Netlify
       (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined) ||
       (process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined) ||
-      "http://localhost:5173";
+      "https://movie-ticket-booking-rajy.netlify.app"";
 
     // Backend/public endpoint for download links in emails. Prefer explicitly set BACKEND_URL
     // Example: BACKEND_URL = https://api.yoursite.com
