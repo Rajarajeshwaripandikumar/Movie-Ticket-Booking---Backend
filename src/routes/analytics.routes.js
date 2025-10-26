@@ -35,6 +35,19 @@ if (!Movie) {
 
 const router = Router();
 
+// Allow EventSource clients to pass token via query param (?token=...)
+// by copying it into Authorization header for the /stream route only.
+router.use("/stream", (req, res, next) => {
+  try {
+    if (!req.headers.authorization && req.query && req.query.token) {
+      req.headers.authorization = `Bearer ${String(req.query.token)}`;
+    }
+  } catch (e) {
+    // defensive: ignore and continue
+  }
+  next();
+});
+
 /* ------------------------ analytics config / helpers ---------------------- */
 
 const TZ = process.env.ANALYTICS_TZ || "UTC";
