@@ -116,6 +116,66 @@ function normalizeArrayField(value) {
   return [String(value).trim()].filter(Boolean);
 }
 
+/* --------------------- Defensive sanitizers for cast/crew ----------------- */
+/**
+ * Turn an incoming messy cast array into plain objects:
+ * [{ name: "Actor", character: "Role" }, ...]
+ */
+function sanitizeCastArray(inputArr) {
+  if (!Array.isArray(inputArr)) return [];
+
+  return inputArr
+    .map((entry) => {
+      if (!entry && entry !== 0) return null;
+
+      if (typeof entry === "string") {
+        return { name: entry.trim(), character: "" };
+      }
+
+      if (Array.isArray(entry)) {
+        const names = entry
+          .map((x) => (typeof x === "string" ? x : x?.name || x?.actorName || JSON.stringify(x)))
+          .filter(Boolean);
+        return { name: names.join(", "), character: "" };
+      }
+
+      if (typeof entry === "object") {
+        const name =
+          entry.name ||
+          entry.actorName ||
+          (entry.actor && (entry.actor.name || entry.actor.fullName)) ||
+          (entry.person && (entry.person.name || entry.person.fullName)) ||
+          "";
+        const character = entry.character ?? entry.role ?? "";
+        return { name: String(name || "").trim(), character: String(character || "").trim() };
+      }
+
+      return { name: String(entry), character: "" };
+    })
+    .filter((x) => x && (String(x.name).trim().length > 0 || String(x.character).trim().length > 0));
+}
+
+function sanitizeCrewArray(inputArr) {
+  if (!Array.isArray(inputArr)) return [];
+
+  return inputArr
+    .map((entry) => {
+      if (!entry && entry !== 0) return null;
+      if (typeof entry === "string") return { name: entry.trim(), role: "" };
+      if (Array.isArray(entry)) {
+        const names = entry.map((x) => (typeof x === "string" ? x : x?.name || JSON.stringify(x))).filter(Boolean);
+        return { name: names.join(", "), role: "" };
+      }
+      if (typeof entry === "object") {
+        const name = entry.name || entry.fullName || (entry.person && (entry.person.name || entry.person.fullName)) || "";
+        const role = entry.role || entry.job || "";
+        return { name: String(name || "").trim(), role: String(role || "").trim() };
+      }
+      return { name: String(entry), role: "" };
+    })
+    .filter((x) => x && (String(x.name).trim().length > 0 || String(x.role).trim().length > 0));
+}
+
 /* ----------------------------- Public API -------------------------------- */
 
 /**
@@ -271,6 +331,9 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
 /**
  * PUT /api/movies/admin/:id
  * update movie, optional poster replace
+ *
+ * This handler normalizes incoming cast/crew data into predictable plain objects,
+ * runs validation, and returns clearer validation errors when possible.
  */
 adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, res) => {
   try {
@@ -284,9 +347,13 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
 
     // Normalize arrays (if present). If not present, keep existing values.
     const genres = body.genres ? normalizeArrayField(body.genres) : existing.genres || [];
-    const cast = body.cast ? normalizeArrayField(body.cast) : existing.cast || [];
-    const crew = body.crew ? normalizeArrayField(body.crew) : existing.crew || [];
+    const rawCast = body.cast ? normalizeArrayField(body.cast) : existing.cast || [];
+    const rawCrew = body.crew ? normalizeArrayField(body.crew) : existing.crew || [];
     const languages = body.languages ? normalizeArrayField(body.languages) : existing.languages || ["English"];
+
+    // Sanitize cast/crew into predictable plain object shapes
+    const cast = sanitizeCastArray(rawCast);
+    const crew = sanitizeCrewArray(rawCrew);
 
     const payload = {
       title: body.title ?? existing.title,
@@ -326,7 +393,22 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       payload.uploaderRole = req.user.role || "admin";
     }
 
-    const updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+    // Attempt update with validation; capture validation errors for clearer logs
+    let updated;
+    try {
+      updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+    } catch (validationErr) {
+      console.error("[Movies][Admin] Validation error on update:", validationErr);
+      // If mongoose validation error, extract messages
+      if (validationErr && validationErr.errors) {
+        const details = Object.keys(validationErr.errors).map((k) => ({
+          path: k,
+          message: validationErr.errors[k].message,
+        }));
+        return res.status(400).json({ ok: false, message: "Validation failed", errors: details, raw: validationErr.message });
+      }
+      return res.status(500).json({ ok: false, message: "Failed to update movie", error: String(validationErr) });
+    }
 
     // best-effort delete old poster if changed
     if (updated && oldPosterRef && oldPosterRef !== (updated.posterPublicId || updated.posterUrl)) {
@@ -342,8 +424,9 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
 
     res.json({ ok: true, data: updated });
   } catch (err) {
-    console.error("[Movies][Admin] PUT /:id error:", err);
-    res.status(500).json({ ok: false, message: "Failed to update movie", error: err.message });
+    console.error("[Movies][Admin] PUT /:id error:", err && (err.stack || err));
+    // Surface inner error.message if available
+    return res.status(500).json({ ok: false, message: "Failed to update movie", error: err?.message || String(err) });
   }
 });
 
