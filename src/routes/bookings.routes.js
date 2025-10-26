@@ -22,6 +22,22 @@ const router = Router();
 
 const seatKey = (r, c) => `${Number(r)}:${Number(c)}`;
 
+// --- new helpers to generate labels like A7, B12, ... (handles AA, AB, etc.)
+function rowToLabel(rowNum) {
+  let n = Number(rowNum);
+  if (!Number.isInteger(n) || n <= 0) return String(rowNum);
+  let s = "";
+  while (n > 0) {
+    n -= 1;
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26);
+  }
+  return s;
+}
+function seatLabel(row, col) {
+  return `${rowToLabel(row)}${col}`;
+}
+
 // Frontend base (for SPA/QR/view links)
 const APP_PUBLIC_BASE =
   process.env.APP_PUBLIC_BASE || process.env.APP_BASE_URL || "http://localhost:5173";
@@ -270,7 +286,12 @@ router.post("/confirm", requireAuth, async (req, res) => {
     await ensureSeatsInitialized(show);
     await reconcileLocks(show);
 
-    const normSeats = seats.map((s) => ({ row: Number(s.row), col: Number(s.col) }));
+    // --- normalize seats and add label property
+    const normSeats = seats.map((s) => {
+      const r = Number(s.row);
+      const c = Number(s.col);
+      return { row: r, col: c, label: seatLabel(r, c) };
+    });
     const keys = normSeats.map((s) => seatKey(s.row, s.col));
 
     const idx = new Map(show.seats.map((s, i) => [seatKey(s.row, s.col), i]));
@@ -422,7 +443,8 @@ router.post("/confirm", requireAuth, async (req, res) => {
           console.warn(tag, "No recipient email; skipping email send.");
         } else {
           const name = pickUserName(req.user, null);
-          const seatsText = normSeats.map((s) => `${s.row}-${s.col}`).join(", ");
+          // prefer labels if present
+          const seatsText = normSeats.map((s) => s.label || `${s.row}-${s.col}`).join(", ");
 
           // Short-lived token so *both* View link and PDF can open from email
           const linkToken = jwt.sign(
@@ -501,7 +523,16 @@ router.get("/me", requireAuth, async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    res.json({ ok: true, bookings });
+    // ensure older bookings without label still show as row-col
+    const normalized = bookings.map((b) => {
+      b.seats = (b.seats || []).map((s) => {
+        if (!s) return s;
+        return { row: s.row, col: s.col, label: s.label || seatLabel(s.row, s.col) };
+      });
+      return b;
+    });
+
+    res.json({ ok: true, bookings: normalized });
   } catch (err) {
     console.error("Fetch bookings error:", err);
     res.status(500).json({ ok: false, error: "Failed to fetch bookings" });
@@ -542,6 +573,12 @@ router.get(
       if (!isAdmin && bookingUserId !== String(req.user._id)) {
         return res.status(403).json({ ok: false, error: "Forbidden" });
       }
+
+      // ensure seats have labels for older bookings
+      booking.seats = (booking.seats || []).map((s) => {
+        if (!s) return s;
+        return { row: s.row, col: s.col, label: s.label || seatLabel(s.row, s.col) };
+      });
 
       res.json({ ok: true, booking });
     } catch (err) {
@@ -724,6 +761,7 @@ router.get("/calendar", requireAuth, async (req, res) => {
 
     const events = bookings
       .map((b) => ({
+
         id: b._id,
         title: b.showtime?.movie?.title || "Booking",
         start: b.showtime?.startTime,
@@ -786,6 +824,12 @@ router.get(
           "Customer",
         email: booking.user?.email || req.user?.email || undefined,
       };
+
+      // ensure seats have labels for PDF generation
+      booking.seats = (booking.seats || []).map((s) => {
+        if (!s) return s;
+        return { row: s.row, col: s.col, label: s.label || seatLabel(s.row, s.col) };
+      });
 
       const { buffer } = await generateTicketPdf(
         booking,
