@@ -9,16 +9,53 @@ import QRCode from "qrcode";
  * generateTicketPdf(booking, user = {}, show = {}, opts = {})
  * - returns { buffer } when outDir not provided
  * - returns { filepath } when outDir provided (writes file)
+ *
+ * opts:
+ *  - outDir
+ *  - filename
+ *  - baseUrl  <-- highest priority
+ *  - pageSize
  */
+function resolveBaseUrl(optsBaseUrl) {
+  // 1) explicit option passed to function
+  if (optsBaseUrl) return String(optsBaseUrl).replace(/\/$/, "");
+
+  // 2) common env var names (your app-specific and hosting providers)
+  const candidates = [
+    process.env.BASE_URL,
+    process.env.APP_BASE_URL,
+    process.env.VITE_APP_BASE_URL,
+    process.env.REACT_APP_BASE_URL,
+    process.env.NEXT_PUBLIC_BASE_URL,
+    process.env.URL, // Netlify exposes this
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined, // Vercel gives host without protocol
+    process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined, // Render
+    process.env.PRODUCTION_URL,
+  ].filter(Boolean);
+
+  if (candidates.length > 0) {
+    // normalize — ensure protocol present, remove trailing slash
+    let candidate = String(candidates[0]);
+    if (!/^https?:\/\//i.test(candidate)) candidate = `https://${candidate}`;
+    return candidate.replace(/\/$/, "");
+  }
+
+  // 3) last-resort fallback (local dev)
+  return "http://localhost:5173";
+}
+
 export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}) {
   if (!booking || !booking._id) throw new Error("Invalid booking passed to generateTicketPdf");
 
   const {
     outDir = null,
     filename = `ticket-${String(booking._id)}.pdf`,
-    baseUrl = process.env.VITE_APP_BASE_URL || process.env.APP_BASE_URL || "http://localhost:5173",
+    baseUrl: optsBaseUrl = null,
     pageSize = "A4",
   } = opts;
+
+  // Resolve a sane baseUrl (opts overrides envs)
+  const baseUrl = resolveBaseUrl(optsBaseUrl);
 
   const writeToFile = !!outDir;
   const tmpDir = writeToFile ? path.resolve(outDir) : os.tmpdir();
@@ -27,7 +64,9 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
     fs.mkdirSync(tmpDir, { recursive: true });
   }
 
-  const filepath = writeToFile ? path.join(tmpDir, filename) : path.join(tmpDir, `ticket-${String(booking._id)}-${Date.now()}.pdf`);
+  const filepath = writeToFile
+    ? path.join(tmpDir, filename)
+    : path.join(tmpDir, `ticket-${String(booking._id)}-${Date.now()}.pdf`);
   const doc = new PDFDocument({ margin: 40, size: pageSize });
 
   // If writing to file, pipe to fs stream. Otherwise capture chunks to build a buffer.
