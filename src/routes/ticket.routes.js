@@ -1,4 +1,4 @@
-// src/routes/tickets.routes.js  (or wherever this file lives)
+// src/routes/tickets.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import fs from "fs";
@@ -21,55 +21,63 @@ router.get("/:bookingId/download", async (req, res) => {
     const booking = await Booking.findById(bookingId)
       .populate({
         path: "showtime",
-        populate: [{ path: "movie", select: "title" }, { path: "screen", select: "name" }],
+        populate: [
+          { path: "movie", select: "title" },
+          { path: "screen", select: "name" },
+        ],
       })
       .lean();
 
     if (!booking) return res.status(404).send("Booking not found");
 
     // -------------------------
-    // Resolve URLs (env-first; fallbacks)
+    // 🌐 Resolve URLs (env-first; with production fallback)
     // -------------------------
-    // Frontend site (used in PDF verify link & QR). Set this in your hosting env:
-    // BASE_URL = https://movie-ticket-booking-rajy.netlify.app
+    // FRONTEND_URL → used for QR / verify links in PDF
     const FRONTEND_URL =
       process.env.BASE_URL ||
+      process.env.APP_BASE_URL ||
+      process.env.VITE_APP_BASE_URL ||
       process.env.URL || // Netlify
       (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined) ||
       (process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined) ||
-      "https://movie-ticket-booking-rajy.netlify.app"";
+      "https://movie-ticket-booking-rajy.netlify.app"; // ✅ production fallback (never localhost)
 
-    // Backend/public endpoint for download links in emails. Prefer explicitly set BACKEND_URL
-    // Example: BACKEND_URL = https://api.yoursite.com
-    const BACKEND_URL = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+    // BACKEND_URL → used for direct download link in email
+    const BACKEND_URL =
+      process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+
+    // Debug: log which URLs the server is using
+    console.log(
+      "[tickets.download] FRONTEND_URL=%s BACKEND_URL=%s bookingId=%s",
+      FRONTEND_URL,
+      BACKEND_URL,
+      bookingId
+    );
 
     // -------------------------
-    // Generate ticket PDF
+    // 🧾 Generate ticket PDF
     // -------------------------
-    // We'll write a temporary file so we can stream it easily to the client.
     const tmpDir = os.tmpdir();
-    const outDir = tmpDir; // you can change to a dedicated temp folder if preferred
+    const outDir = tmpDir;
+    const filename = `ticket-${booking._id}-${Date.now()}.pdf`;
 
     const genResult = await generateTicketPdf(
       booking,
       booking.user || { name: "Guest User", email: "guest@example.com" },
       booking.showtime,
-      { outDir, baseUrl: FRONTEND_URL } // IMPORTANT: pass baseUrl explicitly
+      { outDir, baseUrl: FRONTEND_URL, filename }
     );
 
-    // genResult may be { filepath } or { buffer } depending on opts
     let filepath = null;
     let buffer = null;
-    if (genResult && genResult.filepath) filepath = genResult.filepath;
-    else if (genResult && genResult.buffer) buffer = genResult.buffer;
-    else {
-      // defensive: if your util returns filepath string directly in older code
-      if (typeof genResult === "string") filepath = genResult;
-      else throw new Error("generateTicketPdf returned unexpected result");
-    }
+    if (genResult?.filepath) filepath = genResult.filepath;
+    else if (genResult?.buffer) buffer = genResult.buffer;
+    else if (typeof genResult === "string") filepath = genResult;
+    else throw new Error("generateTicketPdf returned unexpected result");
 
     // -------------------------
-    // Create notification entry (initially pending)
+    // 📨 Create notification
     // -------------------------
     const emailTo = booking.user?.email || booking.email;
     const movieName = booking.showtime?.movie?.title || "Unknown Movie";
@@ -86,17 +94,18 @@ router.get("/:bookingId/download", async (req, res) => {
     });
 
     // -------------------------
-    // Email the ticket (if email present)
+    // 📧 Email the ticket
     // -------------------------
     if (emailTo) {
-      // Use backend URL for download link in email
       const pdfLink = `${String(BACKEND_URL).replace(/\/$/, "")}/tickets/${booking._id}/download`;
 
       const html = renderTemplate("ticket", {
         name: booking.user?.name || "Guest User",
         movieName,
         theaterName: booking.showtime?.screen?.name || "Unknown Theater",
-        showDate: booking.showtime?.date ? new Date(booking.showtime.date).toLocaleDateString() : "N/A",
+        showDate: booking.showtime?.date
+          ? new Date(booking.showtime.date).toLocaleDateString()
+          : "N/A",
         showTime: booking.showtime?.time || "N/A",
         seatNumber: booking.seatNumber || "N/A",
         pdfLink,
@@ -109,7 +118,6 @@ router.get("/:bookingId/download", async (req, res) => {
           html,
         });
 
-        // Update notification on success
         await Notification.updateOne(
           { _id: notif._id },
           {
@@ -123,7 +131,6 @@ router.get("/:bookingId/download", async (req, res) => {
         );
         console.log("✅ Email sent:", emailTo);
       } catch (err) {
-        // Update notification on failure
         await Notification.updateOne(
           { _id: notif._id },
           {
@@ -139,20 +146,20 @@ router.get("/:bookingId/download", async (req, res) => {
     }
 
     // -------------------------
-    // Stream or send the PDF to user
+    // 📤 Stream or send the PDF to user
     // -------------------------
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="ticket-${booking._id}.pdf"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="ticket-${booking._id}.pdf"`
+    );
 
     if (buffer) {
-      // If util returned a buffer, send it directly
       res.send(buffer);
     } else if (filepath) {
-      // Stream file and remove after streaming
       const stream = fs.createReadStream(filepath);
       stream.pipe(res);
       stream.on("end", () => {
-        // cleanup
         fs.unlink(filepath, (err) => {
           if (err) console.warn("Failed to unlink temp ticket file:", err);
         });
