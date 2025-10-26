@@ -127,8 +127,10 @@ router.get("/", async (req, res) => {
 /**
  * GET /api/theaters/:id
  * Single theater + screen count
+ *
+ * NOTE: param constrained to 24-hex ObjectId to avoid accidental matching of literal segments.
  */
-router.get("/:id", async (req, res) => {
+router.get("/:id([0-9a-fA-F]{24})", async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid theater id" });
@@ -147,8 +149,10 @@ router.get("/:id", async (req, res) => {
 /**
  * GET /api/theaters/:theaterId/screens
  * List all screens for a theater
+ *
+ * param constrained to ObjectId
  */
-router.get("/:theaterId/screens", async (req, res) => {
+router.get("/:theaterId([0-9a-fA-F]{24})/screens", async (req, res) => {
   try {
     const { theaterId } = req.params;
     if (!isValidId(theaterId)) return res.status(400).json({ ok: false, error: "Invalid theater id" });
@@ -162,17 +166,19 @@ router.get("/:theaterId/screens", async (req, res) => {
 });
 
 /* ------------------------------- Admin Routes ---------------------------- */
+/* Use a dedicated adminRouter mounted at /admin so literal paths like /admin/list
+   are never captured by param routes. Middleware applied to adminRouter protects all admin endpoints.
+*/
 
-/**
- * GET /api/theaters/admin/list
- * Admin — full list (protected)
- */
-router.get("/admin/list", requireAuth, requireAdmin, async (_req, res) => {
+const adminRouter = express.Router();
+
+// Admin — full list
+adminRouter.get("/list", async (req, res) => {
   try {
     const theaters = await Theater.find().sort({ createdAt: -1 }).lean();
     res.json({ ok: true, data: theaters });
   } catch (err) {
-    console.error("[Theaters] GET /admin/list error:", err);
+    console.error("[Theaters][Admin] GET /list error:", err);
     res.status(500).json({ ok: false, message: "Failed to fetch theaters", error: err.message });
   }
 });
@@ -182,8 +188,7 @@ router.get("/admin/list", requireAuth, requireAdmin, async (_req, res) => {
  * Admin — create with Cloudinary image
  * Accepts multipart/form-data with field "image" or regular JSON with posterUrl
  */
-router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
-  // This route is meant to be mounted at /api/theaters (so POST "/" is admin create).
+adminRouter.post("/", upload.single("image"), async (req, res) => {
   try {
     const payload = req.body || {};
     payload.amenities = toArray(payload.amenities);
@@ -195,7 +200,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, 
         payload.imageUrl = result.secure_url;
         payload.imagePublicId = result.public_id;
       } catch (e) {
-        console.error("[Theaters] Cloudinary upload failed (create):", e?.message || e);
+        console.error("[Theaters][Admin] Cloudinary upload failed (create):", e?.message || e);
         return res.status(500).json({ ok: false, message: "Failed to upload image", error: e?.message || String(e) });
       }
     }
@@ -208,7 +213,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, 
     const created = await Theater.create(payload);
     res.status(201).json({ ok: true, data: created });
   } catch (err) {
-    console.error("[Theaters] POST / error:", err);
+    console.error("[Theaters][Admin] POST / error:", err);
     res.status(500).json({ ok: false, message: "Failed to create theater", error: err.message });
   }
 });
@@ -217,7 +222,7 @@ router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, 
  * PUT /api/theaters/admin/:id
  * Admin — update + optional image replace
  */
-router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
+adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("image"), async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid theater ID" });
@@ -245,7 +250,7 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req
         payload.imagePublicId = result.public_id;
         oldImageRef = existing.imagePublicId || existing.imageUrl;
       } catch (e) {
-        console.error("[Theaters] Cloudinary upload failed (update):", e?.message || e);
+        console.error("[Theaters][Admin] Cloudinary upload failed (update):", e?.message || e);
         return res.status(500).json({ ok: false, message: "Failed to upload image", error: e?.message || String(e) });
       }
     }
@@ -265,13 +270,13 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req
           console.log("[Cloudinary] destroyed old image:", oldImageRef);
         }
       } catch (e) {
-        console.warn("[Theaters] failed to delete previous image:", e?.message || e);
+        console.warn("[Theaters][Admin] failed to delete previous image:", e?.message || e);
       }
     }
 
     res.json({ ok: true, data: updated });
   } catch (err) {
-    console.error("[Theaters] PUT /:id error:", err);
+    console.error("[Theaters][Admin] PUT /:id error:", err);
     res.status(500).json({ ok: false, message: "Failed to update theater", error: err.message });
   }
 });
@@ -280,7 +285,7 @@ router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req
  * DELETE /api/theaters/admin/:id
  * Admin — delete + remove Cloudinary image
  */
-router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+adminRouter.delete("/:id([0-9a-fA-F]{24})", async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid theater ID" });
@@ -299,29 +304,14 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
 
     res.json({ ok: true, message: "Deleted", id: deleted._id });
   } catch (err) {
-    console.error("[Theaters] DELETE /:id error:", err);
+    console.error("[Theaters][Admin] DELETE /:id error:", err);
     res.status(500).json({ ok: false, message: "Failed to delete theater", error: err.message });
   }
 });
 
-/* ------------------------ Admin-prefixed routes --------------------------- */
-/* If the router is mounted at /api/theaters we also want /admin/* paths to work.
-   These forward to the base handlers above (same technique used in movies.routes). */
-
-router.post("/admin", requireAuth, requireAdmin, upload.single("image"), async (req, res, next) => {
-  req.url = "/";
-  return router.handle(req, res, next);
-});
-
-router.put("/admin/:id", requireAuth, requireAdmin, upload.single("image"), async (req, res, next) => {
-  req.url = `/${req.params.id}`;
-  return router.handle(req, res, next);
-});
-
-router.delete("/admin/:id", requireAuth, requireAdmin, async (req, res, next) => {
-  req.url = `/${req.params.id}`;
-  return router.handle(req, res, next);
-});
+/* ----------------- mount adminRouter with auth ------------------ */
+// protect all admin routes
+router.use("/admin", requireAuth, requireAdmin, adminRouter);
 
 /* ----------------------- Multer error handler ---------------------------- */
 router.use((err, _req, res, next) => {
