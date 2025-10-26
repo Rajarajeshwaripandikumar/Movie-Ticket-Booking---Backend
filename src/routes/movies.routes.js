@@ -117,10 +117,6 @@ function normalizeArrayField(value) {
 }
 
 /* --------------------- Defensive sanitizers for cast/crew ----------------- */
-/**
- * Turn an incoming messy cast array into plain objects:
- * [{ name: "Actor", character: "Role" }, ...]
- */
 function sanitizeCastArray(inputArr) {
   if (!Array.isArray(inputArr)) return [];
 
@@ -340,10 +336,17 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
 
+    // Debug log
+    console.log(`[Movies][Admin] PUT start id=${id} user=${req.user?.id || "anon"}`);
+
     const existing = await Movie.findById(id);
-    if (!existing) return res.status(404).json({ ok: false, message: "Movie not found" });
+    if (!existing) {
+      console.warn(`[Movies][Admin] PUT movie not found id=${id}`);
+      return res.status(404).json({ ok: false, message: "Movie not found" });
+    }
 
     const body = req.body || {};
+    console.log("[Movies][Admin] incoming body keys:", Object.keys(body));
 
     // Normalize arrays (if present). If not present, keep existing values.
     const genres = body.genres ? normalizeArrayField(body.genres) : existing.genres || [];
@@ -351,9 +354,15 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
     const rawCrew = body.crew ? normalizeArrayField(body.crew) : existing.crew || [];
     const languages = body.languages ? normalizeArrayField(body.languages) : existing.languages || ["English"];
 
+    console.log("[Movies][Admin] normalized: genresLen=", genres.length, "rawCastSample=", JSON.stringify(rawCast?.slice(0,3)));
+    console.log("[Movies][Admin] normalized: rawCrewSample=", JSON.stringify(rawCrew?.slice(0,3)), "languages=", languages);
+
     // Sanitize cast/crew into predictable plain object shapes
     const cast = sanitizeCastArray(rawCast);
     const crew = sanitizeCrewArray(rawCrew);
+
+    console.log("[Movies][Admin] sanitized cast sample:", JSON.stringify(cast?.slice(0,3)));
+    console.log("[Movies][Admin] sanitized crew sample:", JSON.stringify(crew?.slice(0,3)));
 
     const payload = {
       title: body.title ?? existing.title,
@@ -393,13 +402,20 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       payload.uploaderRole = req.user.role || "admin";
     }
 
+    console.log("[Movies][Admin] update payload preview:", {
+      title: payload.title,
+      genresCount: (payload.genres || []).length,
+      castCount: (payload.cast || []).length,
+      crewCount: (payload.crew || []).length,
+      posterUrlPreview: payload.posterUrl ? String(payload.posterUrl).slice(0, 80) : null,
+    });
+
     // Attempt update with validation; capture validation errors for clearer logs
     let updated;
     try {
       updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
     } catch (validationErr) {
       console.error("[Movies][Admin] Validation error on update:", validationErr);
-      // If mongoose validation error, extract messages
       if (validationErr && validationErr.errors) {
         const details = Object.keys(validationErr.errors).map((k) => ({
           path: k,
@@ -422,11 +438,12 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       }
     }
 
-    res.json({ ok: true, data: updated });
+    console.log(`[Movies][Admin] updated movie id=${id} success`);
+    return res.json({ ok: true, data: updated });
   } catch (err) {
-    console.error("[Movies][Admin] PUT /:id error:", err && (err.stack || err));
-    // Surface inner error.message if available
-    return res.status(500).json({ ok: false, message: "Failed to update movie", error: err?.message || String(err) });
+    console.error("[Movies][Admin] PUT /:id error:", err && (err.stack || err.message || err));
+    const shortStack = err?.stack ? String(err.stack).split("\n").slice(0, 6).join("\n") : undefined;
+    return res.status(500).json({ ok: false, message: "Failed to update movie", error: err?.message || String(err), stack: shortStack });
   }
 });
 
