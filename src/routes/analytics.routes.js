@@ -104,8 +104,8 @@ const dayProjectSimple = [
  *   ok: true,
  *   revenue: [{ date, total }],
  *   users: [{ date, count }],
- *   occupancy: [{ theaterName, occupancyRate }],
- *   popularMovies: [{ movie, bookings, revenue }]
+ *   occupancy: [{ theaterName, name, occupancyRate, occupancy }],
+ *   popularMovies: [{ movieId, movieName, movie, bookings, revenue }]
  * }
  */
 router.get("/", async (req, res, next) => {
@@ -156,7 +156,7 @@ router.get("/", async (req, res, next) => {
                 },
               },
             },
-            { $project: { seats: 1, seatsBooked: 1, quantity: 1 } },
+            { $project: { seats: 1, seatsBooked: 1, quantity: 1, createdAt: 1 } },
           ],
           as: "bks",
         },
@@ -165,19 +165,37 @@ router.get("/", async (req, res, next) => {
       { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
       {
         $project: {
-          theater: "$t.name",
+          theater: { $ifNull: ["$t.name", "$t.title", "$t.displayName", "$t.label", null] },
           totalSeats: { $size: { $ifNull: ["$seats", []] } },
+          showtimeCapacity: { $ifNull: ["$capacity", "$totalSeats", null] },
+          theaterCapacity: { $ifNull: ["$t.capacity", "$t.totalSeats", null] },
           booked: {
             $sum: {
               $map: {
                 input: { $ifNull: ["$bks", []] },
                 as: "b",
                 in: {
-                  $size: {
-                    $ifNull: [
-                      "$$b.seats",
-                      { $ifNull: ["$$b.seatsBooked", []] },
-                    ],
+                  $let: {
+                    vars: {
+                      seatsArraySize: { $size: { $ifNull: ["$$b.seats", []] } },
+                      seatsBookedNum: { $ifNull: ["$$b.seatsBooked", null] },
+                      qtyNum: { $ifNull: ["$$b.quantity", null] },
+                    },
+                    in: {
+                      $cond: [
+                        { $gt: ["$$seatsArraySize", 0] },
+                        "$$seatsArraySize",
+                        {
+                          $cond: [
+                            { $ne: ["$$seatsBookedNum", null] },
+                            "$$seatsBookedNum",
+                            {
+                              $cond: [{ $ne: ["$$qtyNum", null] }, "$$qtyNum", 1],
+                            },
+                          ],
+                        },
+                      ],
+                    },
                   },
                 },
               },
@@ -186,15 +204,24 @@ router.get("/", async (req, res, next) => {
         },
       },
       {
+        $addFields: {
+          // derive a totalSeats fallback (prefer explicit seats array, then showtimeCapacity, then theaterCapacity)
+          totalSeats: {
+            $cond: [
+              { $gt: ["$totalSeats", 0] },
+              "$totalSeats",
+              { $ifNull: ["$showtimeCapacity", { $ifNull: ["$theaterCapacity", 0] }] },
+            ],
+          },
+        },
+      },
+      {
         $group: {
           _id: "$theater",
+          // average across showtimes
           occupancyRate: {
             $avg: {
-              $cond: [
-                { $gt: ["$totalSeats", 0] },
-                { $divide: ["$booked", "$totalSeats"] },
-                0,
-              ],
+              $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0],
             },
           },
         },
@@ -217,13 +244,72 @@ router.get("/", async (req, res, next) => {
         },
       },
       { $sort: { bookings: -1 } },
-      { $limit: 5 },
-      { $lookup: { from: "movies", localField: "_id", foreignField: "_id", as: "movie" } },
-      { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
-      { $project: { _id: 0, movie: { $ifNull: ["$movie.title", "Unknown"] }, bookings: 1, revenue: 1 } },
+      { $limit: 20 },
+      // try to resolve movie document if available
+      {
+        $lookup: {
+          from: "movies",
+          let: { mid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$mid"] },
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                  ],
+                },
+              },
+            },
+            { $project: { title: 1, name: 1 } },
+          ],
+          as: "movieDoc",
+        },
+      },
+      { $unwind: { path: "$movieDoc", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 0,
+          movieId: "$_id",
+          movieName: { $ifNull: ["$movieDoc.title", "$movieDoc.name", null] },
+          // keep 'movie' for older frontend shapes
+          movie: { $ifNull: ["$movieDoc.title", "$movieDoc.name", null] },
+          bookings: 1,
+          revenue: 1,
+        },
+      },
     ]);
 
-    res.json({ ok: true, revenue, users, occupancy, popularMovies });
+    /* ------------------ Normalization for frontend ------------------ */
+    // Normalize occupancy shape to expected keys (the frontend may expect 'name' or 'theaterName', and 'occupancy' as percent)
+    const normalizedOccupancy = (occupancy || []).map((r) => {
+      const occupancyRate = typeof r.occupancyRate === "number" ? r.occupancyRate : 0;
+      return {
+        theaterName: r.theaterName || r.name || "Unknown",
+        name: r.theaterName || r.name || "Unknown",
+        occupancyRate,
+        occupancy: Math.round(Number(occupancyRate || 0) * 100), // percent
+      };
+    });
+
+    // Normalize popularMovies to include movieName/movie and numeric fields the frontend expects
+    const normalizedPopular = (popularMovies || []).map((m) => ({
+      movieId: m.movieId ?? null,
+      movieName: m.movieName ?? m.movie ?? (m.movieId ? String(m.movieId) : "Unknown"),
+      movie: m.movieName ?? m.movie ?? (m.movieId ? String(m.movieId) : "Unknown"),
+      bookings: Number(m.bookings ?? 0),
+      revenue: Number(m.revenue ?? 0),
+      totalBookings: Number(m.bookings ?? 0),
+      totalRevenue: Number(m.revenue ?? 0),
+    }));
+
+    res.json({
+      ok: true,
+      revenue,
+      users,
+      occupancy: normalizedOccupancy,
+      popularMovies: normalizedPopular,
+    });
   } catch (err) {
     debug("analytics error:", err?.stack || err?.message);
     next(err);
@@ -281,19 +367,50 @@ router.get("/movies/popular", async (req, res, next) => {
       },
       { $sort: { totalBookings: -1 } },
       { $limit: limit },
-      { $lookup: { from: "movies", localField: "_id", foreignField: "_id", as: "m" } },
+      {
+        $lookup: {
+          from: "movies",
+          let: { mid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$mid"] },
+                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                  ],
+                },
+              },
+            },
+            { $project: { title: 1, name: 1 } },
+          ],
+          as: "m",
+        },
+      },
       { $unwind: { path: "$m", preserveNullAndEmptyArrays: true } },
       {
         $project: {
           _id: 0,
           movieId: "$_id",
-          movieName: { $ifNull: ["$m.title", "Unknown"] },
+          movieName: { $ifNull: ["$m.title", "$m.name", null] },
+          movie: { $ifNull: ["$m.title", "$m.name", null] },
           totalBookings: 1,
           totalRevenue: 1,
         },
       },
     ]);
-    res.json(data);
+
+    // Normalize to frontend-friendly shape (include movieName fallback)
+    const out = (data || []).map((d) => ({
+      movieId: d.movieId ?? null,
+      movieName: d.movieName ?? d.movie ?? (d.movieId ? String(d.movieId) : "Unknown"),
+      totalBookings: Number(d.totalBookings ?? 0),
+      totalRevenue: Number(d.totalRevenue ?? 0),
+      bookings: Number(d.totalBookings ?? 0),
+      revenue: Number(d.totalRevenue ?? 0),
+    }));
+
+    res.json(out);
   } catch (e) {
     debug("movies/popular error:", e.message);
     next(e);
@@ -321,6 +438,7 @@ router.get("/occupancy", async (req, res, next) => {
                     { $eq: ["$showtimeId", "$$sidStr"] },
                   ],
                 },
+                createdAt: { $gte: since },
               },
             },
             { $project: { seats: 1, seatsBooked: 1, quantity: 1 } },
@@ -332,17 +450,32 @@ router.get("/occupancy", async (req, res, next) => {
         $project: {
           theater: 1,
           totalSeats: { $size: { $ifNull: ["$seats", []] } },
+          showtimeCapacity: { $ifNull: ["$capacity", "$totalSeats", null] },
           booked: {
             $sum: {
               $map: {
                 input: { $ifNull: ["$bks", []] },
                 as: "b",
                 in: {
-                  $size: {
-                    $ifNull: [
-                      "$$b.seats",
-                      { $ifNull: ["$$b.seatsBooked", []] },
-                    ],
+                  $let: {
+                    vars: {
+                      seatsArraySize: { $size: { $ifNull: ["$$b.seats", []] } },
+                      seatsBookedNum: { $ifNull: ["$$b.seatsBooked", null] },
+                      qtyNum: { $ifNull: ["$$b.quantity", null] },
+                    },
+                    in: {
+                      $cond: [
+                        { $gt: ["$$seatsArraySize", 0] },
+                        "$$seatsArraySize",
+                        {
+                          $cond: [
+                            { $ne: ["$$seatsBookedNum", null] },
+                            "$$seatsBookedNum",
+                            { $cond: [{ $ne: ["$$qtyNum", null] }, "$$qtyNum", 1] },
+                          ],
+                        },
+                      ],
+                    },
                   },
                 },
               },
@@ -351,25 +484,40 @@ router.get("/occupancy", async (req, res, next) => {
         },
       },
       { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
-      { $unwind: "$t" },
+      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+      {
+        $addFields: {
+          totalSeats: {
+            $cond: [
+              { $gt: ["$totalSeats", 0] },
+              "$totalSeats",
+              { $ifNull: ["$showtimeCapacity", { $ifNull: ["$t.capacity", 0] }] },
+            ],
+          },
+        },
+      },
       {
         $group: {
-          _id: "$t.name",
+          _id: { name: { $ifNull: ["$t.name", "$t.title", "$t.displayName", "Unknown"] } },
           occupancyRate: {
             $avg: {
-              $cond: [
-                { $gt: ["$totalSeats", 0] },
-                { $divide: ["$booked", "$totalSeats"] },
-                0,
-              ],
+              $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0],
             },
           },
         },
       },
-      { $project: { _id: 0, theaterName: "$_id", occupancyRate: 1 } },
+      { $project: { _id: 0, theaterName: "$_id.name", occupancyRate: 1 } },
       { $sort: { occupancyRate: -1 } },
     ]);
-    res.json(data);
+
+    // Add percent occupancy to each row for easier frontend use
+    const out = (data || []).map((r) => ({
+      theaterName: r.theaterName || r.name || "Unknown",
+      occupancyRate: typeof r.occupancyRate === "number" ? r.occupancyRate : 0,
+      occupancy: Math.round((typeof r.occupancyRate === "number" ? r.occupancyRate : 0) * 100),
+    }));
+
+    res.json(out);
   } catch (e) {
     debug("occupancy error:", e.message);
     next(e);
