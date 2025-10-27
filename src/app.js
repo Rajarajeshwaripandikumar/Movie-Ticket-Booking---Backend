@@ -26,6 +26,7 @@ import analyticsRoutes from "./routes/analytics.routes.js";
 import screensRoutes from "./routes/screens.routes.js";
 import pricingRoutes from "./routes/pricing.routes.js";
 import debugMailRoutes from "./routes/debug-mail.js";
+import ordersRouter from "./routes/orders.routes.js";
 
 // ─────────────────────────────── MIDDLEWARE ───────────────────────────────
 import { requireAuth, requireAdmin } from "./middleware/auth.js";
@@ -142,6 +143,7 @@ app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/_debug", debugMailRoutes);
+app.use("/api/orders", ordersRouter);
 
 // Pricing (protected admin)
 app.use("/api/pricing", requireAuth, requireAdmin, pricingRoutes);
