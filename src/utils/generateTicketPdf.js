@@ -75,40 +75,57 @@ function numberToLetters(n) {
 }
 
 /**
- * Normalize/format a single seat entry into "ROWLETTER-COL" or a useful fallback.
+ * Normalize/format a single seat entry into "ROWLETTER-COL" (e.g. "H-6")
+ * Always enforces the hyphen between letter(s) and column number when both are present.
+ *
  * Accepts many shapes:
  * - { row: 8, col: 7 } -> "H-7"
  * - { row: "H", col: 7 } -> "H-7"
  * - { label: "H-7" } -> "H-7"
  * - "H-7" -> "H-7"
- * - { seat: "H7" } -> "H7" (fallback)
+ * - "H7" -> "H-7"
+ * - { seat: "H7" } -> "H-7"
  * - numeric/other -> String(...)
  *
- * Note: This assumes numeric row values are 1-indexed (1 -> A). If your data uses
- * 0-indexed rows (0 -> A), either add +1 before calling or let me know and I will
- * adjust the helper to auto-detect 0-based.
+ * Note: Assumes numeric row values are 1-indexed (1 -> A). If your rows are 0-indexed,
+ * change row handling to (rowVal + 1) before converting.
  */
 function formatSeat(s) {
-  // If already a simple string
+  // If already a simple string - try to normalize common patterns
   if (typeof s === "string") {
-    return s;
+    const trimmed = s.trim();
+    // If already has hyphen and looks ok, just upper-case row part
+    const hyphenMatch = trimmed.match(/^([A-Za-z]+)\s*-\s*(\d+)$/);
+    if (hyphenMatch) {
+      return `${hyphenMatch[1].toUpperCase()}-${hyphenMatch[2]}`;
+    }
+    // If pattern like H6 or H 6 -> convert to H-6
+    const letterNumberMatch = trimmed.match(/^([A-Za-z]+)\s*?(\d+)$/);
+    if (letterNumberMatch) {
+      return `${letterNumberMatch[1].toUpperCase()}-${letterNumberMatch[2]}`;
+    }
+    // If pattern like 6H or other, just return trimmed string
+    return trimmed;
   }
+
   // If it's an object, inspect known fields
   if (s && typeof s === "object") {
-    // If label already provided (e.g., 'H-7' or 'H7'), use it
-    if (s.label) return String(s.label);
-    if (s.seat) return String(s.seat);
-    // If there is a preformatted seat like "H-7"
-    if (s.name) return String(s.name);
+    // If label already provided (e.g., 'H-7' or 'H7'), normalize it
+    if (s.label && typeof s.label === "string") return formatSeat(s.label);
+    if (s.seat && typeof s.seat === "string") return formatSeat(s.seat);
+    if (s.name && typeof s.name === "string") return formatSeat(s.name);
 
-    const rowVal = s.row ?? s.r ?? s.rowNumber ?? null;
-    const colVal = s.col ?? s.c ?? s.colNumber ?? s.column ?? null;
+    // Known numeric/text fields for rows/cols
+    const rowVal = s.row ?? s.r ?? s.rowNumber ?? s.row_idx ?? null;
+    const colVal = s.col ?? s.c ?? s.colNumber ?? s.column ?? s.seatNumber ?? null;
 
     // If row is alphabetic already
     if (typeof rowVal === "string" && /^[A-Za-z]+$/.test(rowVal.trim())) {
       const rowLetter = rowVal.trim().toUpperCase();
-      if (colVal != null) return `${rowLetter}-${colVal}`;
-      return `${rowLetter}${colVal ?? ""}`.trim();
+      if (colVal != null) {
+        return `${rowLetter}-${colVal}`;
+      }
+      return rowLetter;
     }
 
     // If row is numeric
@@ -120,8 +137,22 @@ function formatSeat(s) {
       }
     }
 
-    // If no row/col but label-like fields didn't exist, return JSON-ish fallback
-    // (this keeps PDF generation from crashing and helps debug unexpected shapes)
+    // If we didn't find row/col but object has a single key like { "H": 6 } or similar, attempt extract
+    try {
+      const keys = Object.keys(s || {});
+      if (keys.length === 1) {
+        const onlyKey = keys[0];
+        const value = s[onlyKey];
+        // e.g., { H: 6 } -> H-6
+        if (/^[A-Za-z]+$/.test(onlyKey) && (typeof value === "number" || /^[0-9]+$/.test(String(value)))) {
+          return `${onlyKey.toUpperCase()}-${value}`;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // If no row/col but object shape unexpected, fallback to JSON-ish string to avoid crash
     try {
       return JSON.stringify(s);
     } catch (e) {
@@ -198,7 +229,9 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
     let seatsText = "N/A";
     if (Array.isArray(booking.seats)) {
       try {
-        seatsText = booking.seats.map((s) => formatSeat(s)).join(", ");
+        // Map and normalize every seat to the enforced "LETTER-COL" format
+        const normalized = booking.seats.map((s) => formatSeat(s));
+        seatsText = normalized.join(", ");
       } catch (e) {
         seatsText = String(booking.seats);
       }
