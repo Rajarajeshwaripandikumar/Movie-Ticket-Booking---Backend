@@ -1,4 +1,3 @@
-// src/models/Booking.js
 import mongoose from "mongoose";
 import Showtime from "./Showtime.js";
 import Screen from "./Screen.js";
@@ -17,8 +16,9 @@ function rowToLabel(rowNum) {
   return s;
 }
 function seatLabel(row, col) {
+  // return with hyphen (e.g. H-7) so display is consistent
   if (!row || !col) return String(`${row ?? ""}${col ?? ""}`).trim();
-  return `${rowToLabel(row)}${col}`;
+  return `${rowToLabel(row)}-${col}`;
 }
 
 function expandRangeString(s) {
@@ -65,6 +65,8 @@ function normalizeSeatsRaw(rawSeats, seatsPerRow = 10) {
         out.push({ row: r, col: c, label: token.label || seatLabel(r, c) });
       } else if (token.label) {
         out.push({ row: null, col: null, label: String(token.label) });
+      } else {
+        out.push({ row: null, col: null, label: String(token) });
       }
       continue;
     }
@@ -83,6 +85,7 @@ function normalizeSeatsRaw(rawSeats, seatsPerRow = 10) {
       if (/^[A-Za-z]+-\d+$/.test(t)) {
         const parts = t.split("-");
         const colNum = parseInt(parts[1], 10);
+        // keep original letter label (H-7) but store numeric col if parseable
         out.push({ row: null, col: Number.isFinite(colNum) ? colNum : null, label: t.toUpperCase() });
       } else if (/^\d+$/.test(t)) {
         const id = parseInt(t, 10);
@@ -154,7 +157,7 @@ bookingSchema.pre("save", async function (next) {
     if (needNormalize) {
       this.seats = normalizeSeatsRaw(this.seats || [], seatsPerRow);
     } else {
-      // ensure label present for each seat
+      // ensure label present for each seat and normalize label formatting
       this.seats = this.seats.map((s) => {
         if (!s) return s;
         const r = Number(s.row);
@@ -162,7 +165,18 @@ bookingSchema.pre("save", async function (next) {
         if (Number.isFinite(r) && Number.isFinite(c)) {
           return { row: r, col: c, label: s.label || seatLabel(r, c) };
         }
-        return { row: s.row ?? null, col: s.col ?? null, label: s.label ?? String(s.label ?? `${s.row ?? ""}-${s.col ?? ""}`) };
+        // if row/col are not numeric, prefer existing label, otherwise construct fallback
+        const existingLabel = s.label ?? null;
+        if (existingLabel) return { row: s.row ?? null, col: s.col ?? null, label: String(existingLabel) };
+        // fallback to `${row}-${col}` but ensure row is converted to letter when numeric-like
+        if (s.row != null && s.col != null) {
+          const rn = Number(s.row);
+          const cn = Number(s.col);
+          if (Number.isFinite(rn) && Number.isFinite(cn)) {
+            return { row: rn, col: cn, label: seatLabel(rn, cn) };
+          }
+        }
+        return { row: s.row ?? null, col: s.col ?? null, label: String(`${s.row ?? ""}-${s.col ?? ""}`).replace(/^-|-$|^$/, "").trim() };
       });
     }
     next();
