@@ -22,7 +22,7 @@ const router = Router();
 
 const seatKey = (r, c) => `${Number(r)}:${Number(c)}`;
 
-// --- new helpers to generate labels like A7, B12, ... (handles AA, AB, etc.)
+// --- helpers to generate labels like A1, B12, AA3…
 function rowToLabel(rowNum) {
   let n = Number(rowNum);
   if (!Number.isInteger(n) || n <= 0) return String(rowNum);
@@ -44,24 +44,12 @@ function normalizeCandidate(candidate) {
   if (!candidate) return null;
   let s = String(candidate).trim();
   if (!s) return null;
-  // If environment provided a Netlify-style URL with protocol already (Netlify's URL often includes https://)
   if (!/^https?:\/\//i.test(s)) {
-    // prefer https unless explicitly http provided
     s = `https://${s}`;
   }
   return s.replace(/\/$/, "");
 }
 
-/**
- * Resolve the public frontend base URL used for SPA links / QR codes
- * Priority:
- * 1. APP_PUBLIC_BASE (explicit env)
- * 2. CLIENT_BASE_URL (common name)
- * 3. FRONTEND_BASE_URL
- * 4. APP_BASE_URL
- * 5. process.env.URL (Netlify)
- * 6. fallback to localhost dev
- */
 function resolveAppPublicBase() {
   const candidates = [
     process.env.APP_PUBLIC_BASE,
@@ -71,41 +59,31 @@ function resolveAppPublicBase() {
     process.env.VITE_APP_BASE_URL,
     process.env.REACT_APP_BASE_URL,
     process.env.NEXT_PUBLIC_BASE_URL,
-    process.env.URL, // Netlify sometimes sets this
+    process.env.URL,
   ].filter(Boolean);
 
   const picked = candidates.length > 0 ? normalizeCandidate(candidates[0]) : null;
 
-  // If running in production we should avoid defaulting to localhost silently.
   if (process.env.NODE_ENV === "production") {
     if (picked && picked !== "http://localhost:5173") {
       console.info("[BASE_URL] APP_PUBLIC_BASE resolved (production):", picked);
       return picked;
     }
-    // try forcing CLIENT_BASE_URL specifically
     if (process.env.CLIENT_BASE_URL) {
       const cb = normalizeCandidate(process.env.CLIENT_BASE_URL);
       console.warn("[BASE_URL] production but initial resolve was unsafe — forcing CLIENT_BASE_URL:", cb);
       return cb;
     }
-    // Throw to surface config error in logs rather than issuing localhost links silently
     throw new Error(
       "Missing frontend base URL in production. Set APP_PUBLIC_BASE or CLIENT_BASE_URL environment variable."
     );
   }
 
-  // not production: return picked or default localhost dev URL
   const result = picked || "http://localhost:5173";
   console.info("[BASE_URL] APP_PUBLIC_BASE resolved:", result);
   return result;
 }
 
-/**
- * Resolve backend public base (used for direct API/pdf links in emails)
- * Priority:
- * 1. BACKEND_PUBLIC_BASE env
- * 2. constructs from request host is not available here, so fallback to http://localhost:<PORT>
- */
 function resolveBackendPublicBase() {
   const picked = process.env.BACKEND_PUBLIC_BASE || null;
   const normalized = normalizeCandidate(picked) || `http://localhost:${process.env.PORT || 8080}`;
@@ -113,16 +91,13 @@ function resolveBackendPublicBase() {
   return normalized;
 }
 
-// Resolve once at module load time (you can also resolve per-request if you prefer)
 let APP_PUBLIC_BASE;
 let BACKEND_PUBLIC_BASE;
 
 try {
   APP_PUBLIC_BASE = resolveAppPublicBase();
 } catch (err) {
-  // If this throws in production, app should fail loudly in logs — but continue in non-production
   console.error("[BASE_URL] failed to resolve APP_PUBLIC_BASE:", err?.message || err);
-  // fallback to localhost for safety in dev
   APP_PUBLIC_BASE = process.env.APP_PUBLIC_BASE || "http://localhost:5173";
 }
 
@@ -137,6 +112,8 @@ const pickUserName = (reqUser, bookingUser) =>
   reqUser?.name ||
   (pickUserEmail(reqUser, bookingUser)?.split("@")[0]) ||
   "there";
+
+/* ---------------------- Seat initialization / locks ---------------------- */
 
 async function ensureSeatsInitialized(show) {
   if (Array.isArray(show.seats) && show.seats.length > 0) return show;
@@ -220,6 +197,106 @@ async function freeSeatsForBooking(booking) {
   } catch (err) {
     console.error("freeSeatsForBooking failed:", err);
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        Seat normalization utilities                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Expand a range/comma/label string into tokens.
+ * Examples:
+ *  "1-7" -> [1,2,3,4,5,6,7]
+ *  "5,6,7" -> [5,6,7]
+ *  "A-6,B-3" -> ["A-6","B-3"]
+ *  "6" -> [6]
+ */
+function expandRangeString(s) {
+  if (!s || typeof s !== "string") return [];
+  s = s.trim();
+  if (s.includes(",")) return s.split(",").map((p) => p.trim()).flatMap(expandRangeString);
+
+  if (/^\d+\s*-\s*\d+$/.test(s)) {
+    const [a, b] = s.split("-").map((x) => parseInt(x.trim(), 10)).sort((x, y) => x - y);
+    if (Number.isFinite(a) && Number.isFinite(b)) return Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  }
+
+  if (/^\d+$/.test(s)) return [Number(s)];
+
+  if (/^[A-Za-z]+\s*[-_\s]?\s*\d+$/.test(s) || /^[A-Za-z]+\d+$/.test(s)) {
+    const parts = s.split(/[-_\s]+/).filter(Boolean);
+    return [`${parts[0].toUpperCase()}-${parts[1]}`];
+  }
+
+  return [s];
+}
+
+/**
+ * Convert global numeric seat id to row/col using seatsPerRow (cols)
+ * Numeric ids are 1-indexed across the whole auditorium.
+ */
+function numericIdToRowCol(id, seatsPerRow) {
+  if (!Number.isFinite(id) || !Number.isInteger(id) || !seatsPerRow) return null;
+  const idx = id - 1;
+  const row = Math.floor(idx / seatsPerRow) + 1;
+  const col = (idx % seatsPerRow) + 1;
+  return { row, col };
+}
+
+/**
+ * Normalize raw seats input into array of { row, col, label }.
+ * Accepts arrays, numbers, strings like "1-7", "5,6", "A-6", or older objects.
+ */
+function normalizeSeatsRaw(rawSeats, seatsPerRow = 10) {
+  if (rawSeats == null) return [];
+  let arr = Array.isArray(rawSeats) ? rawSeats.slice() : expandRangeString(String(rawSeats));
+  const out = [];
+
+  for (const token of arr) {
+    if (token == null) continue;
+
+    // object shape {row, col, label}
+    if (typeof token === "object" && !Array.isArray(token)) {
+      const r = Number(token.row);
+      const c = Number(token.col);
+      if (Number.isFinite(r) && Number.isFinite(c)) {
+        out.push({ row: r, col: c, label: token.label || seatLabel(r, c) });
+      } else if (token.label) {
+        out.push({ row: null, col: null, label: String(token.label) });
+      }
+      continue;
+    }
+
+    // numeric token
+    if (typeof token === "number") {
+      const rc = numericIdToRowCol(token, seatsPerRow);
+      if (rc) out.push({ row: rc.row, col: rc.col, label: seatLabel(rc.row, rc.col) });
+      else out.push({ row: null, col: null, label: String(token) });
+      continue;
+    }
+
+    // string token like "A-6" or "12"
+    if (typeof token === "string") {
+      const t = token.trim();
+      if (/^[A-Za-z]+-\d+$/.test(t)) {
+        const parts = t.split("-");
+        const colNum = parseInt(parts[1], 10);
+        out.push({ row: null, col: Number.isFinite(colNum) ? colNum : null, label: t.toUpperCase() });
+      } else if (/^\d+$/.test(t)) {
+        const id = parseInt(t, 10);
+        const rc = numericIdToRowCol(id, seatsPerRow);
+        if (rc) out.push({ row: rc.row, col: rc.col, label: seatLabel(rc.row, rc.col) });
+        else out.push({ row: null, col: null, label: t });
+      } else {
+        out.push({ row: null, col: null, label: t });
+      }
+      continue;
+    }
+
+    out.push({ row: null, col: null, label: String(token) });
+  }
+
+  return out;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -369,7 +446,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
     await ensureSeatsInitialized(show);
     await reconcileLocks(show);
 
-    // --- normalize seats and add label property
+    // normalize seats and add label property
     const normSeats = seats.map((s) => {
       const r = Number(s.row);
       const c = Number(s.col);
@@ -526,10 +603,8 @@ router.post("/confirm", requireAuth, async (req, res) => {
           console.warn(tag, "No recipient email; skipping email send.");
         } else {
           const name = pickUserName(req.user, null);
-          // prefer labels if present
           const seatsText = normSeats.map((s) => s.label || `${s.row}-${s.col}`).join(", ");
 
-          // Short-lived token so *both* View link and PDF can open from email
           const linkToken = jwt.sign(
             { sub: String(req.user._id), role: "USER" },
             process.env.JWT_SECRET,
@@ -556,7 +631,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
               bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
               { name, email: to },
               show,
-              { baseUrl: APP_PUBLIC_BASE } // ✅ explicit baseUrl (comes from resolved APP_PUBLIC_BASE above)
+              { baseUrl: APP_PUBLIC_BASE }
             );
             if (buffer) {
               attachments.push({
@@ -600,18 +675,15 @@ router.get("/me", requireAuth, async (req, res) => {
         path: "showtime",
         populate: [
           { path: "movie", select: "title posterUrl runtime" },
-          { path: "screen", select: "name" },
+          { path: "screen", select: "name rows cols" },
         ],
       })
       .sort({ createdAt: -1 })
       .lean();
 
-    // ensure older bookings without label still show as row-col
     const normalized = bookings.map((b) => {
-      b.seats = (b.seats || []).map((s) => {
-        if (!s) return s;
-        return { row: s.row, col: s.col, label: s.label || seatLabel(s.row, s.col) };
-      });
+      const seatsPerRow = b.showtime?.screen?.cols || 10;
+      b.seats = normalizeSeatsRaw(b.seats, seatsPerRow);
       return b;
     });
 
@@ -643,7 +715,7 @@ router.get(
           path: "showtime",
           populate: [
             { path: "movie", select: "title posterUrl runtime" },
-            { path: "screen", select: "name" },
+            { path: "screen", select: "name rows cols" },
           ],
         })
         .populate({ path: "user", select: "name email" })
@@ -657,11 +729,9 @@ router.get(
         return res.status(403).json({ ok: false, error: "Forbidden" });
       }
 
-      // ensure seats have labels for older bookings
-      booking.seats = (booking.seats || []).map((s) => {
-        if (!s) return s;
-        return { row: s.row, col: s.col, label: s.label || seatLabel(s.row, s.col) };
-      });
+      // Normalize seats for older/new bookings
+      const seatsPerRow = booking.showtime?.screen?.cols || 10;
+      booking.seats = normalizeSeatsRaw(booking.seats, seatsPerRow);
 
       res.json({ ok: true, booking });
     } catch (err) {
@@ -694,7 +764,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
 
     (async () => {
       try {
-        // USER notification
         const notif = await Notification.create({
           audience: "USER",
           user: booking.user,
@@ -706,7 +775,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
         });
         try { pushNotification?.(notif); } catch {}
 
-        // ADMIN notification
         try {
           const adminNotif = await Notification.create({
             audience: "ADMIN",
@@ -719,7 +787,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
           pushNotification?.(adminNotif);
         } catch {}
 
-        // EMAIL
         const to = pickUserEmail(req.user, booking.user);
         if (!to) {
           console.warn("[delete cancel] No recipient email; skipping email send.");
@@ -775,20 +842,17 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
 
     (async () => {
       try {
-        // USER notification
         const notif = await Notification.create({
           audience: "USER",
           user: booking.user,
           type: "BOOKING_CANCELLED",
           title: "❌ Booking Cancelled",
           message: `Your booking for "${booking.showtime?.movie?.title || "a movie"}" has been cancelled.`,
-
           data: { bookingId: booking._id },
           channels: ["IN_APP", "EMAIL"],
         });
         try { pushNotification?.(notif); } catch {}
 
-        // ADMIN notification
         try {
           const adminNotif = await Notification.create({
             audience: "ADMIN",
@@ -801,7 +865,6 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
           pushNotification?.(adminNotif);
         } catch {}
 
-        // EMAIL
         const to = pickUserEmail(req.user, booking.user);
         if (!to) {
           console.warn(tag, "No recipient email; skipping email send.");
@@ -845,7 +908,6 @@ router.get("/calendar", requireAuth, async (req, res) => {
 
     const events = bookings
       .map((b) => ({
-
         id: b._id,
         title: b.showtime?.movie?.title || "Booking",
         start: b.showtime?.startTime,
@@ -886,7 +948,7 @@ router.get(
           path: "showtime",
           populate: [
             { path: "movie", select: "title posterUrl runtime" },
-            { path: "screen", select: "name" },
+            { path: "screen", select: "name rows cols" },
           ],
         })
         .populate({ path: "user", select: "name email" })
@@ -909,17 +971,15 @@ router.get(
         email: booking.user?.email || req.user?.email || undefined,
       };
 
-      // ensure seats have labels for PDF generation
-      booking.seats = (booking.seats || []).map((s) => {
-        if (!s) return s;
-        return { row: s.row, col: s.col, label: s.label || seatLabel(s.row, s.col) };
-      });
+      // Normalize seats for PDF generation (use screen.cols where available)
+      const seatsPerRow = booking.showtime?.screen?.cols || 10;
+      booking.seats = normalizeSeatsRaw(booking.seats, seatsPerRow);
 
       const { buffer } = await generateTicketPdf(
         booking,
         userForPdf,
         booking.showtime,
-        { baseUrl: APP_PUBLIC_BASE } // ✅ explicit baseUrl (resolved above)
+        { baseUrl: APP_PUBLIC_BASE } // explicit baseUrl
       );
 
       res.setHeader("Content-Type", "application/pdf");
