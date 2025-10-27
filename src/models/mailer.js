@@ -159,6 +159,18 @@ function makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo }) {
 }
 
 /* ------------------- Gmail API (OAuth2 HTTPS) ------------------- */
+const ACCESS_TOKEN_TIMEOUT_MS = 15000; // 15s
+const SEND_TIMEOUT_MS = 20000; // 20s
+
+async function getAccessTokenWithTimeout(oAuth2Client, timeoutMs = ACCESS_TOKEN_TIMEOUT_MS) {
+  return await Promise.race([
+    oAuth2Client.getAccessToken(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`getAccessToken timeout after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
+}
+
 async function sendViaGmailApi({ from, to, subject, html, text, cc, bcc, replyTo }) {
   const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_USER } = process.env;
 
@@ -174,24 +186,34 @@ async function sendViaGmailApi({ from, to, subject, html, text, cc, bcc, replyTo
     );
     oAuth2Client.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
 
-    const accessTokenRes = await oAuth2Client.getAccessToken();
+    console.log("[Mail][GmailAPI] requesting access token...");
+    const accessTokenRes = await getAccessTokenWithTimeout(oAuth2Client);
     const accessToken = accessTokenRes?.token || accessTokenRes;
     if (!accessToken) throw new Error("Failed to obtain Gmail access token");
 
     const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
     const raw = makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo });
 
-    const res = await gmail.users.messages.send({
+    const sendPromise = gmail.users.messages.send({
       userId: "me",
       requestBody: { raw },
     });
 
+    const res = await Promise.race([
+      sendPromise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`gmail.users.messages.send timeout after ${SEND_TIMEOUT_MS}ms`)), SEND_TIMEOUT_MS)
+      ),
+    ]);
+
     console.log(`[Mail] ✅ Gmail API sent to=${to} subject="${subject}" id=${res.data?.id}`);
     return { ok: true, provider: "gmail", messageId: res.data?.id };
   } catch (err) {
-    console.error("[Mail][GmailAPI] ❌ error:", err.message);
-    if (err.response?.data) console.error("Details:", err.response.data);
-    return { ok: false, error: err.message };
+    console.error("[Mail][GmailAPI] ❌ error:", err && (err.message || err));
+    if (err?.response?.data) console.error("Details:", JSON.stringify(err.response.data, null, 2));
+    else if (err?.errors) console.error("Errors:", JSON.stringify(err.errors, null, 2));
+    else console.error("Full error:", err);
+    return { ok: false, error: err.message || String(err), original: err };
   }
 }
 
@@ -226,8 +248,8 @@ async function sendViaSmtp({ from, to, subject, html, text, cc, bcc, replyTo }) 
     console.log(`[Mail] ✅ SMTP sent to=${to} subject="${subject}" id=${info.messageId}`);
     return { ok: true, provider: "smtp", messageId: info.messageId };
   } catch (err) {
-    console.error("[Mail][SMTP] ❌ error:", err.message);
-    return { ok: false, error: err.message };
+    console.error("[Mail][SMTP] ❌ error:", err && err.message ? err.message : err);
+    return { ok: false, error: err.message || String(err), original: err };
   }
 }
 
@@ -248,7 +270,6 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo, att
   if (gmailResult.ok) return gmailResult;
 
   // 2️⃣ Fallback to SMTP (attach attachments here via nodemailer if used)
-  // Note: our sendViaSmtp implementation currently ignores attachments param — include attachments support below if needed
   const smtpResult = await (async () => {
     try {
       const { GMAIL_USER, GMAIL_PASS } = process.env;
@@ -279,14 +300,14 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo, att
       console.log(`[Mail] ✅ SMTP sent to=${to} subject="${subject}" id=${info.messageId}`);
       return { ok: true, provider: "smtp", messageId: info.messageId };
     } catch (err) {
-      console.error("[Mail][SMTP] ❌ error:", err.message);
-      return { ok: false, error: err.message };
+      console.error("[Mail][SMTP] ❌ error:", err && (err.message || err));
+      return { ok: false, error: err.message || String(err), original: err };
     }
   })();
 
   if (smtpResult.ok) return smtpResult;
 
-  return { ok: false, error: `All mail methods failed: ${gmailResult.error}, ${smtpResult.error}` };
+  return { ok: false, error: `All mail methods failed: ${gmailResult.error}, ${smtpResult.error}`, original: { gmail: gmailResult.original, smtp: smtpResult.original } };
 }
 
 /* ------------------- URL builder helpers ------------------- */
@@ -332,6 +353,62 @@ export function createTicketUrls({ bookingId, token } = {}) {
 
   console.log("[Mailer] createTicketUrls ->", { bookingId, ticketPdfUrl, ticketViewUrl });
   return { ticketPdfUrl, ticketViewUrl };
+}
+
+/* ------------------- Reset URL builder & Reset template ------------------- */
+
+/**
+ * createResetUrl({ token, userId, email })
+ * Returns { resetFrontendUrl, resetBackendVerifyUrl }
+ * Ensures frontend link includes both token and email query params.
+ */
+export function createResetUrl({ token, userId, email } = {}) {
+  const PROD_BACKEND = "https://movie-ticket-booking-backend-o1m2.onrender.com";
+  const PROD_APP = "https://movieticketbooking-rajy.netlify.app";
+
+  const backendBaseEnv = (process.env.BACKEND_PUBLIC_BASE || process.env.BACKEND_URL || "").trim();
+  const appBaseEnv = (process.env.APP_PUBLIC_BASE || process.env.FRONTEND_PUBLIC_BASE || "").trim();
+  const localFrontend = `http://localhost:5173`;
+
+  const backendBase = backendBaseEnv || PROD_BACKEND;
+  const appBase = appBaseEnv || (process.env.NODE_ENV === "production" ? PROD_APP : localFrontend);
+
+  const clean = (u) => u.replace(/\/+$/, "");
+
+  const resetFrontendUrl = token
+    ? `${clean(appBase)}/reset-password?token=${encodeURIComponent(token)}${email ? `&email=${encodeURIComponent(email)}` : ""}`
+    : "#";
+
+  const resetBackendVerifyUrl = token
+    ? `${clean(backendBase)}/api/auth/verify-reset?token=${encodeURIComponent(token)}${email ? `&email=${encodeURIComponent(email)}` : ""}`
+    : "#";
+
+  return { resetFrontendUrl, resetBackendVerifyUrl };
+}
+
+/**
+ * resetPasswordTemplate({ name, resetUrl, expiresMinutes })
+ * Basic styled HTML for reset password email (matches your UI colors).
+ */
+export function resetPasswordTemplate({ name = "User", resetUrl = "#", expiresMinutes = 60 } = {}) {
+  const safeName = String(name || "User");
+  return `
+  <div style="font-family:Arial,Helvetica,sans-serif;background:#f9fafb;padding:20px;">
+    <div style="max-width:600px;margin:auto;background:#fff;padding:24px;border-radius:10px;border:1px solid #e6e6e6;">
+      <h2 style="color:#111827;margin-bottom:6px;">Reset your password</h2>
+      <p style="margin-top:0;color:#374151;">Hello <strong>${safeName}</strong>,</p>
+      <p style="color:#374151;">
+        We received a request to reset the password for your account. Click the button below to set a new password. This link will expire in <strong>${expiresMinutes} minutes</strong>.
+      </p>
+      <p style="text-align:center;margin:22px 0;">
+        <a href="${resetUrl}" style="display:inline-block;padding:12px 18px;background:#0071DC;color:#fff;text-decoration:none;border-radius:8px;">Reset Password</a>
+      </p>
+      <p style="color:#6b7280;font-size:13px;">If that button doesn't work, copy and paste this URL into your browser:<br/><a href="${resetUrl}" style="color:#2563eb;">${resetUrl}</a></p>
+      <hr style="margin:20px 0;border:none;border-top:1px solid #f1f1f1;">
+      <p style="font-size:12px;color:#6b7280;">If you didn't request a password reset, you can safely ignore this email.</p>
+    </div>
+  </div>
+  `;
 }
 
 /* ------------------- Templates ------------------- */
@@ -405,10 +482,13 @@ export function renderTemplate(name, data = {}) {
   return tpl(data);
 }
 
+/* ------------------- Default export ------------------- */
 export default {
   sendEmail,
   renderTemplate,
   bookingConfirmedTemplate,
   bookingCancelledTemplate,
   createTicketUrls,
+  createResetUrl,
+  resetPasswordTemplate,
 };
