@@ -147,6 +147,36 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
   return { ok: false, error: `All mail methods failed: ${gmailResult.error}, ${smtpResult.error}` };
 }
 
+/* ------------------- URL builder helpers ------------------- */
+
+/**
+ * createTicketUrls
+ * Builds ticketPdfUrl (served by backend) and ticketViewUrl (frontend link) using env vars.
+ *
+ * @param {Object} opts
+ *   - bookingId: string (required)
+ *   - token: string (optional) — recommended to include auth token as used previously
+ */
+export function createTicketUrls({ bookingId, token } = {}) {
+  const backendBase = process.env.BACKEND_PUBLIC_BASE || `http://localhost:${process.env.PORT || 10000}`;
+  const appBase = process.env.APP_PUBLIC_BASE || process.env.FRONTEND_PUBLIC_BASE || `http://localhost:5173`;
+
+  if (!bookingId) {
+    return { ticketPdfUrl: "#", ticketViewUrl: "#" };
+  }
+
+  // Ensure we don't end up with double slashes
+  const join = (base, path) => `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+
+  const pdfPath = `api/bookings/${bookingId}/pdf${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  const viewPath = `bookings/${bookingId}${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+
+  const ticketPdfUrl = join(backendBase, pdfPath);
+  const ticketViewUrl = join(appBase, viewPath);
+
+  return { ticketPdfUrl, ticketViewUrl };
+}
+
 /* ------------------- Templates ------------------- */
 export const bookingConfirmedTemplate = ({
   name = "Guest",
@@ -158,7 +188,15 @@ export const bookingConfirmedTemplate = ({
   ticketViewUrl = "#",
   supportEmail = "support@example.com",
   supportPhone = "+91-00000-00000",
-}) => `
+}) => {
+  // If caller didn't provide explicit urls, attempt to build them using env vars
+  if ((ticketPdfUrl === "#" || !ticketPdfUrl) && bookingId) {
+    const { ticketPdfUrl: builtPdf, ticketViewUrl: builtView } = createTicketUrls({ bookingId });
+    ticketPdfUrl = builtPdf;
+    ticketViewUrl = ticketViewUrl === "#" || !ticketViewUrl ? builtView : ticketViewUrl;
+  }
+
+  return `
   <div style="font-family:sans-serif;background:#f9fafb;padding:20px;">
     <div style="max-width:600px;margin:auto;background:#fff;padding:25px;border-radius:10px;">
       <h2 style="color:#2563eb;">🎟️ Booking Confirmed</h2>
@@ -173,7 +211,8 @@ export const bookingConfirmedTemplate = ({
       <p style="font-size:13px;color:#555;">Thank you for booking with Cineme by Site!</p>
     </div>
   </div>
-`;
+  `;
+};
 
 export const bookingCancelledTemplate = ({
   name = "Guest",
@@ -182,7 +221,13 @@ export const bookingCancelledTemplate = ({
   ticketViewUrl = "#",
   supportEmail = "support@example.com",
   supportPhone = "+91-00000-00000",
-}) => `
+}) => {
+  if ((ticketViewUrl === "#" || !ticketViewUrl) && bookingId) {
+    const { ticketViewUrl: builtView } = createTicketUrls({ bookingId });
+    ticketViewUrl = builtView;
+  }
+
+  return `
   <div style="font-family:sans-serif;background:#f9fafb;padding:20px;">
     <div style="max-width:600px;margin:auto;background:#fff;padding:25px;border-radius:10px;">
       <h2 style="color:#dc2626;">❌ Booking Cancelled</h2>
@@ -195,7 +240,8 @@ export const bookingCancelledTemplate = ({
       <p style="font-size:13px;color:#555;">We hope to see you again soon 💙 — The Cineme by Site Team</p>
     </div>
   </div>
-`;
+  `;
+};
 
 const TEMPLATES = {
   "booking-confirmed": bookingConfirmedTemplate,
@@ -210,4 +256,4 @@ export function renderTemplate(name, data = {}) {
   return tpl(data);
 }
 
-export default { sendEmail, renderTemplate, bookingConfirmedTemplate, bookingCancelledTemplate };
+export default { sendEmail, renderTemplate, bookingConfirmedTemplate, bookingCancelledTemplate, createTicketUrls };
