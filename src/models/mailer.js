@@ -19,7 +19,114 @@ function encodeSubject(subject) {
   return `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
 }
 
-/* Build RFC822 Gmail message */
+/* ------------------- Seat formatting helpers ------------------- */
+function numberToLetters(n) {
+  if (!Number.isFinite(n) || n <= 0) return null;
+  let num = Math.floor(n);
+  let letters = "";
+  while (num > 0) {
+    num -= 1;
+    letters = String.fromCharCode(65 + (num % 26)) + letters;
+    num = Math.floor(num / 26);
+  }
+  return letters;
+}
+
+function formatSeat(s) {
+  if (typeof s === "string") {
+    const trimmed = s.trim();
+    const hyphenMatch = trimmed.match(/^([A-Za-z]+)\s*-\s*(\d+)$/);
+    if (hyphenMatch) {
+      return `${hyphenMatch[1].toUpperCase()}-${hyphenMatch[2]}`;
+    }
+    const letterNumberMatch = trimmed.match(/^([A-Za-z]+)\s*?(\d+)$/);
+    if (letterNumberMatch) {
+      return `${letterNumberMatch[1].toUpperCase()}-${letterNumberMatch[2]}`;
+    }
+    return trimmed;
+  }
+
+  if (s && typeof s === "object") {
+    if (s.label && typeof s.label === "string") return formatSeat(s.label);
+    if (s.seat && typeof s.seat === "string") return formatSeat(s.seat);
+    if (s.name && typeof s.name === "string") return formatSeat(s.name);
+
+    const rowVal = s.row ?? s.r ?? s.rowNumber ?? s.row_idx ?? null;
+    const colVal = s.col ?? s.c ?? s.colNumber ?? s.column ?? s.seatNumber ?? null;
+
+    if (typeof rowVal === "string" && /^[A-Za-z]+$/.test(rowVal.trim())) {
+      const rowLetter = rowVal.trim().toUpperCase();
+      if (colVal != null) {
+        return `${rowLetter}-${colVal}`;
+      }
+      return rowLetter;
+    }
+
+    if (typeof rowVal === "number") {
+      const rowLetters = numberToLetters(rowVal);
+      if (rowLetters) {
+        if (colVal != null) return `${rowLetters}-${colVal}`;
+        return rowLetters;
+      }
+    }
+
+    try {
+      const keys = Object.keys(s || {});
+      if (keys.length === 1) {
+        const onlyKey = keys[0];
+        const value = s[onlyKey];
+        if (/^[A-Za-z]+$/.test(onlyKey) && (typeof value === "number" || /^[0-9]+$/.test(String(value)))) {
+          return `${onlyKey.toUpperCase()}-${value}`;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    try {
+      return JSON.stringify(s);
+    } catch (e) {
+      return String(s);
+    }
+  }
+
+  return String(s);
+}
+
+function formatSeats(seats) {
+  if (!seats) return "N/A";
+
+  if (typeof seats === "string") {
+    return seats
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .map((t) => formatSeat(t))
+      .join(", ");
+  }
+
+  if (Array.isArray(seats)) {
+    try {
+      const normalized = seats.map((s) => formatSeat(s));
+      return normalized.join(", ");
+    } catch (e) {
+      return String(seats);
+    }
+  }
+
+  if (typeof seats === "object") {
+    if (seats.seats) return formatSeats(seats.seats);
+    try {
+      return JSON.stringify(seats);
+    } catch (e) {
+      return String(seats);
+    }
+  }
+
+  return String(seats);
+}
+
+/* ------------------- Build RFC822 Gmail message ------------------- */
 function makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo }) {
   const boundary = "----=_Part_" + Date.now();
   const safeText = text || (html ? html.replace(/<[^>]*>/g, "") : "");
@@ -125,7 +232,7 @@ async function sendViaSmtp({ from, to, subject, html, text, cc, bcc, replyTo }) 
 }
 
 /* ------------------- Unified sendEmail ------------------- */
-export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
+export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo, attachments } = {}) {
   if (!to) return { ok: false, error: "'to' required" };
   if (!subject) return { ok: false, error: "'subject' required" };
   if (!html && !text) return { ok: false, error: "'html' or 'text' required" };
@@ -134,68 +241,96 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
     process.env.MAIL_FROM ||
     (process.env.GMAIL_USER ? `MovieBook <${process.env.GMAIL_USER}>` : "MovieBook <no-reply@moviebook.com>");
 
-  const payload = { from, to, subject, html, text, cc, bcc, replyTo };
+  const payload = { from, to, subject, html, text, cc, bcc, replyTo, attachments };
 
   // 1️⃣ Try Gmail API (preferred)
   const gmailResult = await sendViaGmailApi(payload);
   if (gmailResult.ok) return gmailResult;
 
-  // 2️⃣ Fallback to SMTP
-  const smtpResult = await sendViaSmtp(payload);
+  // 2️⃣ Fallback to SMTP (attach attachments here via nodemailer if used)
+  // Note: our sendViaSmtp implementation currently ignores attachments param — include attachments support below if needed
+  const smtpResult = await (async () => {
+    try {
+      const { GMAIL_USER, GMAIL_PASS } = process.env;
+      if (!GMAIL_USER || !GMAIL_PASS) {
+        throw new Error("GMAIL_USER or GMAIL_PASS missing for SMTP");
+      }
+      const transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+        pool: true,
+        maxConnections: 3,
+        maxMessages: 50,
+        tls: { minVersion: "TLSv1.2" },
+      });
+
+      const info = await transporter.sendMail({
+        from,
+        to,
+        subject,
+        html,
+        text,
+        cc,
+        bcc,
+        replyTo,
+        attachments, // pass attachments through to nodemailer
+      });
+
+      console.log(`[Mail] ✅ SMTP sent to=${to} subject="${subject}" id=${info.messageId}`);
+      return { ok: true, provider: "smtp", messageId: info.messageId };
+    } catch (err) {
+      console.error("[Mail][SMTP] ❌ error:", err.message);
+      return { ok: false, error: err.message };
+    }
+  })();
+
   if (smtpResult.ok) return smtpResult;
 
   return { ok: false, error: `All mail methods failed: ${gmailResult.error}, ${smtpResult.error}` };
 }
 
 /* ------------------- URL builder helpers ------------------- */
+/**
+ * createTicketUrls
+ * Uses your production backend/frontend URLs by default so emails never point to localhost:10000.
+ * You can still override by setting BACKEND_PUBLIC_BASE and/or APP_PUBLIC_BASE env vars.
+ */
 export function createTicketUrls({ bookingId, token } = {}) {
-  const backendBaseEnv = (process.env.BACKEND_PUBLIC_BASE || "").trim();
-  const appBaseEnv =
-    (process.env.APP_PUBLIC_BASE || process.env.FRONTEND_PUBLIC_BASE || "").trim();
+  // Your production URLs (used as defaults)
+  const PROD_BACKEND = "https://movie-ticket-booking-backend-o1m2.onrender.com";
+  const PROD_APP = "https://movieticketbooking-rajy.netlify.app";
 
-  const backendBaseDefault = `http://localhost:${process.env.PORT || 10000}`;
-  const appBaseDefault = `http://localhost:5173`;
+  // allow overrides via env
+  const backendBaseEnv = (process.env.BACKEND_PUBLIC_BASE || process.env.BACKEND_URL || "").trim();
+  const appBaseEnv = (process.env.APP_PUBLIC_BASE || process.env.FRONTEND_PUBLIC_BASE || "").trim();
 
-  const backendBase = backendBaseEnv || backendBaseDefault;
-  const appBase = appBaseEnv || appBaseDefault;
+  // local dev fallback for frontend only (still prefer env or prod values)
+  const localFrontend = `http://localhost:5173`;
+
+  const backendBase = backendBaseEnv || PROD_BACKEND;
+  const appBase = appBaseEnv || (process.env.NODE_ENV === "production" ? PROD_APP : localFrontend);
 
   if (!bookingId) {
     return { ticketPdfUrl: "#", ticketViewUrl: "#" };
   }
 
-  const join = (base, path) =>
-    `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+  const join = (base, path) => `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 
-  const pdfPath = `api/bookings/${bookingId}/pdf${
-    token ? `?token=${encodeURIComponent(token)}` : ""
-  }`;
-  const viewPath = `bookings/${bookingId}${
-    token ? `?token=${encodeURIComponent(token)}` : ""
-  }`;
+  const pdfPath = `api/bookings/${bookingId}/pdf${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  const viewPath = `bookings/${bookingId}${token ? `?token=${encodeURIComponent(token)}` : ""}`;
 
   let ticketPdfUrl = join(backendBase, pdfPath);
   let ticketViewUrl = join(appBase, viewPath);
 
-  // 🚫 Force-rewrite any localhost URLs to the configured production domains
+  // safety: if env overrides exist, rewrite any localhost occurrences to them
   if (backendBaseEnv) {
-    ticketPdfUrl = ticketPdfUrl.replace(
-      /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/gi,
-      backendBaseEnv
-    );
+    ticketPdfUrl = ticketPdfUrl.replace(/https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/gi, backendBaseEnv);
   }
   if (appBaseEnv) {
-    ticketViewUrl = ticketViewUrl.replace(
-      /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/gi,
-      appBaseEnv
-    );
+    ticketViewUrl = ticketViewUrl.replace(/https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/gi, appBaseEnv);
   }
 
-  console.log("[Mailer] createTicketUrls ->", {
-    bookingId,
-    ticketPdfUrl,
-    ticketViewUrl,
-  });
-
+  console.log("[Mailer] createTicketUrls ->", { bookingId, ticketPdfUrl, ticketViewUrl });
   return { ticketPdfUrl, ticketViewUrl };
 }
 
@@ -208,13 +343,13 @@ export const bookingConfirmedTemplate = ({
   bookingId = "0000",
   ticketPdfUrl = "#",
   ticketViewUrl = "#",
-}) => {
+} = {}) => {
+  const seatsText = formatSeats(seats);
+
   if ((ticketPdfUrl === "#" || !ticketPdfUrl) && bookingId) {
-    const { ticketPdfUrl: builtPdf, ticketViewUrl: builtView } =
-      createTicketUrls({ bookingId });
+    const { ticketPdfUrl: builtPdf, ticketViewUrl: builtView } = createTicketUrls({ bookingId });
     ticketPdfUrl = builtPdf;
-    ticketViewUrl =
-      ticketViewUrl === "#" || !ticketViewUrl ? builtView : ticketViewUrl;
+    ticketViewUrl = ticketViewUrl === "#" || !ticketViewUrl ? builtView : ticketViewUrl;
   }
 
   return `
@@ -223,7 +358,7 @@ export const bookingConfirmedTemplate = ({
       <h2 style="color:#2563eb;">🎟️ Booking Confirmed</h2>
       <p>Hello <b>${name}</b>,</p>
       <p>Your booking for <b>${movieTitle}</b> on ${showtime} has been confirmed!</p>
-      <p><b>Seats:</b> ${seats}</p>
+      <p><b>Seats:</b> ${seatsText}</p>
       <p><b>Booking ID:</b> ${bookingId}</p>
       <p><a href="${ticketPdfUrl}" style="background:#2563eb;color:#fff;padding:10px 15px;text-decoration:none;border-radius:6px;">Download Ticket</a></p>
       <p>You can also view your booking here:<br><a href="${ticketViewUrl}">${ticketViewUrl}</a></p>
@@ -238,7 +373,7 @@ export const bookingCancelledTemplate = ({
   movieTitle = "Unknown Movie",
   bookingId = "0000",
   ticketViewUrl = "#",
-}) => {
+} = {}) => {
   if ((ticketViewUrl === "#" || !ticketViewUrl) && bookingId) {
     const { ticketViewUrl: builtView } = createTicketUrls({ bookingId });
     ticketViewUrl = builtView;
