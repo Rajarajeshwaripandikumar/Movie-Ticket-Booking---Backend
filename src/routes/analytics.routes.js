@@ -230,33 +230,71 @@ router.get("/", async (req, res, next) => {
       { $sort: { occupancyRate: -1 } },
     ]);
 
-    // ---- Popular Movies ----
+    // ---- Popular Movies (robust lookup + embedded-title fallback) ----
     const popularMovies = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       { $match: { createdAt: { $gte: since } } },
+      // accept confirmed/paid only
       { $addFields: { _statusUpper: { $toUpper: { $ifNull: ["$status", ""] } } } },
       { $match: { _statusUpper: { $in: ["CONFIRMED", "PAID"] } } },
+
+      // Try to derive a consistent movie key (string): prefer embedded booking.movie._id, objectId movie, booking.movieId, or booking.movie (string)
+      {
+        $addFields: {
+          movieKey: {
+            $switch: {
+              branches: [
+                // embedded movie object with _id
+                { case: { $and: [{ $ne: ["$movie._id", null] }] }, then: { $toString: "$movie._id" } },
+                // movie as ObjectId stored directly
+                { case: { $eq: [{ $type: "$movie" }, "objectId"] }, then: { $toString: "$movie" } },
+                // explicit movieId field present
+                { case: { $ne: ["$movieId", null] }, then: { $toString: "$movieId" } },
+                // movie already a string title/id
+                { case: { $eq: [{ $type: "$movie" }, "string"] }, then: "$movie" },
+              ],
+              default: null,
+            },
+          },
+          // fallback embedded title (booking may include the movie title in booking.movie.title/name)
+          movieEmbeddedTitle: { $ifNull: ["$movie.title", { $ifNull: ["$movie.name", null] }] },
+        },
+      },
+
+      // If we have a movieKey use it for grouping, else use embedded title
+      {
+        $addFields: {
+          movieGroupKey: { $ifNull: ["$movieKey", "$movieEmbeddedTitle"] },
+        },
+      },
+
       {
         $group: {
-          _id: MOVIE_ID,
+          _id: "$movieGroupKey",
           bookings: { $sum: 1 },
           revenue: { $sum: AMOUNT_EXPR },
         },
       },
+
       { $sort: { bookings: -1 } },
       { $limit: 20 },
-      // try to resolve movie document if available
+
+      // Lookup movie doc by id (as string) OR by title/name matching the group key
       {
         $lookup: {
           from: "movies",
-          let: { mid: "$_id" },
+          let: { movieKey: "$_id" },
           pipeline: [
             {
               $match: {
                 $expr: {
                   $or: [
-                    { $eq: ["$_id", "$$mid"] },
-                    { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                    // match by objectId (stored as string)
+                    { $eq: [{ $toString: "$_id" }, "$$movieKey"] },
+                    // match by title text
+                    { $eq: ["$title", "$$movieKey"] },
+                    // match by name field
+                    { $eq: ["$name", "$$movieKey"] },
                   ],
                 },
               },
@@ -267,13 +305,13 @@ router.get("/", async (req, res, next) => {
         },
       },
       { $unwind: { path: "$movieDoc", preserveNullAndEmptyArrays: true } },
+
+      // Provide movieName using best available source (movieDoc.title, movieDoc.name, or the group key)
       {
         $project: {
           _id: 0,
           movieId: "$_id",
-          movieName: { $ifNull: ["$movieDoc.title", "$movieDoc.name", null] },
-          // keep 'movie' for older frontend shapes
-          movie: { $ifNull: ["$movieDoc.title", "$movieDoc.name", null] },
+          movieName: { $ifNull: ["$movieDoc.title", "$movieDoc.name", "$_id"] },
           bookings: 1,
           revenue: 1,
         },
@@ -295,8 +333,8 @@ router.get("/", async (req, res, next) => {
     // Normalize popularMovies to include movieName/movie and numeric fields the frontend expects
     const normalizedPopular = (popularMovies || []).map((m) => ({
       movieId: m.movieId ?? null,
-      movieName: m.movieName ?? m.movie ?? (m.movieId ? String(m.movieId) : "Unknown"),
-      movie: m.movieName ?? m.movie ?? (m.movieId ? String(m.movieId) : "Unknown"),
+      movieName: m.movieName ?? (m.movieId ? String(m.movieId) : "Unknown"),
+      movie: m.movieName ?? (m.movieId ? String(m.movieId) : "Unknown"),
       bookings: Number(m.bookings ?? 0),
       revenue: Number(m.revenue ?? 0),
       totalBookings: Number(m.bookings ?? 0),
@@ -353,20 +391,43 @@ router.get("/movies/popular", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
     const limit = Number(req.query.limit || 10);
+
     const data = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       { $match: { createdAt: { $gte: since } } },
       { $addFields: { _statusUpper: { $toUpper: { $ifNull: ["$status", ""] } } } },
       { $match: { _statusUpper: { $in: ["CONFIRMED", "PAID"] } } },
+
+      // derive movie key or embedded title
+      {
+        $addFields: {
+          movieKey: {
+            $switch: {
+              branches: [
+                { case: { $and: [{ $ne: ["$movie._id", null] }] }, then: { $toString: "$movie._id" } },
+                { case: { $eq: [{ $type: "$movie" }, "objectId"] }, then: { $toString: "$movie" } },
+                { case: { $ne: ["$movieId", null] }, then: { $toString: "$movieId" } },
+                { case: { $eq: [{ $type: "$movie" }, "string"] }, then: "$movie" },
+              ],
+              default: null,
+            },
+          },
+          movieEmbeddedTitle: { $ifNull: ["$movie.title", { $ifNull: ["$movie.name", null] }] },
+        },
+      },
+
+      { $addFields: { movieGroupKey: { $ifNull: ["$movieKey", "$movieEmbeddedTitle"] } } },
+
       {
         $group: {
-          _id: MOVIE_ID,
+          _id: "$movieGroupKey",
           totalBookings: { $sum: 1 },
           totalRevenue: { $sum: AMOUNT_EXPR },
         },
       },
       { $sort: { totalBookings: -1 } },
       { $limit: limit },
+
       {
         $lookup: {
           from: "movies",
@@ -376,8 +437,9 @@ router.get("/movies/popular", async (req, res, next) => {
               $match: {
                 $expr: {
                   $or: [
-                    { $eq: ["$_id", "$$mid"] },
                     { $eq: [{ $toString: "$_id" }, "$$mid"] },
+                    { $eq: ["$title", "$$mid"] },
+                    { $eq: ["$name", "$$mid"] },
                   ],
                 },
               },
@@ -392,18 +454,16 @@ router.get("/movies/popular", async (req, res, next) => {
         $project: {
           _id: 0,
           movieId: "$_id",
-          movieName: { $ifNull: ["$m.title", "$m.name", null] },
-          movie: { $ifNull: ["$m.title", "$m.name", null] },
+          movieName: { $ifNull: ["$m.title", "$m.name", "$_id"] },
           totalBookings: 1,
           totalRevenue: 1,
         },
       },
     ]);
 
-    // Normalize to frontend-friendly shape (include movieName fallback)
     const out = (data || []).map((d) => ({
       movieId: d.movieId ?? null,
-      movieName: d.movieName ?? d.movie ?? (d.movieId ? String(d.movieId) : "Unknown"),
+      movieName: d.movieName ?? (d.movieId ? String(d.movieId) : "Unknown"),
       totalBookings: Number(d.totalBookings ?? 0),
       totalRevenue: Number(d.totalRevenue ?? 0),
       bookings: Number(d.totalBookings ?? 0),
