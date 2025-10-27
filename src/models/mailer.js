@@ -3,10 +3,9 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { google } from "googleapis";
-import nodemailer from "nodemailer"; // used only for Ethereal fallback
-import fetch from "node-fetch";
+import nodemailer from "nodemailer";
 
-/* ---------------- helpers ---------------- */
+/* ------------------- Helpers ------------------- */
 function base64UrlEncode(str) {
   return Buffer.from(str)
     .toString("base64")
@@ -15,15 +14,16 @@ function base64UrlEncode(str) {
     .replace(/=+$/, "");
 }
 
-/* ✅ FIXED: properly encode subject with UTF-8 (so emoji & symbols render) */
+function encodeSubject(subject) {
+  if (!subject) return "";
+  return `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+}
+
+/* Build RFC822 Gmail message */
 function makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo }) {
   const boundary = "----=_Part_" + Date.now();
   const safeText = text || (html ? html.replace(/<[^>]*>/g, "") : "");
-
-  // RFC 2047 encoded subject
-  const encodedSubject = subject
-    ? `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`
-    : "";
+  const encodedSubject = encodeSubject(subject);
 
   let lines = [];
   lines.push(`From: ${from}`);
@@ -47,22 +47,16 @@ function makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo }) {
   lines.push("");
   lines.push(html || safeText);
   lines.push(`--${boundary}--`);
-
   const message = lines.join("\r\n");
   return base64UrlEncode(message);
 }
 
-/* ---------------- Gmail API sender (HTTPS) ---------------- */
+/* ------------------- Gmail API (OAuth2 HTTPS) ------------------- */
 async function sendViaGmailApi({ from, to, subject, html, text, cc, bcc, replyTo }) {
-  const {
-    GMAIL_CLIENT_ID,
-    GMAIL_CLIENT_SECRET,
-    GMAIL_REFRESH_TOKEN,
-    GMAIL_USER,
-  } = process.env;
+  const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_USER } = process.env;
 
   if (!GMAIL_CLIENT_ID || !GMAIL_CLIENT_SECRET || !GMAIL_REFRESH_TOKEN || !GMAIL_USER) {
-    return { ok: false, error: "Gmail OAuth2 env vars missing" };
+    return { ok: false, error: "Gmail OAuth2 credentials missing" };
   }
 
   try {
@@ -75,11 +69,44 @@ async function sendViaGmailApi({ from, to, subject, html, text, cc, bcc, replyTo
 
     const accessTokenRes = await oAuth2Client.getAccessToken();
     const accessToken = accessTokenRes?.token || accessTokenRes;
-    if (!accessToken) return { ok: false, error: "Failed to obtain Gmail access token" };
+    if (!accessToken) throw new Error("Failed to obtain Gmail access token");
 
     const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
-    const raw = makeRawMessage({
-      from: from || `MovieBook <${GMAIL_USER}>`,
+    const raw = makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo });
+
+    const res = await gmail.users.messages.send({
+      userId: "me",
+      requestBody: { raw },
+    });
+
+    console.log(`[Mail] ✅ Gmail API sent to=${to} subject="${subject}" id=${res.data?.id}`);
+    return { ok: true, provider: "gmail", messageId: res.data?.id };
+  } catch (err) {
+    console.error("[Mail][GmailAPI] ❌ error:", err.message);
+    if (err.response?.data) console.error("Details:", err.response.data);
+    return { ok: false, error: err.message };
+  }
+}
+
+/* ------------------- SMTP (App Password fallback) ------------------- */
+async function sendViaSmtp({ from, to, subject, html, text, cc, bcc, replyTo }) {
+  try {
+    const { GMAIL_USER, GMAIL_PASS } = process.env;
+    if (!GMAIL_USER || !GMAIL_PASS) {
+      throw new Error("GMAIL_USER or GMAIL_PASS missing for SMTP");
+    }
+
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 50,
+      tls: { minVersion: "TLSv1.2" },
+    });
+
+    const info = await transporter.sendMail({
+      from,
       to,
       subject,
       html,
@@ -89,118 +116,38 @@ async function sendViaGmailApi({ from, to, subject, html, text, cc, bcc, replyTo
       replyTo,
     });
 
-    const res = await gmail.users.messages.send({
-      userId: "me",
-      requestBody: { raw },
-    });
-
-    return { ok: true, messageId: res.data?.id, rawResponse: res.data };
+    console.log(`[Mail] ✅ SMTP sent to=${to} subject="${subject}" id=${info.messageId}`);
+    return { ok: true, provider: "smtp", messageId: info.messageId };
   } catch (err) {
-    console.error("[Mail][GmailAPI] error:", err && err.stack ? err.stack : err);
-    return { ok: false, error: err?.message || String(err) };
+    console.error("[Mail][SMTP] ❌ error:", err.message);
+    return { ok: false, error: err.message };
   }
 }
 
-/* ---------------- SendGrid HTTPS fallback ---------------- */
-async function sendViaSendGrid({ from, to, subject, html, text }) {
-  const key = process.env.SENDGRID_API_KEY;
-  const fromEmail = process.env.SG_FROM || from || "no-reply@moviebook.com";
-  if (!key) return { ok: false, error: "SENDGRID_API_KEY not set" };
-
-  const body = {
-    personalizations: [{ to: [{ email: to }] }],
-    from: { email: fromEmail },
-    subject,
-    content: [{ type: "text/html", value: html || text || "" }],
-  };
-
-  try {
-    const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const txt = await r.text();
-      console.error("[Mail][SendGrid] error:", r.status, txt);
-      return { ok: false, status: r.status, error: txt };
-    }
-    return { ok: true };
-  } catch (err) {
-    console.error("[Mail][SendGrid] fetch error:", err && err.stack ? err.stack : err);
-    return { ok: false, error: err?.message || String(err) };
-  }
-}
-
-/* ---------------- export sendEmail that auto-selects ---------------- */
+/* ------------------- Unified sendEmail ------------------- */
 export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
   if (!to) return { ok: false, error: "'to' required" };
   if (!subject) return { ok: false, error: "'subject' required" };
   if (!html && !text) return { ok: false, error: "'html' or 'text' required" };
 
-  const fromEnv =
+  const from =
     process.env.MAIL_FROM ||
-    (process.env.GMAIL_USER
-      ? `MovieBook <${process.env.GMAIL_USER}>`
-      : "MovieBook <no-reply@moviebook.com>");
+    (process.env.GMAIL_USER ? `MovieBook <${process.env.GMAIL_USER}>` : "MovieBook <no-reply@moviebook.com>");
 
-  const payload = { from: fromEnv, to, subject, html, text, cc, bcc, replyTo };
+  const payload = { from, to, subject, html, text, cc, bcc, replyTo };
 
-  // 1️⃣ Try Gmail API
-  if (
-    process.env.GMAIL_CLIENT_ID &&
-    process.env.GMAIL_CLIENT_SECRET &&
-    process.env.GMAIL_REFRESH_TOKEN &&
-    process.env.GMAIL_USER
-  ) {
-    const r = await sendViaGmailApi(payload);
-    if (r.ok) {
-      console.log("[Mail] Sent via Gmail API:", to, subject);
-      return r;
-    }
-    console.warn("[Mail] Gmail API failed, falling back if possible:", r.error);
-  }
+  // 1️⃣ Try Gmail API (preferred on Render)
+  const gmailResult = await sendViaGmailApi(payload);
+  if (gmailResult.ok) return gmailResult;
 
-  // 2️⃣ Try SendGrid
-  if (process.env.SENDGRID_API_KEY) {
-    const r = await sendViaSendGrid(payload);
-    if (r.ok) {
-      console.log("[Mail] Sent via SendGrid:", to, subject);
-      return r;
-    }
-    console.warn("[Mail] SendGrid failed:", r.error);
-    return r;
-  }
+  // 2️⃣ Fallback to SMTP if Gmail API fails
+  const smtpResult = await sendViaSmtp(payload);
+  if (smtpResult.ok) return smtpResult;
 
-  // 3️⃣ Local dev fallback: Ethereal
-  try {
-    const acct = await nodemailer.createTestAccount();
-    const transporter = nodemailer.createTransport({
-      host: acct.smtp.host,
-      port: acct.smtp.port,
-      secure: acct.smtp.secure,
-      auth: { user: acct.user, pass: acct.pass },
-    });
-    const info = await transporter.sendMail({
-      from: fromEnv,
-      to,
-      subject,
-      text: text || (html ? html.replace(/<[^>]*>/g, "") : ""),
-      html,
-    });
-    const preview = nodemailer.getTestMessageUrl(info);
-    console.log("[Mail][Ethereal] preview:", preview);
-    return { ok: true, previewUrl: preview, messageId: info.messageId };
-  } catch (err) {
-    console.error("[Mail] final fallback failed:", err && err.stack ? err.stack : err);
-    return { ok: false, error: err?.message || String(err) };
-  }
+  return { ok: false, error: `All mail methods failed: ${gmailResult.error}, ${smtpResult.error}` };
 }
 
-/* ---------------- Templates ---------------- */
+/* ------------------- Templates ------------------- */
 export const bookingConfirmedTemplate = ({
   name = "Guest",
   movieTitle = "Unknown Movie",
@@ -219,9 +166,7 @@ export const bookingConfirmedTemplate = ({
       <p>Your booking for <b>${movieTitle}</b> on ${showtime} has been confirmed!</p>
       <p><b>Seats:</b> ${seats}</p>
       <p><b>Booking ID:</b> ${bookingId}</p>
-      <p>
-        <a href="${ticketPdfUrl}" style="background:#2563eb;color:#fff;padding:10px 15px;text-decoration:none;border-radius:6px;">Download Ticket</a>
-      </p>
+      <p><a href="${ticketPdfUrl}" style="background:#2563eb;color:#fff;padding:10px 15px;text-decoration:none;border-radius:6px;">Download Ticket</a></p>
       <p>You can also view your booking here:<br><a href="${ticketViewUrl}">${ticketViewUrl}</a></p>
       <hr style="margin:25px 0;">
       <p>Need help?<br>
@@ -261,10 +206,8 @@ export const bookingCancelledTemplate = ({
 const TEMPLATES = {
   "booking-confirmed": bookingConfirmedTemplate,
   bookingConfirmed: bookingConfirmedTemplate,
-  booking_confirmed: bookingConfirmedTemplate,
   "booking-cancelled": bookingCancelledTemplate,
   bookingCancelled: bookingCancelledTemplate,
-  booking_cancelled: bookingCancelledTemplate,
 };
 
 export function renderTemplate(name, data = {}) {
