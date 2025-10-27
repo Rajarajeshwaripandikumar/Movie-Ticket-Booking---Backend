@@ -169,11 +169,8 @@ export const bookingConfirmedTemplate = ({
       <p><a href="${ticketPdfUrl}" style="background:#2563eb;color:#fff;padding:10px 15px;text-decoration:none;border-radius:6px;">Download Ticket</a></p>
       <p>You can also view your booking here:<br><a href="${ticketViewUrl}">${ticketViewUrl}</a></p>
       <hr style="margin:25px 0;">
-      <p>Need help?<br>
-        📧 <a href="mailto:${supportEmail}">${supportEmail}</a><br>
-        ☎️ <a href="tel:${supportPhone}">${supportPhone}</a>
-      </p>
-      <p style="font-size:13px;color:#555;">Thank you for booking with MovieBook!</p>
+   
+      <p style="font-size:13px;color:#555;">Thank you for booking with Cineme by Site!</p>
     </div>
   </div>
 `;
@@ -194,11 +191,8 @@ export const bookingCancelledTemplate = ({
       <p>If this was a mistake, you can rebook anytime:<br>
       <a href="${ticketViewUrl}" style="color:#2563eb;">Rebook Now</a></p>
       <hr style="margin:25px 0;">
-      <p>Need help?<br>
-        📧 <a href="mailto:${supportEmail}">${supportEmail}</a><br>
-        ☎️ <a href="tel:${supportPhone}">${supportPhone}</a>
-      </p>
-      <p style="font-size:13px;color:#555;">We hope to see you again soon 💙 — The MovieBook Team</p>
+      
+      <p style="font-size:13px;color:#555;">We hope to see you again soon 💙 — The Cineme by Site Team</p>
     </div>
   </div>
 `;
