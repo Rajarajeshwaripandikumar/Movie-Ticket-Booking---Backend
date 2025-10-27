@@ -78,9 +78,9 @@ const normalizeCreatedAtStage = [
     $addFields: {
       createdAt: {
         $cond: [
-          { $eq: [{ $type: "$__created_raw" }, "date"] },
-          "$__created_raw",
-          { $toDate: "$__created_raw" },
+          { $eq: [{ $type: " $__created_raw" }, "date"] },
+          " $__created_raw",
+          { $toDate: " $__created_raw" },
         ],
       },
     },
@@ -160,7 +160,7 @@ router.get("/", async (req, res, next) => {
       {
         $group: {
           _id: "$_d",
-          total: { $sum: "$__amount_safe" },
+          total: { $sum: " $__amount_safe" },
           bookings: { $sum: 1 },
         },
       },
@@ -183,7 +183,7 @@ router.get("/", async (req, res, next) => {
       { $sort: { date: 1 } },
     ]);
 
-    /* ---------- occupancy (robust: match string/ObjectId and include referenced-by-bookings) ---------- */
+    /* ---------- occupancy (robust: fallback totalSeats from showtime -> theater, and robust booked seat counting) ---------- */
     const occupancy = await Showtime.aggregate([
       // helper string id for comparisons
       { $addFields: { _idStr: { $toString: "$_id" } } },
@@ -210,33 +210,83 @@ router.get("/", async (req, res, next) => {
               }
             },
             // keep only fields needed for seat counting
-            { $project: { seats: 1, seatsBooked: 1 } }
+            { $project: { seats: 1, seatsBooked: 1, quantity: 1 } }
           ],
           as: "bks"
-        }
-      },
-
-      // compute totalSeats for showtime and total booked seats from matched bookings
-      {
-        $project: {
-          theater: 1,
-          totalSeats: { $size: { $ifNull: ["$seats", []] } },
-          // sum up seat counts from each booking (supports bookings.seats array or seatsBooked)
-          booked: {
-            $sum: {
-              $map: {
-                input: { $ifNull: ["$bks", []] },
-                as: "b",
-                in: { $size: { $ifNull: ["$$b.seats", { $ifNull: ["$$b.seatsBooked", []] }] } }
-              }
-            }
-          }
         }
       },
 
       // attach theater doc (robust)
       { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
       { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+
+      // compute totalSeats for showtime using fallbacks
+      {
+        $addFields: {
+          showtimeSeatsCount: { $size: { $ifNull: ["$seats", []] } },
+          showtimeCapacity: { $ifNull: ["$capacity", "$totalSeats", null] },
+          theaterCapacity: { $ifNull: ["$t.capacity", { $ifNull: ["$t.totalSeats", null] }, null] }
+        }
+      },
+      {
+        $addFields: {
+          totalSeats: {
+            $cond: [
+              { $gt: ["$showtimeSeatsCount", 0] },
+              "$showtimeSeatsCount",
+              {
+                $cond: [
+                  { $gt: ["$showtimeCapacity", null] },
+                  "$showtimeCapacity",
+                  { $ifNull: ["$theaterCapacity", 0] }
+                ]
+              }
+            ]
+          }
+        }
+      },
+
+      // compute booked seats robustly
+      {
+        $addFields: {
+          booked: {
+            $sum: {
+              $map: {
+                input: { $ifNull: ["$bks", []] },
+                as: "b",
+                in: {
+                  $let: {
+                    vars: {
+                      seatsArraySize: { $size: { $ifNull: ["$$b.seats", []] } },
+                      seatsBookedNum: { $ifNull: ["$$b.seatsBooked", null] },
+                      qtyNum: { $ifNull: ["$$b.quantity", null] }
+                    },
+                    in: {
+                      $cond: [
+                        { $gt: ["$$seatsArraySize", 0] },
+                        "$$seatsArraySize",
+                        {
+                          $cond: [
+                            { $ne: ["$$seatsBookedNum", null] },
+                            "$$seatsBookedNum",
+                            {
+                              $cond: [
+                                { $ne: ["$$qtyNum", null] },
+                                "$$qtyNum",
+                                1
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
 
       // group by theater name (provide fallbacks)
       {
@@ -443,7 +493,7 @@ router.get("/revenue/trends", async (req, res, next) => {
       },
       ...dayProject,
       { $addFields: { __amount_safe: AMOUNT_SAFE } },
-      { $group: { _id: "$_d", totalRevenue: { $sum: "$__amount_safe" }, bookings: { $sum: 1 } } },
+      { $group: { _id: "$_d", totalRevenue: { $sum: " $__amount_safe" }, bookings: { $sum: 1 } } },
       { $sort: { _id: 1 } },
       { $project: { date: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
     ]);
@@ -580,44 +630,129 @@ router.get("/movies/popular", async (req, res, next) => {
   }
 });
 
+// ---------- Updated standalone occupancy endpoint (robust counting + fallbacks)
 router.get("/occupancy", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
+
     const data = await Showtime.aggregate([
+      // only consider showtimes in the requested window
       { $match: { startTime: { $gte: since } } },
-      { $lookup: { from: "bookings", localField: "_id", foreignField: "showtime", as: "bks" } },
+
+      // lookup bookings with robust match (string/ObjectId)
       {
-        $project: {
-          theater: 1,
-          totalSeats: { $size: { $ifNull: ["$seats", []] } },
+        $lookup: {
+          from: "bookings",
+          let: { sid: "$_id", sidStr: { $toString: "$_id" } },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$showtime", "$$sid"] },
+                    { $eq: ["$showtime", "$$sidStr"] },
+                    { $eq: ["$showtimeId", "$$sid"] },
+                    { $eq: ["$showtimeId", "$$sidStr"] }
+                  ]
+                },
+                createdAt: { $gte: since }
+              }
+            },
+            { $project: { seats: 1, seatsBooked: 1, quantity: 1 } }
+          ],
+          as: "bks"
+        }
+      },
+
+      // bring theater doc
+      { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
+      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+
+      // compute totalSeats with fallbacks
+      {
+        $addFields: {
+          showtimeSeatsCount: { $size: { $ifNull: ["$seats", []] } },
+          showtimeCapacity: { $ifNull: ["$capacity", "$totalSeats", null] },
+          theaterCapacity: { $ifNull: ["$t.capacity", "$t.totalSeats", null] }
+        }
+      },
+      {
+        $addFields: {
+          totalSeats: {
+            $cond: [
+              { $gt: ["$showtimeSeatsCount", 0] },
+              "$showtimeSeatsCount",
+              {
+                $cond: [
+                  { $gt: ["$showtimeCapacity", null] },
+                  "$showtimeCapacity",
+                  { $ifNull: ["$theaterCapacity", 0] }
+                ]
+              }
+            ]
+          }
+        }
+      },
+
+      // booked seats (robust)
+      {
+        $addFields: {
           booked: {
             $sum: {
               $map: {
-                input: "$bks",
+                input: { $ifNull: ["$bks", []] },
                 as: "b",
-                in: { $size: { $ifNull: ["$$b.seats", { $ifNull: ["$$b.seatsBooked", []] }] } },
-              },
-            },
-          },
-        },
+                in: {
+                  $let: {
+                    vars: {
+                      seatsArraySize: { $size: { $ifNull: ["$$b.seats", []] } },
+                      seatsBookedNum: { $ifNull: ["$$b.seatsBooked", null] },
+                      qtyNum: { $ifNull: ["$$b.quantity", null] }
+                    },
+                    in: {
+                      $cond: [
+                        { $gt: ["$$seatsArraySize", 0] },
+                        "$$seatsArraySize",
+                        {
+                          $cond: [
+                            { $ne: ["$$seatsBookedNum", null] },
+                            "$$seatsBookedNum",
+                            {
+                              $cond: [
+                                { $ne: ["$$qtyNum", null] },
+                                "$$qtyNum",
+                                1
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       },
-      { $lookup: { from: "theaters", localField: "theater", foreignField: "_id", as: "t" } },
-      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+
+      // group by theater
       {
         $group: {
           _id: {
-            name: { $ifNull: ["$t.name", "$t.title", "Unknown"] },
+            name: { $ifNull: ["$t.name", "$t.title", "Unknown"] }
           },
           occupancyRate: {
             $avg: {
-              $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0],
-            },
-          },
-        },
+              $cond: [{ $gt: ["$totalSeats", 0] }, { $divide: ["$booked", "$totalSeats"] }, 0]
+            }
+          }
+        }
       },
       { $project: { _id: 0, theaterName: "$_id.name", occupancyRate: 1 } },
-      { $sort: { occupancyRate: -1 } },
+      { $sort: { occupancyRate: -1 } }
     ]);
+
     res.json(data);
   } catch (e) {
     debug("occupancy error:", e && e.message);
