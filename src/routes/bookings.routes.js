@@ -38,12 +38,95 @@ function seatLabel(row, col) {
   return `${rowToLabel(row)}${col}`;
 }
 
-// Frontend base (for SPA/QR/view links)
-const APP_PUBLIC_BASE =
-  process.env.APP_PUBLIC_BASE || process.env.APP_BASE_URL || "http://localhost:5173";
-// Backend base (for direct API links in emails)
-const BACKEND_PUBLIC_BASE =
-  process.env.BACKEND_PUBLIC_BASE || `http://localhost:${process.env.PORT || 8080}`;
+// ----------------- Normalized base URL helpers -----------------
+
+function normalizeCandidate(candidate) {
+  if (!candidate) return null;
+  let s = String(candidate).trim();
+  if (!s) return null;
+  // If environment provided a Netlify-style URL with protocol already (Netlify's URL often includes https://)
+  if (!/^https?:\/\//i.test(s)) {
+    // prefer https unless explicitly http provided
+    s = `https://${s}`;
+  }
+  return s.replace(/\/$/, "");
+}
+
+/**
+ * Resolve the public frontend base URL used for SPA links / QR codes
+ * Priority:
+ * 1. APP_PUBLIC_BASE (explicit env)
+ * 2. CLIENT_BASE_URL (common name)
+ * 3. FRONTEND_BASE_URL
+ * 4. APP_BASE_URL
+ * 5. process.env.URL (Netlify)
+ * 6. fallback to localhost dev
+ */
+function resolveAppPublicBase() {
+  const candidates = [
+    process.env.APP_PUBLIC_BASE,
+    process.env.CLIENT_BASE_URL,
+    process.env.FRONTEND_BASE_URL,
+    process.env.APP_BASE_URL,
+    process.env.VITE_APP_BASE_URL,
+    process.env.REACT_APP_BASE_URL,
+    process.env.NEXT_PUBLIC_BASE_URL,
+    process.env.URL, // Netlify sometimes sets this
+  ].filter(Boolean);
+
+  const picked = candidates.length > 0 ? normalizeCandidate(candidates[0]) : null;
+
+  // If running in production we should avoid defaulting to localhost silently.
+  if (process.env.NODE_ENV === "production") {
+    if (picked && picked !== "http://localhost:5173") {
+      console.info("[BASE_URL] APP_PUBLIC_BASE resolved (production):", picked);
+      return picked;
+    }
+    // try forcing CLIENT_BASE_URL specifically
+    if (process.env.CLIENT_BASE_URL) {
+      const cb = normalizeCandidate(process.env.CLIENT_BASE_URL);
+      console.warn("[BASE_URL] production but initial resolve was unsafe — forcing CLIENT_BASE_URL:", cb);
+      return cb;
+    }
+    // Throw to surface config error in logs rather than issuing localhost links silently
+    throw new Error(
+      "Missing frontend base URL in production. Set APP_PUBLIC_BASE or CLIENT_BASE_URL environment variable."
+    );
+  }
+
+  // not production: return picked or default localhost dev URL
+  const result = picked || "http://localhost:5173";
+  console.info("[BASE_URL] APP_PUBLIC_BASE resolved:", result);
+  return result;
+}
+
+/**
+ * Resolve backend public base (used for direct API/pdf links in emails)
+ * Priority:
+ * 1. BACKEND_PUBLIC_BASE env
+ * 2. constructs from request host is not available here, so fallback to http://localhost:<PORT>
+ */
+function resolveBackendPublicBase() {
+  const picked = process.env.BACKEND_PUBLIC_BASE || null;
+  const normalized = normalizeCandidate(picked) || `http://localhost:${process.env.PORT || 8080}`;
+  console.info("[BASE_URL] BACKEND_PUBLIC_BASE resolved:", normalized);
+  return normalized;
+}
+
+// Resolve once at module load time (you can also resolve per-request if you prefer)
+let APP_PUBLIC_BASE;
+let BACKEND_PUBLIC_BASE;
+
+try {
+  APP_PUBLIC_BASE = resolveAppPublicBase();
+} catch (err) {
+  // If this throws in production, app should fail loudly in logs — but continue in non-production
+  console.error("[BASE_URL] failed to resolve APP_PUBLIC_BASE:", err?.message || err);
+  // fallback to localhost for safety in dev
+  APP_PUBLIC_BASE = process.env.APP_PUBLIC_BASE || "http://localhost:5173";
+}
+
+BACKEND_PUBLIC_BASE = resolveBackendPublicBase();
 
 const fmtTime = (d) =>
   new Date(d).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
@@ -473,7 +556,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
               bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
               { name, email: to },
               show,
-              { baseUrl: APP_PUBLIC_BASE } // ✅ correct option name
+              { baseUrl: APP_PUBLIC_BASE } // ✅ explicit baseUrl (comes from resolved APP_PUBLIC_BASE above)
             );
             if (buffer) {
               attachments.push({
@@ -699,6 +782,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
           type: "BOOKING_CANCELLED",
           title: "❌ Booking Cancelled",
           message: `Your booking for "${booking.showtime?.movie?.title || "a movie"}" has been cancelled.`,
+
           data: { bookingId: booking._id },
           channels: ["IN_APP", "EMAIL"],
         });
@@ -835,7 +919,7 @@ router.get(
         booking,
         userForPdf,
         booking.showtime,
-        { baseUrl: APP_PUBLIC_BASE } // ✅ correct option name
+        { baseUrl: APP_PUBLIC_BASE } // ✅ explicit baseUrl (resolved above)
       );
 
       res.setHeader("Content-Type", "application/pdf");
