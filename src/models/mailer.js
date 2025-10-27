@@ -15,24 +15,16 @@ function base64UrlEncode(str) {
     .replace(/=+$/, "");
 }
 
-/* ✅ FIXED: properly encode subject with UTF-8 (so emoji & symbols render) */
 function makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo }) {
   const boundary = "----=_Part_" + Date.now();
   const safeText = text || (html ? html.replace(/<[^>]*>/g, "") : "");
-
-  // RFC 2047 encoded subject
-  const encodedSubject = subject
-    ? `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`
-    : "";
-
   let lines = [];
   lines.push(`From: ${from}`);
   lines.push(`To: ${to}`);
   if (cc) lines.push(`Cc: ${cc}`);
   if (bcc) lines.push(`Bcc: ${bcc}`);
   if (replyTo) lines.push(`Reply-To: ${replyTo}`);
-  if (encodedSubject) lines.push(`Subject: ${encodedSubject}`);
-  lines.push(`Date: ${new Date().toUTCString()}`);
+  lines.push(`Subject: ${subject}`);
   lines.push("MIME-Version: 1.0");
   lines.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
   lines.push("");
@@ -47,7 +39,6 @@ function makeRawMessage({ from, to, subject, html, text, cc, bcc, replyTo }) {
   lines.push("");
   lines.push(html || safeText);
   lines.push(`--${boundary}--`);
-
   const message = lines.join("\r\n");
   return base64UrlEncode(message);
 }
@@ -73,11 +64,15 @@ async function sendViaGmailApi({ from, to, subject, html, text, cc, bcc, replyTo
     );
     oAuth2Client.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
 
+    // googleapis will refresh the token if needed
     const accessTokenRes = await oAuth2Client.getAccessToken();
     const accessToken = accessTokenRes?.token || accessTokenRes;
-    if (!accessToken) return { ok: false, error: "Failed to obtain Gmail access token" };
+    if (!accessToken) {
+      return { ok: false, error: "Failed to obtain Gmail access token" };
+    }
 
     const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
+
     const raw = makeRawMessage({
       from: from || `MovieBook <${GMAIL_USER}>`,
       to,
@@ -141,21 +136,11 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
   if (!subject) return { ok: false, error: "'subject' required" };
   if (!html && !text) return { ok: false, error: "'html' or 'text' required" };
 
-  const fromEnv =
-    process.env.MAIL_FROM ||
-    (process.env.GMAIL_USER
-      ? `MovieBook <${process.env.GMAIL_USER}>`
-      : "MovieBook <no-reply@moviebook.com>");
-
+  const fromEnv = process.env.MAIL_FROM || (process.env.GMAIL_USER ? `MovieBook <${process.env.GMAIL_USER}>` : "MovieBook <no-reply@moviebook.com>");
   const payload = { from: fromEnv, to, subject, html, text, cc, bcc, replyTo };
 
-  // 1️⃣ Try Gmail API
-  if (
-    process.env.GMAIL_CLIENT_ID &&
-    process.env.GMAIL_CLIENT_SECRET &&
-    process.env.GMAIL_REFRESH_TOKEN &&
-    process.env.GMAIL_USER
-  ) {
+  // 1) Try Gmail API (HTTPS)
+  if (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN && process.env.GMAIL_USER) {
     const r = await sendViaGmailApi(payload);
     if (r.ok) {
       console.log("[Mail] Sent via Gmail API:", to, subject);
@@ -164,7 +149,7 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
     console.warn("[Mail] Gmail API failed, falling back if possible:", r.error);
   }
 
-  // 2️⃣ Try SendGrid
+  // 2) Try SendGrid (if configured)
   if (process.env.SENDGRID_API_KEY) {
     const r = await sendViaSendGrid(payload);
     if (r.ok) {
@@ -175,7 +160,7 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
     return r;
   }
 
-  // 3️⃣ Local dev fallback: Ethereal
+  // 3) Local dev fallback: Ethereal
   try {
     const acct = await nodemailer.createTestAccount();
     const transporter = nodemailer.createTransport({
@@ -200,7 +185,7 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
   }
 }
 
-/* ---------------- Templates ---------------- */
+/* ---------------- Templates (your existing templates) ---------------- */
 export const bookingConfirmedTemplate = ({
   name = "Guest",
   movieTitle = "Unknown Movie",
