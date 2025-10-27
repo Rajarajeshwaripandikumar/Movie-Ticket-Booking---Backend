@@ -101,6 +101,38 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
+/**
+ * Additional robust CORS header middleware:
+ * - Ensure Access-Control-Allow-Origin is explicitly set on every response
+ * - Set Vary: Origin so CDNs/proxies cache correctly per-origin
+ * - Short-circuit OPTIONS requests if not already handled
+ *
+ * This helps ensure that platforms (Render, proxies) don't strip the header
+ * or that some routes that send raw streaming responses still include the header.
+ */
+app.use((req, res, next) => {
+  try {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    } else if (process.env.FRONTEND_ORIGIN) {
+      res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
+      res.setHeader("Vary", "Origin");
+    }
+    // ensure these are present for browsers during preflight
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept");
+    // if you use cookies or other credentials, keep this true and avoid wildcard origin
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    if (req.method === "OPTIONS") return res.sendStatus(corsOptions.optionsSuccessStatus || 204);
+  } catch (err) {
+    // continue even if header-setting fails
+    console.warn("[CORS-middleware] header set failed:", err?.message || err);
+  }
+  next();
+});
+
 /* -------------------------- Optional COOP / COEP --------------------------- */
 if (process.env.ENABLE_COOP_COEP === "true") {
   console.log("COOP/COEP enabled (cross-origin isolation). Make sure resources are CORP-compatible.");
@@ -205,6 +237,7 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
   The old local sseStreamHandler that wrote comments/sampleTicker is removed.
 */
 // SSE preflight (OPTIONS)
+// ensure both /api/notifications/stream and /notifications/stream are covered
 app.options("/api/notifications/stream", sse.ssePreflight);
 app.get("/api/notifications/stream", sse.sseHandler);
 
