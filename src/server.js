@@ -11,6 +11,9 @@ import cors from "cors";
 import helmet from "helmet";
 import { v2 as cloudinary } from "cloudinary";
 
+// SSE helpers (start watcher + emit snapshots)
+import sse from "./socket/sse.js";
+
 // import your app if it exports one (optional)
 import appRoutes from "./app.js";
 
@@ -336,6 +339,19 @@ try {
   console.warn("[mount] router auto-mount skipped:", e?.message || e);
 }
 
+/* --------------------------- Dev helper routes --------------------------- */
+// Dev-only: trigger analytics snapshot to admin clients
+app.post("/dev/emit-snapshot", express.json(), async (req, res) => {
+  try {
+    const days = Number(req.body?.days || req.query?.days || 30);
+    const delivered = await sse.emitAnalyticsSnapshot({ days });
+    res.json({ delivered });
+  } catch (err) {
+    console.error("/dev/emit-snapshot error", err);
+    res.status(500).json({ error: "emit_failed", message: String(err) });
+  }
+});
+
 /* ---------------------- Runtime environment debug info --------------------- */
 console.log("🔍 Runtime env check (sensitive values hidden)");
 console.log("  NODE_ENV =", process.env.NODE_ENV || "development");
@@ -461,6 +477,21 @@ async function start() {
     await connectWithRetry(MONGO_URI, 6);
     app.locals.dbReady = true;
     console.log("✅ MongoDB ready");
+
+    // Start SSE helpers: change-stream watcher + periodic snapshot emitter
+    try {
+      sse.startBookingWatcher();
+      const SNAPSHOT_INTERVAL_MS = Number(process.env.SNAPSHOT_INTERVAL_MS || 60_000);
+      if (SNAPSHOT_INTERVAL_MS > 0) {
+        setInterval(() => {
+          sse.emitAnalyticsSnapshot().catch((err) => console.error("emitAnalyticsSnapshot failed", err));
+        }, SNAPSHOT_INTERVAL_MS);
+      }
+      console.log("SSE helpers started: booking watcher + snapshot emitter");
+    } catch (err) {
+      console.error("Failed starting SSE helpers:", err);
+    }
+
   } catch (err) {
     console.error("❌ Failed to start app:", err);
     process.exit(1);
