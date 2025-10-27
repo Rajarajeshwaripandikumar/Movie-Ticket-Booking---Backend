@@ -61,42 +61,6 @@ Job cleans expired holds every minute
 
 Optimistic UI updates via Socket.IO
 
-# ⚙️ Environment
-
-Create backend/.env:
-
-# Core
-PORT=8080
-
-NODE_ENV=production
-
-CLIENT_URL=https://your-frontend.netlify.app
-
-MONGO_URI=mongodb+srv://user:pass@cluster/dbname
-
-JWT_ACCESS_SECRET=base64_256bit_here
-
-JWT_REFRESH_SECRET=base64_256bit_here
-
-# Payments 
-
-PAYMENT_PROVIDER=razorpay                
-
-RAZORPAY_KEY_ID=rzp_test_xxx
-
-RAZORPAY_KEY_SECRET=xxx
-
-RAZORPAY_WEBHOOK_SECRET=whsec_xxx
-
-# Email/SMS
-
-SMTP_HOST=smtp.gmail.com
-
-SMTP_PORT=587
-
-SMTP_USER=rajarajeshwaripandikumar@gmail.com
-
-SMTP_PASS=app_password
 
 
 # 📚 API (high level)
