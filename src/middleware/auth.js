@@ -5,17 +5,47 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 /**
  * Middleware: Verify JWT and attach user info to req.user
+ *
+ * Token lookup order:
+ *  1. Authorization header "Bearer <token>"
+ *  2. req.cookies.token (cookie) - recommended for EventSource (SSE)
+ *  3. req.query.token - allowed only for stream endpoints or non-production (to avoid leaking tokens)
  */
 export const requireAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "Missing Authorization header" });
-  }
-
-  const token = authHeader.slice(7);
-
   try {
+    // 1) Header
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+      token = authHeader.slice(7).trim();
+    }
+
+    // 2) Cookie (if no Authorization header)
+    if (!token) {
+      // cookie-parser must be mounted in app.js for req.cookies to exist
+      if (req.cookies && req.cookies.token) {
+        token = String(req.cookies.token);
+      }
+    }
+
+    // 3) Query param token — only allow for SSE (`/stream`) or in development
+    if (!token && req.query && req.query.token) {
+      const allowQuery =
+        String(process.env.NODE_ENV || "development") !== "production" ||
+        (req.path && req.path.includes("/stream"));
+      if (allowQuery) {
+        token = String(req.query.token);
+      } else {
+        // If not allowed, treat as missing
+        console.warn("[Auth] Query token present but not allowed in production for this path:", req.path);
+      }
+    }
+
+    if (!token) {
+      return res.status(401).json({ message: "Missing Authorization token" });
+    }
+
+    // Verify token
     const decoded = jwt.verify(token, JWT_SECRET);
 
     const rawId = decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId;
@@ -46,7 +76,7 @@ export const requireAuth = (req, res, next) => {
 
     next();
   } catch (err) {
-    console.error("[Auth] Invalid token:", err.message);
+    console.error("[Auth] Invalid token:", err && err.message);
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 };
