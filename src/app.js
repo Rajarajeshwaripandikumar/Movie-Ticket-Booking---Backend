@@ -119,6 +119,28 @@ app.use((req, _res, next) => {
   next();
 });
 
+/* ---------------------------------------------------------------------------
+   Pre-auth helper: copy ?token=... into Authorization header for SSE stream
+   This runs BEFORE route auth middleware. It only targets the exact SSE path:
+   /api/analytics/stream (trailing slash allowed).
+   --------------------------------------------------------------------------- */
+app.use((req, _res, next) => {
+  try {
+    if (
+      !req.headers.authorization &&
+      req.path &&
+      (req.path === "/api/analytics/stream" || req.path === "/api/analytics/stream/") &&
+      req.query &&
+      req.query.token
+    ) {
+      req.headers.authorization = `Bearer ${String(req.query.token)}`;
+    }
+  } catch (e) {
+    // ignore
+  }
+  next();
+});
+
 // ─────────────────────────────── ROUTES ───────────────────────────────
 // Health check
 app.get("/api/health", (_req, res) =>
@@ -160,30 +182,10 @@ app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
 app.use("/api/screens", screensRoutes);
 
 // Analytics (protected)
-// Accept token via ?token=... (useful for SSE / EventSource where custom headers are not possible).
-// This middleware is gated to non-production to reduce token leakage risk.
-// It copies req.query.token into req.headers.authorization before auth middleware runs.
-if (process.env.NODE_ENV !== "production") {
-  app.use(
-    "/api/analytics",
-    (req, _res, next) => {
-      try {
-        if (!req.headers.authorization && req.query && req.query.token) {
-          req.headers.authorization = `Bearer ${String(req.query.token)}`;
-        }
-      } catch (e) {
-        // ignore
-      }
-      next();
-    },
-    requireAuth,
-    requireAdmin,
-    analyticsRoutes
-  );
-} else {
-  // Production: do not accept tokens via query param — require proper Authorization header.
-  app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
-}
+// Previous approach optionally allowed query token for the whole analytics mount.
+// Now the SSE-specific pre-auth above handles the EventSource case; keep normal
+// auth for the analytics endpoints.
+app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
 
 // ─────────────────────────────── 404 HANDLER ───────────────────────────────
 app.use((req, res, next) => {
