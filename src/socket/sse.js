@@ -6,6 +6,8 @@ const debug = debugFactory("app:sse");
 
 /* ----------------------------- config ------------------------------ */
 const JWT_SECRET = process.env.JWT_SECRET || process.env.JWT_SECRET_BASE64 || "dev_jwt_secret_change_me";
+// Optionally provide a public key for RS256 tokens via JWT_PUBLIC_KEY (PEM)
+const JWT_PUBLIC_KEY = process.env.JWT_PUBLIC_KEY || null;
 const APP_ORIGIN = process.env.APP_ORIGIN || "*"; // set to your frontend origin in production
 const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
 const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
@@ -50,7 +52,7 @@ function extractToken(req) {
   if (!token && cookies.token) token = cookies.token;
   if (!token && cookies.access_token) token = cookies.access_token;
   if (!token && cookies.jwt) token = cookies.jwt;
-  // try last-event-id style or URL-embedded token (defensive)
+  // defensive: try last-event-id style or URL-embedded token
   if (!token && req.originalUrl) {
     try {
       const full = new URL(req.originalUrl, `http://${req.headers.host}`);
@@ -65,6 +67,7 @@ function sanitizeToken(raw) {
   let t = raw.trim();
   try { t = decodeURIComponent(t); } catch {}
   t = t.replace(/:\d+$/, ""); // strip accidental :1 suffix
+  // ensure it looks like a JWT (three parts). If not, return null.
   if ((t.match(/\./g) || []).length !== 2) return null;
   return t;
 }
@@ -81,11 +84,22 @@ function roleFromDecoded(decoded) {
 // Map<channelKey, Set<res>>
 global.sseClients = global.sseClients || new Map();
 
+/* -------------------------- CORS origin resolver -------------------- */
+function resolveOrigin(req) {
+  // If APP_ORIGIN explicitly set to something other than "*", use it
+  if (APP_ORIGIN && APP_ORIGIN !== "*") return APP_ORIGIN;
+  // Otherwise, echo request origin if present (required when using credentials)
+  return req.headers.origin || "*";
+}
+
 /* -------------------------- CORS preflight ------------------------- */
 export const ssePreflight = (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
+  const origin = resolveOrigin(req);
+  res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
+  // allow the headers EventSource clients may need; last-event-id is useful
   res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, last-event-id");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.status(204).end();
 };
 
@@ -95,17 +109,28 @@ export const sseHandler = async (req, res) => {
     const { token: rawToken, cookies } = extractToken(req);
     const token = sanitizeToken(rawToken);
 
-    debug("SSE connection attempt", { url: req.originalUrl, hasAuthHeader: Boolean(req.headers.authorization), hasToken: Boolean(token) });
+    debug("SSE connection attempt", {
+      url: req.originalUrl,
+      origin: req.headers.origin,
+      hasAuthHeader: Boolean(req.headers.authorization),
+      hasToken: Boolean(token),
+      cookies: Object.keys(cookies || {}),
+    });
 
     if (!token) {
       // return a simple text 401 (EventSource expects non-200 to indicate failure)
-      res.status(401).type("text").send("Unauthorized: missing token (provide ?token= or Bearer header or cookie)");
+      res.status(401).type("text").send("Unauthorized: missing token — provide ?token=YOUR_JWT or set cookie 'token'/'access_token'");
       return;
     }
 
     let decoded;
     try {
-      decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], ignoreExpiration: false });
+      // support optional RS256 public-key verification if JWT_PUBLIC_KEY is provided
+      if (JWT_PUBLIC_KEY) {
+        decoded = jwt.verify(token, JWT_PUBLIC_KEY, { algorithms: ["RS256"], ignoreExpiration: false });
+      } else {
+        decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], ignoreExpiration: false });
+      }
     } catch (err) {
       debug("Invalid JWT for SSE:", err && err.message);
       res.status(401).type("text").send(`Unauthorized: invalid token (${err && err.name})`);
@@ -124,11 +149,12 @@ export const sseHandler = async (req, res) => {
     const scope = String(req.query?.scope || "user").toLowerCase();
     const channel = isAdmin && scope === "admin" ? "admin" : userId;
 
-    // SSE headers
+    // SSE headers (CORS aware)
+    const origin = resolveOrigin(req);
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
-    res.setHeader("Access-Control-Allow-Origin", APP_ORIGIN);
+    res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
     // retry hint for clients
     res.write("retry: 10000\n\n");
@@ -138,7 +164,9 @@ export const sseHandler = async (req, res) => {
     const current = global.sseClients.get(channel) || new Set();
     if (current.size >= MAX_CLIENTS_PER_USER) {
       sseWrite(res, { event: "error", data: { message: "too_many_connections" } });
-      return res.end();
+      // give client a short message then close
+      try { res.end(); } catch {}
+      return;
     }
 
     // register client
