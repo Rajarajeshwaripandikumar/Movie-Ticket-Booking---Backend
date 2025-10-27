@@ -136,11 +136,11 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
 
   const payload = { from, to, subject, html, text, cc, bcc, replyTo };
 
-  // 1️⃣ Try Gmail API (preferred on Render)
+  // 1️⃣ Try Gmail API (preferred)
   const gmailResult = await sendViaGmailApi(payload);
   if (gmailResult.ok) return gmailResult;
 
-  // 2️⃣ Fallback to SMTP if Gmail API fails
+  // 2️⃣ Fallback to SMTP
   const smtpResult = await sendViaSmtp(payload);
   if (smtpResult.ok) return smtpResult;
 
@@ -148,31 +148,53 @@ export async function sendEmail({ to, subject, html, text, cc, bcc, replyTo }) {
 }
 
 /* ------------------- URL builder helpers ------------------- */
-
-/**
- * createTicketUrls
- * Builds ticketPdfUrl (served by backend) and ticketViewUrl (frontend link) using env vars.
- *
- * @param {Object} opts
- *   - bookingId: string (required)
- *   - token: string (optional) — recommended to include auth token as used previously
- */
 export function createTicketUrls({ bookingId, token } = {}) {
-  const backendBase = process.env.BACKEND_PUBLIC_BASE || `http://localhost:${process.env.PORT || 10000}`;
-  const appBase = process.env.APP_PUBLIC_BASE || process.env.FRONTEND_PUBLIC_BASE || `http://localhost:5173`;
+  const backendBaseEnv = (process.env.BACKEND_PUBLIC_BASE || "").trim();
+  const appBaseEnv =
+    (process.env.APP_PUBLIC_BASE || process.env.FRONTEND_PUBLIC_BASE || "").trim();
+
+  const backendBaseDefault = `http://localhost:${process.env.PORT || 10000}`;
+  const appBaseDefault = `http://localhost:5173`;
+
+  const backendBase = backendBaseEnv || backendBaseDefault;
+  const appBase = appBaseEnv || appBaseDefault;
 
   if (!bookingId) {
     return { ticketPdfUrl: "#", ticketViewUrl: "#" };
   }
 
-  // Ensure we don't end up with double slashes
-  const join = (base, path) => `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+  const join = (base, path) =>
+    `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 
-  const pdfPath = `api/bookings/${bookingId}/pdf${token ? `?token=${encodeURIComponent(token)}` : ""}`;
-  const viewPath = `bookings/${bookingId}${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  const pdfPath = `api/bookings/${bookingId}/pdf${
+    token ? `?token=${encodeURIComponent(token)}` : ""
+  }`;
+  const viewPath = `bookings/${bookingId}${
+    token ? `?token=${encodeURIComponent(token)}` : ""
+  }`;
 
-  const ticketPdfUrl = join(backendBase, pdfPath);
-  const ticketViewUrl = join(appBase, viewPath);
+  let ticketPdfUrl = join(backendBase, pdfPath);
+  let ticketViewUrl = join(appBase, viewPath);
+
+  // 🚫 Force-rewrite any localhost URLs to the configured production domains
+  if (backendBaseEnv) {
+    ticketPdfUrl = ticketPdfUrl.replace(
+      /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/gi,
+      backendBaseEnv
+    );
+  }
+  if (appBaseEnv) {
+    ticketViewUrl = ticketViewUrl.replace(
+      /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/gi,
+      appBaseEnv
+    );
+  }
+
+  console.log("[Mailer] createTicketUrls ->", {
+    bookingId,
+    ticketPdfUrl,
+    ticketViewUrl,
+  });
 
   return { ticketPdfUrl, ticketViewUrl };
 }
@@ -186,14 +208,13 @@ export const bookingConfirmedTemplate = ({
   bookingId = "0000",
   ticketPdfUrl = "#",
   ticketViewUrl = "#",
-  supportEmail = "support@example.com",
-  supportPhone = "+91-00000-00000",
 }) => {
-  // If caller didn't provide explicit urls, attempt to build them using env vars
   if ((ticketPdfUrl === "#" || !ticketPdfUrl) && bookingId) {
-    const { ticketPdfUrl: builtPdf, ticketViewUrl: builtView } = createTicketUrls({ bookingId });
+    const { ticketPdfUrl: builtPdf, ticketViewUrl: builtView } =
+      createTicketUrls({ bookingId });
     ticketPdfUrl = builtPdf;
-    ticketViewUrl = ticketViewUrl === "#" || !ticketViewUrl ? builtView : ticketViewUrl;
+    ticketViewUrl =
+      ticketViewUrl === "#" || !ticketViewUrl ? builtView : ticketViewUrl;
   }
 
   return `
@@ -207,11 +228,9 @@ export const bookingConfirmedTemplate = ({
       <p><a href="${ticketPdfUrl}" style="background:#2563eb;color:#fff;padding:10px 15px;text-decoration:none;border-radius:6px;">Download Ticket</a></p>
       <p>You can also view your booking here:<br><a href="${ticketViewUrl}">${ticketViewUrl}</a></p>
       <hr style="margin:25px 0;">
-   
       <p style="font-size:13px;color:#555;">Thank you for booking with Cineme by Site!</p>
     </div>
-  </div>
-  `;
+  </div>`;
 };
 
 export const bookingCancelledTemplate = ({
@@ -219,8 +238,6 @@ export const bookingCancelledTemplate = ({
   movieTitle = "Unknown Movie",
   bookingId = "0000",
   ticketViewUrl = "#",
-  supportEmail = "support@example.com",
-  supportPhone = "+91-00000-00000",
 }) => {
   if ((ticketViewUrl === "#" || !ticketViewUrl) && bookingId) {
     const { ticketViewUrl: builtView } = createTicketUrls({ bookingId });
@@ -233,14 +250,11 @@ export const bookingCancelledTemplate = ({
       <h2 style="color:#dc2626;">❌ Booking Cancelled</h2>
       <p>Hello <b>${name}</b>,</p>
       <p>Your booking for <b>${movieTitle}</b> (ID: ${bookingId}) has been cancelled.</p>
-      <p>If this was a mistake, you can rebook anytime:<br>
-      <a href="${ticketViewUrl}" style="color:#2563eb;">Rebook Now</a></p>
+      <p>You can rebook anytime:<br><a href="${ticketViewUrl}" style="color:#2563eb;">Rebook Now</a></p>
       <hr style="margin:25px 0;">
-      
       <p style="font-size:13px;color:#555;">We hope to see you again soon 💙 — The Cineme by Site Team</p>
     </div>
-  </div>
-  `;
+  </div>`;
 };
 
 const TEMPLATES = {
@@ -256,4 +270,10 @@ export function renderTemplate(name, data = {}) {
   return tpl(data);
 }
 
-export default { sendEmail, renderTemplate, bookingConfirmedTemplate, bookingCancelledTemplate, createTicketUrls };
+export default {
+  sendEmail,
+  renderTemplate,
+  bookingConfirmedTemplate,
+  bookingCancelledTemplate,
+  createTicketUrls,
+};
