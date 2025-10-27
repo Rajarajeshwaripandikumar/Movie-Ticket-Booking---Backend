@@ -160,7 +160,30 @@ app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
 app.use("/api/screens", screensRoutes);
 
 // Analytics (protected)
-app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
+// Accept token via ?token=... (useful for SSE / EventSource where custom headers are not possible).
+// This middleware is gated to non-production to reduce token leakage risk.
+// It copies req.query.token into req.headers.authorization before auth middleware runs.
+if (process.env.NODE_ENV !== "production") {
+  app.use(
+    "/api/analytics",
+    (req, _res, next) => {
+      try {
+        if (!req.headers.authorization && req.query && req.query.token) {
+          req.headers.authorization = `Bearer ${String(req.query.token)}`;
+        }
+      } catch (e) {
+        // ignore
+      }
+      next();
+    },
+    requireAuth,
+    requireAdmin,
+    analyticsRoutes
+  );
+} else {
+  // Production: do not accept tokens via query param — require proper Authorization header.
+  app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
+}
 
 // ─────────────────────────────── 404 HANDLER ───────────────────────────────
 app.use((req, res, next) => {
