@@ -200,94 +200,16 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
 
 /* ----------------------------- SSE / EventSource --------------------------- */
 /*
-  Consolidated SSE handler reused for both /api/notifications/stream and /notifications/stream
-  Supports token via ?token= (copied to Authorization header by tokenQueryToHeader) or Authorization header.
+  Use the centralized SSE module (socket/sse.js) which handles authentication,
+  client registration, init payloads (notifications), and push helpers.
+  The old local sseStreamHandler that wrote comments/sampleTicker is removed.
 */
-function setSseCorsHeaders(req, res) {
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else if (process.env.FRONTEND_ORIGIN) {
-    res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-}
+// SSE preflight (OPTIONS)
+app.options("/api/notifications/stream", sse.ssePreflight);
+app.get("/api/notifications/stream", sse.sseHandler);
 
-function sseStreamHandler(req, res) {
-  try {
-    // Set CORS & SSE headers
-    setSseCorsHeaders(req, res);
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    // Accept token from ?token= or Authorization header (tokenQueryToHeader already copies ?token into Authorization)
-    const token = req.query.token || (req.headers.authorization ? req.headers.authorization.split(" ")[1] : undefined);
-
-    // temporary log for debugging
-    console.log("[SSE HIT]", { path: req.originalUrl, hasAuthHeader: Boolean(req.headers.authorization), tokenPresent: Boolean(token) });
-
-    // initial comment to establish connection
-    try { res.write(": connected\n\n"); } catch (err) {}
-
-    // heartbeat (keep connection alive through proxies)
-    const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
-    const keepAlive = setInterval(() => {
-      if (res.writableEnded || res.destroyed) return;
-      try {
-        res.write(`: heartbeat ${Date.now()}\n\n`);
-      } catch (e) {}
-    }, HEARTBEAT_MS);
-
-    // example periodic sample data (replace with real notification push logic)
-    const sampleTicker = setInterval(() => {
-      if (res.writableEnded || res.destroyed) return;
-      try {
-        const data = { msg: "heartbeat", at: new Date().toISOString() };
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-      } catch (e) {}
-    }, 60000);
-
-    // cleanup on close/error
-    const cleanup = () => {
-      try { clearInterval(keepAlive); } catch {}
-      try { clearInterval(sampleTicker); } catch {}
-      try { res.end(); } catch {}
-    };
-
-    req.on("close", cleanup);
-    req.on("end", cleanup);
-    res.on("error", (err) => {
-      console.log("[SSE socket error]", err && err.message);
-      cleanup();
-    });
-
-    // keep the response open
-    return;
-  } catch (err) {
-    console.error("[sseStreamHandler] error:", err && err.stack ? err.stack : err);
-    try {
-      if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
-    } catch {}
-  }
-}
-
-// Register OPTIONS + GET for both /api/notifications/stream and /notifications/stream
-app.options("/api/notifications/stream", (req, res) => {
-  setSseCorsHeaders(req, res);
-  return res.sendStatus(204);
-});
-app.get("/api/notifications/stream", sseStreamHandler);
-
-app.options("/notifications/stream", (req, res) => {
-  setSseCorsHeaders(req, res);
-  return res.sendStatus(204);
-});
-app.get("/notifications/stream", sseStreamHandler);
+app.options("/notifications/stream", sse.ssePreflight);
+app.get("/notifications/stream", sse.sseHandler);
 
 /* ----------------------------- /api/upload route --------------------------- */
 import multer from "multer";
@@ -341,16 +263,18 @@ try {
 
 /* --------------------------- Dev helper routes --------------------------- */
 // Dev-only: trigger analytics snapshot to admin clients
-app.post("/dev/emit-snapshot", express.json(), async (req, res) => {
-  try {
-    const days = Number(req.body?.days || req.query?.days || 30);
-    const delivered = await sse.emitAnalyticsSnapshot({ days });
-    res.json({ delivered });
-  } catch (err) {
-    console.error("/dev/emit-snapshot error", err);
-    res.status(500).json({ error: "emit_failed", message: String(err) });
-  }
-});
+if ((process.env.NODE_ENV || "development") !== "production") {
+  app.post("/dev/emit-snapshot", express.json(), async (req, res) => {
+    try {
+      const days = Number(req.body?.days || req.query?.days || 30);
+      const delivered = await sse.emitAnalyticsSnapshot({ days });
+      res.json({ delivered });
+    } catch (err) {
+      console.error("/dev/emit-snapshot error", err);
+      res.status(500).json({ error: "emit_failed", message: String(err) });
+    }
+  });
+}
 
 /* ---------------------- Runtime environment debug info --------------------- */
 console.log("🔍 Runtime env check (sensitive values hidden)");
