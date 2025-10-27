@@ -59,6 +59,81 @@ function resolveBaseUrl(optsBaseUrl) {
 }
 
 /**
+ * Convert 1-based numeric row -> alphabetic label
+ * 1 -> A, 2 -> B, ..., 26 -> Z, 27 -> AA, etc.
+ */
+function numberToLetters(n) {
+  if (!Number.isFinite(n) || n <= 0) return null;
+  let num = Math.floor(n);
+  let letters = "";
+  while (num > 0) {
+    num -= 1;
+    letters = String.fromCharCode(65 + (num % 26)) + letters;
+    num = Math.floor(num / 26);
+  }
+  return letters;
+}
+
+/**
+ * Normalize/format a single seat entry into "ROWLETTER-COL" or a useful fallback.
+ * Accepts many shapes:
+ * - { row: 8, col: 7 } -> "H-7"
+ * - { row: "H", col: 7 } -> "H-7"
+ * - { label: "H-7" } -> "H-7"
+ * - "H-7" -> "H-7"
+ * - { seat: "H7" } -> "H7" (fallback)
+ * - numeric/other -> String(...)
+ *
+ * Note: This assumes numeric row values are 1-indexed (1 -> A). If your data uses
+ * 0-indexed rows (0 -> A), either add +1 before calling or let me know and I will
+ * adjust the helper to auto-detect 0-based.
+ */
+function formatSeat(s) {
+  // If already a simple string
+  if (typeof s === "string") {
+    return s;
+  }
+  // If it's an object, inspect known fields
+  if (s && typeof s === "object") {
+    // If label already provided (e.g., 'H-7' or 'H7'), use it
+    if (s.label) return String(s.label);
+    if (s.seat) return String(s.seat);
+    // If there is a preformatted seat like "H-7"
+    if (s.name) return String(s.name);
+
+    const rowVal = s.row ?? s.r ?? s.rowNumber ?? null;
+    const colVal = s.col ?? s.c ?? s.colNumber ?? s.column ?? null;
+
+    // If row is alphabetic already
+    if (typeof rowVal === "string" && /^[A-Za-z]+$/.test(rowVal.trim())) {
+      const rowLetter = rowVal.trim().toUpperCase();
+      if (colVal != null) return `${rowLetter}-${colVal}`;
+      return `${rowLetter}${colVal ?? ""}`.trim();
+    }
+
+    // If row is numeric
+    if (typeof rowVal === "number") {
+      const rowLetters = numberToLetters(rowVal);
+      if (rowLetters) {
+        if (colVal != null) return `${rowLetters}-${colVal}`;
+        return rowLetters;
+      }
+    }
+
+    // If no row/col but label-like fields didn't exist, return JSON-ish fallback
+    // (this keeps PDF generation from crashing and helps debug unexpected shapes)
+    try {
+      return JSON.stringify(s);
+    } catch (e) {
+      return String(s);
+    }
+  }
+
+  // Fallback for other primitives
+  return String(s);
+}
+
+/**
  * Main PDF generator
  */
 export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}) {
@@ -119,27 +194,18 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
       show?.startTime || show?.time || booking.showtime || booking.startTime || booking.createdAt;
     const showtimeText = showtimeVal ? new Date(showtimeVal).toLocaleString() : "—";
 
-    // Seats: support both array of objects and array of strings, fallback to string
+    // Seats: support array of objects and array of strings, fallback to string
     let seatsText = "N/A";
     if (Array.isArray(booking.seats)) {
       try {
-        seatsText = booking.seats
-          .map((s) => {
-            if (s && typeof s === "object") {
-              // prefer row/col fields, then seatLabel
-              if (s.row != null && s.col != null) return `${s.row}-${s.col}`;
-              if (s.label) return String(s.label);
-              if (s.seat) return String(s.seat);
-              return JSON.stringify(s);
-            }
-            return String(s);
-          })
-          .join(", ");
+        seatsText = booking.seats.map((s) => formatSeat(s)).join(", ");
       } catch (e) {
         seatsText = String(booking.seats);
       }
     } else if (booking.seats) {
-      seatsText = String(booking.seats);
+      // If it's a comma separated string already
+      if (typeof booking.seats === "string") seatsText = booking.seats;
+      else seatsText = String(booking.seats);
     }
 
     const amountText = booking.amount ?? booking.total ?? "N/A";
