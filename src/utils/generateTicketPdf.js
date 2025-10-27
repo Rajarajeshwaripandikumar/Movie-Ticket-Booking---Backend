@@ -13,29 +13,43 @@ import QRCode from "qrcode";
  * opts:
  *  - outDir
  *  - filename
- *  - baseUrl  <-- highest priority
+ *  - baseUrl  <-- highest priority (explicitly passed in)
  *  - pageSize
  */
+
+/**
+ * resolveBaseUrl(optsBaseUrl)
+ * Priority:
+ * 1. optsBaseUrl (explicit)
+ * 2. preferred server env names (CLIENT_BASE_URL, FRONTEND_BASE_URL)
+ * 3. various common env names (Netlify, Vercel, Render, etc.)
+ * 4. fallback to localhost dev URL
+ */
 function resolveBaseUrl(optsBaseUrl) {
-  // 1) explicit option passed to function
+  // 1) explicit option passed to function has highest priority
   if (optsBaseUrl) return String(optsBaseUrl).replace(/\/$/, "");
 
-  // 2) common env var names (your app-specific and hosting providers)
+  // 2) server / runtime env vars we want to prefer (add platform-specific names here)
   const candidates = [
+    process.env.CLIENT_BASE_URL,
+    process.env.FRONTEND_BASE_URL,
     process.env.BASE_URL,
     process.env.APP_BASE_URL,
     process.env.VITE_APP_BASE_URL,
     process.env.REACT_APP_BASE_URL,
     process.env.NEXT_PUBLIC_BASE_URL,
-    process.env.URL, // Netlify exposes this
-    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined, // Vercel gives host without protocol
-    process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined, // Render
+    process.env.SITE_URL,
+    process.env.URL, // Netlify usually exposes this as full URL
+    // Vercel gives a host like "my-site.vercel.app" so add protocol
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined,
+    // Render gives an external host name without protocol
+    process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined,
     process.env.PRODUCTION_URL,
   ].filter(Boolean);
 
   if (candidates.length > 0) {
-    // normalize — ensure protocol present, remove trailing slash
-    let candidate = String(candidates[0]);
+    let candidate = String(candidates[0]).trim();
+    // If candidate doesn't have protocol, add https by default
     if (!/^https?:\/\//i.test(candidate)) candidate = `https://${candidate}`;
     return candidate.replace(/\/$/, "");
   }
@@ -44,6 +58,9 @@ function resolveBaseUrl(optsBaseUrl) {
   return "http://localhost:5173";
 }
 
+/**
+ * Main PDF generator
+ */
 export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}) {
   if (!booking || !booking._id) throw new Error("Invalid booking passed to generateTicketPdf");
 
@@ -67,6 +84,7 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
   const filepath = writeToFile
     ? path.join(tmpDir, filename)
     : path.join(tmpDir, `ticket-${String(booking._id)}-${Date.now()}.pdf`);
+
   const doc = new PDFDocument({ margin: 40, size: pageSize });
 
   // If writing to file, pipe to fs stream. Otherwise capture chunks to build a buffer.
@@ -97,9 +115,33 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
     // Booking/show/customer details
     const movieTitle = show?.movie?.title || booking.movieTitle || "Unknown Movie";
     const screenName = show?.screen?.name || booking.screenName || "—";
-    const showtimeVal = show?.startTime || show?.time || booking.showtime || booking.startTime || booking.createdAt;
+    const showtimeVal =
+      show?.startTime || show?.time || booking.showtime || booking.startTime || booking.createdAt;
     const showtimeText = showtimeVal ? new Date(showtimeVal).toLocaleString() : "—";
-    const seatsText = Array.isArray(booking.seats) ? booking.seats.map((s) => `${s.row}-${s.col}`).join(", ") : (booking.seats || "N/A");
+
+    // Seats: support both array of objects and array of strings, fallback to string
+    let seatsText = "N/A";
+    if (Array.isArray(booking.seats)) {
+      try {
+        seatsText = booking.seats
+          .map((s) => {
+            if (s && typeof s === "object") {
+              // prefer row/col fields, then seatLabel
+              if (s.row != null && s.col != null) return `${s.row}-${s.col}`;
+              if (s.label) return String(s.label);
+              if (s.seat) return String(s.seat);
+              return JSON.stringify(s);
+            }
+            return String(s);
+          })
+          .join(", ");
+      } catch (e) {
+        seatsText = String(booking.seats);
+      }
+    } else if (booking.seats) {
+      seatsText = String(booking.seats);
+    }
+
     const amountText = booking.amount ?? booking.total ?? "N/A";
 
     doc.fontSize(11).fillColor("#000");
@@ -119,14 +161,23 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
     doc.moveDown(1);
 
     // QR code generation (verify URL)
-    const verifyUrl = `${String(baseUrl).replace(/\/$/, "")}/tickets/verify/${booking._id}`;
+    const bookingIdStr = String(booking._id);
+    const verifyUrl = `${String(baseUrl).replace(/\/$/, "")}/tickets/verify/${bookingIdStr}`;
+
     let qrBuffer = null;
     try {
-      const qrDataUrl = await QRCode.toDataURL(verifyUrl, { errorCorrectionLevel: "H", margin: 1, width: 400 });
+      // generate as data URL then convert to buffer for PDFKit
+      const qrDataUrl = await QRCode.toDataURL(verifyUrl, {
+        errorCorrectionLevel: "H",
+        margin: 1,
+        width: 400,
+      });
       const base64 = qrDataUrl.split(",")[1];
       qrBuffer = Buffer.from(base64, "base64");
     } catch (qrErr) {
       // QR failed: we'll render a fallback text
+      // Keep warning but don't crash PDF generation
+      // eslint-disable-next-line no-console
       console.warn("generateTicketPdf: QR generation failed:", qrErr);
       qrBuffer = null;
     }
@@ -135,8 +186,10 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
     doc.moveDown(0.5);
     if (qrBuffer) {
       try {
+        // center the QR by placing it in the document with fit
         doc.image(qrBuffer, { fit: [170, 170], align: "center", valign: "center" });
       } catch (imgErr) {
+        // eslint-disable-next-line no-console
         console.warn("generateTicketPdf: PDFKit failed to embed QR image:", imgErr);
         doc.fontSize(10).fillColor("#cc0000").text("QR unavailable", { align: "center" });
       }
@@ -145,16 +198,29 @@ export async function generateTicketPdf(booking, user = {}, show = {}, opts = {}
     }
 
     doc.moveDown(0.6);
-    doc.fontSize(9).fillColor("#666").text("Scan this QR code at the cinema gate for verification.", { align: "center" });
+    doc.fontSize(9).fillColor("#666").text("Scan this QR code at the cinema gate for verification.", {
+      align: "center",
+    });
     doc.moveDown(0.8);
-    doc.fontSize(8).fillColor("#444").text(`Verify ticket: ${verifyUrl}`, { align: "center" });
+    doc
+      .fontSize(8)
+      .fillColor("#444")
+      .text(`Verify ticket: ${verifyUrl}`, { align: "center", link: verifyUrl, underline: false });
 
     doc.moveDown(1.2);
-    doc.fontSize(9).fillColor("#777").text("Please bring this ticket to the cinema. Enjoy the show!", { align: "center" });
+    doc.fontSize(9).fillColor("#777").text("Please bring this ticket to the cinema. Enjoy the show!", {
+      align: "center",
+    });
 
+    // finalize pdf
     doc.end();
   } catch (err) {
-    try { doc.end(); } catch (e) {}
+    try {
+      // ensure doc closed if something bad happened
+      doc.end();
+    } catch (e) {
+      // ignore
+    }
     throw err;
   }
 
