@@ -1,4 +1,3 @@
-// backend/src/routes/analytics.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import debugFactory from "debug";
@@ -136,12 +135,12 @@ router.get("/", async (req, res, next) => {
       { $sort: { date: 1 } },
     ]);
 
-    // ---- Theater Occupancy (theater-driven: returns all theaters) ----
+    // ---- Theater Occupancy (robust: returns totals per theater) ----
     const occupancyByTheater = await Theater.aggregate([
-      // normalize theater name + any theater-level capacity
-      { $project: { name: { $ifNull: ["$name", "$title", "$displayName", "Unknown"] }, tCapacity: { $ifNull: ["$capacity", "$totalSeats", null] } } },
+      // normalize theater name
+      { $project: { name: { $ifNull: ["$name", "$title", "$displayName", "Unknown"] } } },
 
-      // lookup showtimes for the theater
+      // lookup all showtimes for theater
       {
         $lookup: {
           from: "showtimes",
@@ -157,16 +156,24 @@ router.get("/", async (req, res, next) => {
                 }
               }
             },
-            { $project: { _id: 1, seats: 1, capacity: 1, totalSeats: 1 } }
+            // compute showCapacity = totalSeats OR capacity OR seats.length
+            { $project: { _id: 1, seats: 1, capacity: 1, totalSeats: 1,
+                showCapacity: {
+                  $ifNull: [
+                    "$totalSeats",
+                    { $ifNull: ["$capacity", { $size: { $ifNull: ["$seats", []] } }] }
+                  ]
+                }
+            } }
           ],
-          as: "shows",
-        },
+          as: "shows"
+        }
       },
 
-      // unwind shows (preserve theaters with no shows)
+      // unwind shows so we can lookup bookings per-show
       { $unwind: { path: "$shows", preserveNullAndEmptyArrays: true } },
 
-      // lookup bookings for each show (bookings within 'since' window)
+      // lookup confirmed bookings for each show within window
       {
         $lookup: {
           from: "bookings",
@@ -184,61 +191,79 @@ router.get("/", async (req, res, next) => {
                     { $eq: ["$show", "$$sidStr"] }
                   ]
                 },
-                createdAt: { $gte: since }
+                $expr: { $in: [ { $toUpper: { $ifNull: ["$status", ""] } }, ["CONFIRMED", "PAID"] ] }
               }
             },
-            { $project: { quantity: 1 } }
+            { $project: { seats: 1, quantity: 1 } }
           ],
-          as: "bookingsForShow",
-        },
-      },
-
-      // compute bookedSeats and showCapacity for this show
-      {
-        $addFields: {
-          "showBookings.bookedSeats": { $sum: { $map: { input: { $ifNull: ["$bookingsForShow", []] }, as: "b", in: { $ifNull: ["$$b.quantity", 1] } } } },
-          "showBookings.showCapacity": { $ifNull: ["$shows.capacity", "$shows.totalSeats", { $size: { $ifNull: ["$shows.seats", []] } } ] }
+          as: "bookingsForShow"
         }
       },
 
-      // group back to theater
+      // compute booked seats for this show (prefer seats.length per booking, else quantity)
+      {
+        $addFields: {
+          bookedSeatsForShow: {
+            $sum: {
+              $map: {
+                input: { $ifNull: ["$bookingsForShow", []] },
+                as: "b",
+                in: {
+                  $cond: [
+                    { $gt: [{ $size: { $ifNull: ["$$b.seats", []] } }, 0] },
+                    { $size: { $ifNull: ["$$b.seats", []] } },
+                    { $ifNull: ["$$b.quantity", 1] }
+                  ]
+                }
+              }
+            }
+          },
+          showCapacity: { $ifNull: ["$shows.showCapacity", 0] }
+        }
+      },
+
+      // group back to theater to sum booked + capacity
       {
         $group: {
           _id: "$_id",
           theaterName: { $first: "$name" },
-          tCapacity: { $first: "$tCapacity" },
-          shows: { $push: { booked: "$showBookings.bookedSeats", capacity: "$showBookings.showCapacity" } }
+          totalBooked: { $sum: "$bookedSeatsForShow" },
+          totalCapacity: { $sum: "$showCapacity" }
         }
       },
 
-      // compute totals and occupancy (ignore shows with null capacity)
+      // compute occupancy decimal and percent (null when capacity missing)
       {
         $addFields: {
-          totalBooked: { $sum: "$shows.booked" },
-          totalCapacity: { $sum: { $map: { input: "$shows", as: "s", in: { $ifNull: ["$$s.capacity", 0] } } } }
+          occupancyDecimal: {
+            $cond: [
+              { $gt: ["$totalCapacity", 0] },
+              { $divide: ["$totalBooked", "$totalCapacity"] },
+              null
+            ]
+          },
+          occupancyPercent: {
+            $cond: [
+              { $gt: ["$totalCapacity", 0] },
+              { $round: [{ $multiply: [{ $divide: ["$totalBooked", "$totalCapacity"] }, 100] }, 2] },
+              null
+            ]
+          }
         }
       },
 
-      // derive occupancy %, fallback to 0 when capacity is zero or missing
-      {
-        $project: {
-          _id: 0,
-          theaterName: 1,
-          totalBooked: 1,
-          totalCapacity: 1,
-          occupancyRate: { $cond: [{ $gt: ["$totalCapacity", 0] }, { $divide: ["$totalBooked", "$totalCapacity"] }, 0] }
-        }
-      },
-
-      // sort for UI
-      { $sort: { theaterName: 1 } }
+      { $project: { _id: 0, theaterId: "$_id", theaterName: 1, totalBooked: 1, totalCapacity: 1, occupancyDecimal: 1, occupancyPercent: 1 } },
+      { $sort: { occupancyPercent: -1 } }
     ]);
 
+    // Map to frontend shape (include capacity/booked)
     const normalizedOccupancy = (occupancyByTheater || []).map((r) => ({
       theaterName: r.theaterName || "Unknown",
       name: r.theaterName || "Unknown",
-      occupancyRate: typeof r.occupancyRate === "number" ? r.occupancyRate : 0,
-      occupancy: Math.round(Number(r.occupancyRate || 0) * 100),
+      occupancyRate: typeof r.occupancyDecimal === "number" ? r.occupancyDecimal : 0,
+      occupancy: r.occupancyPercent == null ? null : r.occupancyPercent, // percent with 2 decimals or null
+      totalCapacity: Number(r.totalCapacity || 0),
+      totalBooked: Number(r.totalBooked || 0),
     }));
 
     // ---- Popular Movies (robust: tries many booking/showtime shapes) ----
