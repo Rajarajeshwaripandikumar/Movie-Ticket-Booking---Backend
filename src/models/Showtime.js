@@ -1,10 +1,10 @@
-// models/Showtime.js
+// backend/src/models/Showtime.js
 import mongoose from "mongoose";
 
 const seatSchema = new mongoose.Schema(
   {
-    row: Number,
-    col: Number,
+    row: { type: Number, required: true },
+    col: { type: Number, required: true },
     status: {
       type: String,
       enum: ["AVAILABLE", "LOCKED", "BOOKED"],
@@ -16,15 +16,38 @@ const seatSchema = new mongoose.Schema(
 
 const showtimeSchema = new mongoose.Schema(
   {
-    movie:   { type: mongoose.Schema.Types.ObjectId, ref: "Movie", required: true, index: true },
-    theater: { type: mongoose.Schema.Types.ObjectId, ref: "Theater", required: true, index: true },
-    screen:  { type: mongoose.Schema.Types.ObjectId, ref: "Screen", required: true, index: true },
-    city:    { type: String }, // optional; we auto-fill below if absent
-    startTime:   { type: Date, required: true, index: true },
-    basePrice:   { type: Number, required: true },
+    movie: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Movie",
+      required: true,
+      index: true,
+    },
+    theater: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Theater",
+      required: true,
+      index: true,
+    },
+    screen: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Screen",
+      required: true,
+      index: true,
+    },
+
+    city: { type: String, trim: true },
+    startTime: { type: Date, required: true, index: true },
+
+    basePrice: {
+      type: Number,
+      required: true,
+      min: [1, "Base price must be positive"],
+    },
+
     dynamicPricing: { type: Boolean, default: false },
     seats: [seatSchema],
-    // Kept for backward compat; consider removing once not used anywhere:
+
+    // Legacy compatibility: some old data may still use bookedSeats array
     bookedSeats: [{ row: Number, col: Number }],
   },
   { timestamps: true }
@@ -33,35 +56,34 @@ const showtimeSchema = new mongoose.Schema(
 /* -------------------------------------------------------------------------- */
 /* Indexes                                                                    */
 /* -------------------------------------------------------------------------- */
-
-// Frequent queries: by theater/date, movie/date, screen/date
 showtimeSchema.index({ theater: 1, startTime: 1 });
 showtimeSchema.index({ movie: 1, startTime: 1 });
 showtimeSchema.index({ screen: 1, startTime: 1 });
-
-// Optional: helpful for city filter (case-sensitive, route uses regex i)
 showtimeSchema.index({ city: 1 });
 
-// Soft “no overlap” on same screen within same minute (tune as needed)
+// Prevent exact same screen + time duplication
 showtimeSchema.index(
   { screen: 1, startTime: 1 },
-  { unique: true, partialFilterExpression: { startTime: { $type: "date" } } }
+  {
+    unique: true,
+    partialFilterExpression: { startTime: { $type: "date" } },
+  }
 );
 
 /* -------------------------------------------------------------------------- */
-/* Helpers                                                                    */
+/* Seat Initialization Helper                                                 */
 /* -------------------------------------------------------------------------- */
-
-// Initialize seats if empty, using screen rows/cols
 showtimeSchema.methods.ensureSeatsInitialized = async function () {
   if (Array.isArray(this.seats) && this.seats.length > 0) return this;
+
   const Screen = mongoose.model("Screen");
-  let rows = 10, cols = 10;
+  let rows = 10,
+    cols = 10;
 
   if (this.screen) {
     const scr = await Screen.findById(this.screen).lean();
-    rows = Number(scr?.rows) || rows;
-    cols = Number(scr?.cols) || cols;
+    rows = Number(scr?.rows || 10);
+    cols = Number(scr?.cols || 10);
   }
 
   const seats = [];
@@ -79,14 +101,51 @@ showtimeSchema.methods.ensureSeatsInitialized = async function () {
 /* Middleware                                                                 */
 /* -------------------------------------------------------------------------- */
 
-// Auto-fill city from Theater if not set
+// 🔹 Auto-fill missing city from Theater
+// 🔹 Auto-fill missing basePrice if not set
+// 🔹 Ensure seats are initialized once
 showtimeSchema.pre("validate", async function (next) {
-  if (!this.city && this.theater) {
+  try {
     const Theater = mongoose.model("Theater");
-    const th = await Theater.findById(this.theater).select("city").lean();
-    if (th?.city) this.city = th.city;
+    const Screen = mongoose.model("Screen");
+
+    // Fill city from Theater
+    if (!this.city && this.theater) {
+      const th = await Theater.findById(this.theater)
+        .select("city capacity totalSeats")
+        .lean();
+      if (th?.city) this.city = th.city;
+    }
+
+    // Ensure basePrice is present (fallback from Screen or Theater default)
+    if (!this.basePrice || this.basePrice <= 0) {
+      if (this.screen) {
+        const scr = await Screen.findById(this.screen)
+          .select("basePrice")
+          .lean();
+        if (scr?.basePrice) this.basePrice = scr.basePrice;
+      }
+    }
+
+    // Fallback to theater-level price if screen had none
+    if (!this.basePrice || this.basePrice <= 0) {
+      const th = await Theater.findById(this.theater)
+        .select("defaultPrice")
+        .lean();
+      if (th?.defaultPrice) this.basePrice = th.defaultPrice;
+      else this.basePrice = 200; // final fallback
+    }
+
+    // Initialize seats if missing
+    if (!this.seats || this.seats.length === 0) {
+      await this.ensureSeatsInitialized();
+    }
+
+    next();
+  } catch (err) {
+    console.warn("[Showtime pre-validate] failed:", err.message);
+    next(); // never block save
   }
-  next();
 });
 
 export default mongoose.model("Showtime", showtimeSchema);
