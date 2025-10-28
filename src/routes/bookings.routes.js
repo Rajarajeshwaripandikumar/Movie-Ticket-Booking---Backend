@@ -441,6 +441,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
     if (!Array.isArray(seats) || seats.length === 0)
       return res.status(400).json({ ok: false, error: "seats array is required" });
 
+    // Populate movie at the show level so we can set booking.movie
     let show = await Showtime.findById(showtimeId).populate("movie");
     if (!show) return res.status(404).json({ ok: false, error: "Showtime not found" });
     await ensureSeatsInitialized(show);
@@ -494,7 +495,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
 
     const execTx = async () => {
       await session.withTransaction(async () => {
-        const showForWrite = await Showtime.findById(show._id).session(session);
+        const showForWrite = await Showtime.findById(show._id).session(session).populate("movie");
         await ensureSeatsInitialized(showForWrite);
         await reconcileLocks(showForWrite);
 
@@ -518,11 +519,17 @@ router.post("/confirm", requireAuth, async (req, res) => {
         await showForWrite.save({ session });
 
         const finalAmount = Number(amount || normSeats.length * Number(show.basePrice || 200));
+
+        // IMPORTANT: set booking.movie from show.movie if available (avoid undefined movie on saved bookings)
+        const movieValue =
+          showForWrite.movie && (typeof showForWrite.movie === "object" ? showForWrite.movie._id ?? showForWrite.movie : showForWrite.movie);
+
         const [booking] = await Booking.create(
           [
             {
               user: req.user._id,
               showtime: show._id,
+              movie: movieValue ?? undefined,
               seats: normSeats,
               amount: finalAmount,
               status: "CONFIRMED",
@@ -562,6 +569,22 @@ router.post("/confirm", requireAuth, async (req, res) => {
       session.endSession();
     }
 
+    // Populate bookingDoc (so it contains movie and showtime.movie for downstream code)
+    try {
+      bookingDoc = await Booking.findById(bookingDoc._id)
+        .populate({ path: "movie", select: "title posterUrl runtime" })
+        .populate({
+          path: "showtime",
+          populate: [
+            { path: "movie", select: "title posterUrl runtime" },
+            { path: "screen", select: "name rows cols" },
+          ],
+        })
+        .lean();
+    } catch (popErr) {
+      console.warn(tag, "Failed to populate bookingDoc after create:", popErr?.message || popErr);
+    }
+
     // Post-commit side effects (non-blocking)
     (async () => {
       try {
@@ -571,7 +594,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
           user: req.user._id,
           type: "BOOKING_CONFIRMED",
           title: "🎟️ Booking Confirmed",
-          message: `Your booking for "${show.movie?.title || "a movie"}" on ${fmtTime(show.startTime)} has been confirmed.`,
+          message: `Your booking for "${bookingDoc?.showtime?.movie?.title || bookingDoc?.movie?.title || "a movie"}" on ${fmtTime(bookingDoc?.showtime?.startTime || show.startTime)} has been confirmed.`,
           data: { bookingId: bookingDoc._id, showtimeId: show._id },
           channels: ["IN_APP", "EMAIL"],
         });
@@ -617,8 +640,8 @@ router.post("/confirm", requireAuth, async (req, res) => {
           const html =
             renderTemplate?.("booking-confirmed", {
               name,
-              movieTitle: show.movie?.title || "your movie",
-              showtime: fmtTime(show.startTime),
+              movieTitle: bookingDoc?.showtime?.movie?.title || bookingDoc?.movie?.title || "your movie",
+              showtime: fmtTime(bookingDoc?.showtime?.startTime || show.startTime),
               seats: seatsText,
               bookingId: String(bookingDoc._id),
               ticketViewUrl: viewUrl,
@@ -628,9 +651,9 @@ router.post("/confirm", requireAuth, async (req, res) => {
           let attachments = [];
           try {
             const { buffer } = await generateTicketPdf(
-              bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
+              bookingDoc,
               { name, email: to },
-              show,
+              bookingDoc?.showtime || show,
               { baseUrl: APP_PUBLIC_BASE }
             );
             if (buffer) {
@@ -671,6 +694,7 @@ router.post("/confirm", requireAuth, async (req, res) => {
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const bookings = await Booking.find({ user: req.user._id })
+      .populate({ path: "movie", select: "title posterUrl runtime" })
       .populate({
         path: "showtime",
         populate: [
@@ -711,6 +735,7 @@ router.get(
       }
 
       const booking = await Booking.findById(req.params.id)
+        .populate({ path: "movie", select: "title posterUrl runtime" })
         .populate({
           path: "showtime",
           populate: [
@@ -745,6 +770,9 @@ router.get(
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const booking = await Booking.findById(req.params.id).populate({
+      path: "movie",
+      select: "title",
+    }).populate({
       path: "showtime",
       populate: { path: "movie", select: "title" },
     });
@@ -769,7 +797,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
           user: booking.user,
           type: "BOOKING_CANCELLED",
           title: "❌ Booking Cancelled",
-          message: `Your booking for "${booking.showtime?.movie?.title}" has been cancelled.`,
+          message: `Your booking for "${booking.showtime?.movie?.title || booking.movie?.title}" has been cancelled.`,
           data: { bookingId: booking._id },
           channels: ["IN_APP", "EMAIL"],
         });
@@ -794,7 +822,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
           const html =
             renderTemplate?.("booking-cancelled", {
               name: pickUserName(req.user, booking.user),
-              movieTitle: booking.showtime?.movie?.title || "your movie",
+              movieTitle: booking.showtime?.movie?.title || booking.movie?.title || "your movie",
               bookingId: String(booking._id),
               ticketViewUrl: `${APP_PUBLIC_BASE}/bookings/${booking._id}`,
             }) || `<p>${notif.message}</p>`;
@@ -824,6 +852,9 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     }
 
     const booking = await Booking.findById(id).populate({
+      path: "movie",
+      select: "title",
+    }).populate({
       path: "showtime",
       populate: { path: "movie", select: "title" },
     });
@@ -847,7 +878,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
           user: booking.user,
           type: "BOOKING_CANCELLED",
           title: "❌ Booking Cancelled",
-          message: `Your booking for "${booking.showtime?.movie?.title || "a movie"}" has been cancelled.`,
+          message: `Your booking for "${booking.showtime?.movie?.title || booking.movie?.title || "a movie"}" has been cancelled.`,
           data: { bookingId: booking._id },
           channels: ["IN_APP", "EMAIL"],
         });
@@ -872,7 +903,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
           const html =
             renderTemplate?.("booking-cancelled", {
               name: pickUserName(req.user, booking.user),
-              movieTitle: booking.showtime?.movie?.title || "your movie",
+              movieTitle: booking.showtime?.movie?.title || booking.movie?.title || "your movie",
               bookingId: String(booking._id),
               ticketViewUrl: `${APP_PUBLIC_BASE}/bookings/${booking._id}`,
             }) || `<p>${notif.message}</p>`;
@@ -900,6 +931,7 @@ router.get("/calendar", requireAuth, async (req, res) => {
     const endDate = end ? new Date(end) : new Date(startDate.getTime() + 90 * 86400000);
 
     const bookings = await Booking.find({ user: req.user._id })
+      .populate({ path: "movie", select: "title posterUrl" })
       .populate({
         path: "showtime",
         populate: { path: "movie", select: "title posterUrl" },
@@ -909,7 +941,7 @@ router.get("/calendar", requireAuth, async (req, res) => {
     const events = bookings
       .map((b) => ({
         id: b._id,
-        title: b.showtime?.movie?.title || "Booking",
+        title: b.showtime?.movie?.title || b.movie?.title || "Booking",
         start: b.showtime?.startTime,
         raw: b,
       }))
@@ -944,6 +976,7 @@ router.get(
       }
 
       const booking = await Booking.findById(req.params.id)
+        .populate({ path: "movie", select: "title posterUrl runtime" })
         .populate({
           path: "showtime",
           populate: [
