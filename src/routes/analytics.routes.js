@@ -5,10 +5,10 @@ import debugFactory from "debug";
 const debug = debugFactory("app:analytics");
 
 // Prefer explicit imports if available
-const Booking  = mongoose.models.Booking  || mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
+const Booking = mongoose.models.Booking || mongoose.model("Booking", new mongoose.Schema({}, { strict: false, timestamps: true }));
 const Showtime = mongoose.models.Showtime || mongoose.model("Showtime", new mongoose.Schema({}, { strict: false }));
-const Theater  = mongoose.models.Theater  || mongoose.model("Theater", new mongoose.Schema({}, { strict: false }));
-const Movie    = mongoose.models.Movie    || mongoose.model("Movie", new mongoose.Schema({}, { strict: false }));
+const Theater = mongoose.models.Theater || mongoose.model("Theater", new mongoose.Schema({}, { strict: false }));
+const Movie = mongoose.models.Movie || mongoose.model("Movie", new mongoose.Schema({}, { strict: false }));
 
 const router = Router();
 
@@ -136,183 +136,183 @@ router.get("/", async (req, res, next) => {
       { $sort: { date: 1 } },
     ]);
 
-    // ---- Theater Occupancy ----
-    // Use bookings in the window, group by showtime, then join showtime & theater to compute occupancy
-    const occupancyAgg = await Booking.aggregate([
-      ...normalizeCreatedAtStage,
-      { $match: { createdAt: { $gte: since } } },
+    // ---- Theater Occupancy (theater-driven: returns all theaters) ----
+    const occupancyByTheater = await Theater.aggregate([
+      // normalize theater name + any theater-level capacity
+      { $project: { name: { $ifNull: ["$name", "$title", "$displayName", "Unknown"] }, tCapacity: { $ifNull: ["$capacity", "$totalSeats", null] } } },
 
-      // derive a showtime key (objectId or string) from various fields
-      {
-        $addFields: {
-          showtimeKey: {
-            $switch: {
-              branches: [
-                { case: { $eq: [{ $type: "$showtime", }, "objectId"] }, then: "$showtime" },
-                { case: { $eq: [{ $type: "$showtimeId", }, "objectId"] }, then: "$showtimeId" },
-                { case: { $eq: [{ $type: "$showtime", }, "string"] }, then: "$showtime" },
-                { case: { $eq: [{ $type: "$showtimeId", }, "string"] }, then: "$showtimeId" }
-              ],
-              default: null
-            }
-          }
-        }
-      },
-
-      // skip bookings without any showtime key
-      { $match: { showtimeKey: { $ne: null } } },
-
-      // sum booked seats per showtime (uses quantity or defaults to 1)
-      {
-        $group: {
-          _id: "$showtimeKey",
-          bookedSeats: { $sum: { $ifNull: ["$quantity", 1] } }
-        }
-      },
-
-      // lookup showtime doc by objectId or string
+      // lookup showtimes for the theater
       {
         $lookup: {
           from: "showtimes",
-          let: { sid: "$_id" },
+          let: { tid: "$_id", tidStr: { $toString: "$_id" } },
           pipeline: [
             {
               $match: {
                 $expr: {
                   $or: [
-                    { $eq: ["$_id", "$$sid"] },
-                    { $eq: [{ $toString: "$_id" }, "$$sid"] }
+                    { $eq: ["$theater", "$$tid"] },
+                    { $eq: ["$theater", "$$tidStr"] }
                   ]
                 }
               }
             },
-            { $project: { theater: 1, seats: 1, capacity: 1, totalSeats: 1 } }
+            { $project: { _id: 1, seats: 1, capacity: 1, totalSeats: 1 } }
           ],
-          as: "showtime"
-        }
+          as: "shows",
+        },
       },
-      { $unwind: { path: "$showtime", preserveNullAndEmptyArrays: true } },
 
-      // lookup theater
-      { $lookup: { from: "theaters", localField: "showtime.theater", foreignField: "_id", as: "t" } },
-      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+      // unwind shows (preserve theaters with no shows)
+      { $unwind: { path: "$shows", preserveNullAndEmptyArrays: true } },
 
-      // compute totalSeats with fallbacks
+      // lookup bookings for each show (bookings within 'since' window)
+      {
+        $lookup: {
+          from: "bookings",
+          let: { sid: "$shows._id", sidStr: { $toString: "$shows._id" } },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$showtime", "$$sid"] },
+                    { $eq: ["$showtime", "$$sidStr"] },
+                    { $eq: ["$showtimeId", "$$sid"] },
+                    { $eq: ["$showtimeId", "$$sidStr"] },
+                    { $eq: ["$show", "$$sid"] },
+                    { $eq: ["$show", "$$sidStr"] }
+                  ]
+                },
+                createdAt: { $gte: since }
+              }
+            },
+            { $project: { quantity: 1 } }
+          ],
+          as: "bookingsForShow",
+        },
+      },
+
+      // compute bookedSeats and showCapacity for this show
       {
         $addFields: {
-          totalSeats: {
-            $cond: [
-              { $gt: [{ $size: { $ifNull: ["$showtime.seats", []] } }, 0] },
-              { $size: { $ifNull: ["$showtime.seats", []] } },
-              {
-                $ifNull: [
-                  "$showtime.capacity",
-                  { $ifNull: ["$showtime.totalSeats", { $ifNull: ["$t.capacity", 0] }] }
-                ]
-              }
-            ]
-          },
-          theaterName: { $ifNull: ["$t.name", "$t.title", "Unknown"] }
+          "showBookings.bookedSeats": { $sum: { $map: { input: { $ifNull: ["$bookingsForShow", []] }, as: "b", in: { $ifNull: ["$$b.quantity", 1] } } } },
+          "showBookings.showCapacity": { $ifNull: ["$shows.capacity", "$shows.totalSeats", { $size: { $ifNull: ["$shows.seats", []] } } ] }
         }
       },
 
-      // exclude shows without capacity (prevents divide-by-zero)
-      { $match: { totalSeats: { $gt: 0 } } },
-
-      // compute occupancy per show
-      {
-        $project: {
-          theaterName: 1,
-          showOccupancy: { $divide: ["$bookedSeats", "$totalSeats"] }
-        }
-      },
-
-      // average occupancy per theater
+      // group back to theater
       {
         $group: {
-          _id: "$theaterName",
-          occupancyRate: { $avg: "$showOccupancy" }
+          _id: "$_id",
+          theaterName: { $first: "$name" },
+          tCapacity: { $first: "$tCapacity" },
+          shows: { $push: { booked: "$showBookings.bookedSeats", capacity: "$showBookings.showCapacity" } }
         }
       },
 
-      { $project: { _id: 0, theaterName: "$_id", occupancyRate: 1 } },
-      { $sort: { occupancyRate: -1 } }
+      // compute totals and occupancy (ignore shows with null capacity)
+      {
+        $addFields: {
+          totalBooked: { $sum: "$shows.booked" },
+          totalCapacity: { $sum: { $map: { input: "$shows", as: "s", in: { $ifNull: ["$$s.capacity", 0] } } } }
+        }
+      },
+
+      // derive occupancy %, fallback to 0 when capacity is zero or missing
+      {
+        $project: {
+          _id: 0,
+          theaterName: 1,
+          totalBooked: 1,
+          totalCapacity: 1,
+          occupancyRate: { $cond: [{ $gt: ["$totalCapacity", 0] }, { $divide: ["$totalBooked", "$totalCapacity"] }, 0] }
+        }
+      },
+
+      // sort for UI
+      { $sort: { theaterName: 1 } }
     ]);
 
-    // map occupancy to frontend shape
-    const normalizedOccupancy = (occupancyAgg || []).map((r) => {
-      const occupancyRate = typeof r.occupancyRate === "number" ? r.occupancyRate : 0;
-      return {
-        theaterName: r.theaterName || r.name || "Unknown",
-        name: r.theaterName || r.name || "Unknown",
-        occupancyRate,
-        occupancy: Math.round(Number(occupancyRate || 0) * 100), // percent 0-100
-      };
-    });
+    const normalizedOccupancy = (occupancyByTheater || []).map((r) => ({
+      theaterName: r.theaterName || "Unknown",
+      name: r.theaterName || "Unknown",
+      occupancyRate: typeof r.occupancyRate === "number" ? r.occupancyRate : 0,
+      occupancy: Math.round(Number(r.occupancyRate || 0) * 100),
+    }));
 
-    // ---- Popular Movies (robust: includes showtime lookup for movieId) ----
+    // ---- Popular Movies (robust: tries many booking/showtime shapes) ----
     const popularMovies = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       { $match: { createdAt: { $gte: since } } },
       { $addFields: { _statusUpper: { $toUpper: { $ifNull: ["$status", ""] } } } },
       { $match: { _statusUpper: { $in: ["CONFIRMED", "PAID"] } } },
 
-      // lookup showtime so we can use showtime.movieId if booking lacks movie ref
+      // Lookup showtime by trying multiple possible booking fields (objectId or string)
       {
         $lookup: {
           from: "showtimes",
-          localField: "showtimeId",
-          foreignField: "_id",
+          let: {
+            s1: { $ifNull: ["$showtime", "$showtimeId"] },
+            s2: { $ifNull: ["$show", "$showId"] },
+            s3: { $ifNull: ["$screen", "$screenId"] },
+          },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$s1"] },
+                    { $eq: [{ $toString: "$_id" }, "$$s1"] },
+                    { $eq: ["$_id", "$$s2"] },
+                    { $eq: [{ $toString: "$_id" }, "$$s2"] },
+                    { $eq: ["$_id", "$$s3"] },
+                    { $eq: [{ $toString: "$_id" }, "$$s3"] }
+                  ]
+                }
+              }
+            },
+            { $project: { movieId: 1, title: 1, seats: 1, capacity: 1, totalSeats: 1 } }
+          ],
           as: "showtime"
         }
       },
       { $unwind: { path: "$showtime", preserveNullAndEmptyArrays: true } },
 
-      // Try to derive a consistent movie key (string): embedded booking.movie._id, objectId movie, booking.movieId, showtime.movieId, or booking.movie (string)
+      // Build a robust movie key: booking.movie._id, booking.movie (objectId), booking.movieId, showtime.movieId, or string
       {
         $addFields: {
           movieKey: {
             $switch: {
               branches: [
-                // embedded movie object with _id
                 { case: { $and: [{ $ne: ["$movie._id", null] }] }, then: { $toString: "$movie._id" } },
-                // movie as ObjectId stored directly
                 { case: { $eq: [{ $type: "$movie" }, "objectId"] }, then: { $toString: "$movie" } },
-                // explicit movieId field present on booking
                 { case: { $ne: ["$movieId", null] }, then: { $toString: "$movieId" } },
-                // movieId on the showtime referenced by booking (common)
                 { case: { $ne: ["$showtime.movieId", null] }, then: { $toString: "$showtime.movieId" } },
-                // movie already a string title/id
-                { case: { $eq: [{ $type: "$movie" }, "string"] }, then: "$movie" },
+                { case: { $eq: [{ $type: "$movie" }, "string"] }, then: "$movie" }
               ],
-              default: null,
-            },
+              default: null
+            }
           },
-          // fallback embedded title (booking may include the movie title in booking.movie.title/name)
-          movieEmbeddedTitle: { $ifNull: ["$movie.title", { $ifNull: ["$movie.name", null] }] },
-        },
+          movieEmbeddedTitle: { $ifNull: ["$movie.title", { $ifNull: ["$movie.name", null] }] }
+        }
       },
 
-      // If we have a movieKey use it for grouping, else use embedded title
-      {
-        $addFields: {
-          movieGroupKey: { $ifNull: ["$movieKey", "$movieEmbeddedTitle"] },
-        },
-      },
+      { $addFields: { movieGroupKey: { $ifNull: ["$movieKey", "$movieEmbeddedTitle"] } } },
 
-      // group by movieGroupKey
+      // group by movieGroupKey (either id-string or title)
       {
         $group: {
           _id: "$movieGroupKey",
           bookings: { $sum: 1 },
           revenue: { $sum: AMOUNT_EXPR },
-        },
+        }
       },
 
       { $sort: { bookings: -1 } },
       { $limit: 20 },
 
-      // Lookup movie doc by id (as string) OR by title/name matching the group key
+      // Lookup movie document by id (as string) OR by title/name matching the group key
       {
         $lookup: {
           from: "movies",
@@ -322,11 +322,8 @@ router.get("/", async (req, res, next) => {
               $match: {
                 $expr: {
                   $or: [
-                    // match by objectId (stored as string)
                     { $eq: [{ $toString: "$_id" }, "$$movieKey"] },
-                    // match by title text
                     { $eq: ["$title", "$$movieKey"] },
-                    // match by name field
                     { $eq: ["$name", "$$movieKey"] },
                   ],
                 },
@@ -407,7 +404,7 @@ router.get("/revenue/trends", async (req, res, next) => {
   }
 });
 
-// 2. Popular movies
+// 2. Popular movies (granular)
 router.get("/movies/popular", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -419,18 +416,37 @@ router.get("/movies/popular", async (req, res, next) => {
       { $addFields: { _statusUpper: { $toUpper: { $ifNull: ["$status", ""] } } } },
       { $match: { _statusUpper: { $in: ["CONFIRMED", "PAID"] } } },
 
-      // lookup showtime so booking can use showtime.movieId
+      // lookup showtime using multiple possible fields
       {
         $lookup: {
           from: "showtimes",
-          localField: "showtimeId",
-          foreignField: "_id",
+          let: {
+            s1: { $ifNull: ["$showtime", "$showtimeId"] },
+            s2: { $ifNull: ["$show", "$showId"] },
+            s3: { $ifNull: ["$screen", "$screenId"] },
+          },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$_id", "$$s1"] },
+                    { $eq: [{ $toString: "$_id" }, "$$s1"] },
+                    { $eq: ["$_id", "$$s2"] },
+                    { $eq: [{ $toString: "$_id" }, "$$s2"] },
+                    { $eq: ["$_id", "$$s3"] },
+                    { $eq: [{ $toString: "$_id" }, "$$s3"] }
+                  ]
+                }
+              }
+            },
+            { $project: { movieId: 1, title: 1 } }
+          ],
           as: "showtime"
         }
       },
       { $unwind: { path: "$showtime", preserveNullAndEmptyArrays: true } },
 
-      // derive movie key or embedded title
       {
         $addFields: {
           movieKey: {
@@ -510,108 +526,100 @@ router.get("/movies/popular", async (req, res, next) => {
   }
 });
 
-// 3. Theater occupancy (granular)
+// 3. Theater occupancy (granular) — mirror of theater-driven occupancy used above
 router.get("/occupancy", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
 
-    // Use bookings to determine relevant showtimes (bookings within the window)
-    const data = await Booking.aggregate([
-      ...normalizeCreatedAtStage,
-      { $match: { createdAt: { $gte: since } } },
+    const occupancyByTheater = await Theater.aggregate([
+      { $project: { name: { $ifNull: ["$name", "$title", "$displayName", "Unknown"] }, tCapacity: { $ifNull: ["$capacity", "$totalSeats", null] } } },
 
-      // derive showtime key robustly
-      {
-        $addFields: {
-          showtimeKey: {
-            $switch: {
-              branches: [
-                { case: { $eq: [{ $type: "$showtime", }, "objectId"] }, then: "$showtime" },
-                { case: { $eq: [{ $type: "$showtimeId", }, "objectId"] }, then: "$showtimeId" },
-                { case: { $eq: [{ $type: "$showtime", }, "string"] }, then: "$showtime" },
-                { case: { $eq: [{ $type: "$showtimeId", }, "string"] }, then: "$showtimeId" }
-              ],
-              default: null
-            }
-          }
-        }
-      },
-      { $match: { showtimeKey: { $ne: null } } },
-
-      // sum booked seats per showtime (use quantity or default 1)
-      {
-        $group: {
-          _id: "$showtimeKey",
-          bookedSeats: { $sum: { $ifNull: ["$quantity", 1] } },
-        }
-      },
-
-      // lookup showtime and theater, compute capacity and occupancy per show
       {
         $lookup: {
           from: "showtimes",
-          let: { sid: "$_id" },
+          let: { tid: "$_id", tidStr: { $toString: "$_id" } },
           pipeline: [
             {
               $match: {
                 $expr: {
                   $or: [
-                    { $eq: ["$_id", "$$sid"] },
-                    { $eq: [{ $toString: "$_id" }, "$$sid"] }
+                    { $eq: ["$theater", "$$tid"] },
+                    { $eq: ["$theater", "$$tidStr"] }
                   ]
                 }
               }
             },
-            { $project: { theater: 1, seats: 1, capacity: 1, totalSeats: 1 } }
+            { $project: { _id: 1, seats: 1, capacity: 1, totalSeats: 1 } }
           ],
-          as: "showtime"
-        }
+          as: "shows",
+        },
       },
-      { $unwind: { path: "$showtime", preserveNullAndEmptyArrays: true } },
 
-      { $lookup: { from: "theaters", localField: "showtime.theater", foreignField: "_id", as: "t" } },
-      { $unwind: { path: "$t", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$shows", preserveNullAndEmptyArrays: true } },
+
+      {
+        $lookup: {
+          from: "bookings",
+          let: { sid: "$shows._id", sidStr: { $toString: "$shows._id" } },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$showtime", "$$sid"] },
+                    { $eq: ["$showtime", "$$sidStr"] },
+                    { $eq: ["$showtimeId", "$$sid"] },
+                    { $eq: ["$showtimeId", "$$sidStr"] },
+                    { $eq: ["$show", "$$sid"] },
+                    { $eq: ["$show", "$$sidStr"] }
+                  ]
+                },
+                createdAt: { $gte: since }
+              }
+            },
+            { $project: { quantity: 1 } }
+          ],
+          as: "bookingsForShow",
+        },
+      },
 
       {
         $addFields: {
-          totalSeats: {
-            $cond: [
-              { $gt: [{ $size: { $ifNull: ["$showtime.seats", []] } }, 0] },
-              { $size: { $ifNull: ["$showtime.seats", []] } },
-              {
-                $ifNull: [
-                  "$showtime.capacity",
-                  { $ifNull: ["$showtime.totalSeats", { $ifNull: ["$t.capacity", 0] }] }
-                ]
-              }
-            ]
-          },
-          theaterName: { $ifNull: ["$t.name", "$t.title", "Unknown"] }
-        }
-      },
-
-      // exclude shows without capacity
-      { $match: { totalSeats: { $gt: 0 } } },
-
-      {
-        $project: {
-          theaterName: 1,
-          showOccupancy: { $divide: ["$bookedSeats", "$totalSeats"] }
+          "showBookings.bookedSeats": { $sum: { $map: { input: { $ifNull: ["$bookingsForShow", []] }, as: "b", in: { $ifNull: ["$$b.quantity", 1] } } } },
+          "showBookings.showCapacity": { $ifNull: ["$shows.capacity", "$shows.totalSeats", { $size: { $ifNull: ["$shows.seats", []] } } ] }
         }
       },
 
       {
         $group: {
-          _id: "$theaterName",
-          occupancyRate: { $avg: "$showOccupancy" }
+          _id: "$_id",
+          theaterName: { $first: "$name" },
+          tCapacity: { $first: "$tCapacity" },
+          shows: { $push: { booked: "$showBookings.bookedSeats", capacity: "$showBookings.showCapacity" } }
         }
       },
 
-      { $project: { _id: 0, theaterName: "$_id", occupancyRate: 1 } },
-      { $sort: { occupancyRate: -1 } }
+      {
+        $addFields: {
+          totalBooked: { $sum: "$shows.booked" },
+          totalCapacity: { $sum: { $map: { input: "$shows", as: "s", in: { $ifNull: ["$$s.capacity", 0] } } } }
+        }
+      },
+
+      {
+        $project: {
+          _id: 0,
+          theaterName: 1,
+          totalBooked: 1,
+          totalCapacity: 1,
+          occupancyRate: { $cond: [{ $gt: ["$totalCapacity", 0] }, { $divide: ["$totalBooked", "$totalCapacity"] }, 0] }
+        }
+      },
+
+      { $sort: { theaterName: 1 } }
     ]);
 
-    const out = (data || []).map((r) => ({
+    const out = (occupancyByTheater || []).map((r) => ({
       theaterName: r.theaterName || "Unknown",
       occupancyRate: typeof r.occupancyRate === "number" ? r.occupancyRate : 0,
       occupancy: Math.round((typeof r.occupancyRate === "number" ? r.occupancyRate : 0) * 100),
