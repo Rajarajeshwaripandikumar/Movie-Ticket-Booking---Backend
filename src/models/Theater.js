@@ -8,6 +8,30 @@ const TheaterSchema = new mongoose.Schema(
     address: { type: String, trim: true, default: "" },
     imageUrl: { type: String, default: "" },
 
+    // optional synonyms (legacy clients sometimes use title/displayName)
+    title: { type: String, trim: true, default: "" },
+    displayName: { type: String, trim: true, default: "" },
+
+    // numeric capacity fields used by analytics/occupancy
+    capacity: {
+      type: Number,
+      default: null,
+      set: (v) => {
+        if (v == null || v === "") return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      },
+    },
+    totalSeats: {
+      type: Number,
+      default: null,
+      set: (v) => {
+        if (v == null || v === "") return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      },
+    },
+
     amenities: {
       type: [String],
       default: [],
@@ -39,6 +63,13 @@ const TheaterSchema = new mongoose.Schema(
 TheaterSchema.pre("save", function (next) {
   this.nameLower = (this.name || "").trim().toLowerCase();
   this.cityLower = (this.city || "").trim().toLowerCase();
+
+  // Ensure displayName/title fallback behavior is consistent
+  if (!this.displayName && this.title) {
+    this.displayName = String(this.title).trim();
+  }
+
+  // If numeric strings were passed, setters already coerced them to Number or null.
   next();
 });
 
@@ -58,6 +89,16 @@ TheaterSchema.virtual("posterUrl").get(function () {
 });
 TheaterSchema.virtual("theaterImage").get(function () {
   return this.imageUrl;
+});
+
+// prefer explicit displayName, then title, then name
+TheaterSchema.virtual("displayLabel").get(function () {
+  return this.displayName || this.title || this.name || "";
+});
+
+// expose a legacy-friendly alias 'title' for templates that expect it
+TheaterSchema.virtual("titleOrName").get(function () {
+  return this.title || this.name || "";
 });
 
 TheaterSchema.set("toJSON", { virtuals: true });
