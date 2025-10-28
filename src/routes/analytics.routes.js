@@ -24,9 +24,14 @@ router.use((req, res, next) => {
 
 /* ----------------------------- HELPERS ----------------------------- */
 
-// safe number extraction for amounts
+// safe number extraction for amounts (falls back to several fields)
 const AMOUNT_EXPR = {
-  $toDouble: { $ifNull: ["$totalAmount", { $ifNull: ["$amount", 0] }] },
+  $toDouble: {
+    $ifNull: [
+      "$totalAmount",
+      { $ifNull: ["$amount", { $ifNull: ["$price", 0] }] }
+    ]
+  }
 };
 
 // tolerant references (booking shapes vary)
@@ -155,7 +160,8 @@ router.get("/", async (req, res, next) => {
                 $expr: { $or: [{ $eq: ["$theater", "$$tid"] }, { $eq: ["$theater", "$$tidStr"] }] }
               }
             },
-            { $project: { _id: 1, capacity: 1, totalSeats: 1, seats: 1 } }
+            // project actual movie field (ObjectId) and seats/capacity
+            { $project: { _id: 1, movie: 1, title: 1, capacity: 1, totalSeats: 1, seats: 1 } }
           ],
           as: "shows"
         }
@@ -173,20 +179,25 @@ router.get("/", async (req, res, next) => {
             {
               $match: {
                 $expr: {
-                  $or: [
-                    { $eq: ["$showtime", "$$sid"] },
-                    { $eq: ["$showtime", "$$sidStr"] },
-                    { $eq: ["$showtimeId", "$$sid"] },
-                    { $eq: ["$showtimeId", "$$sidStr"] },
-                    { $eq: ["$show", "$$sid"] },
-                    { $eq: ["$show", "$$sidStr"] }
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: ["$showtime", "$$sid"] },
+                        { $eq: ["$showtime", "$$sidStr"] },
+                        { $eq: ["$showtimeId", "$$sid"] },
+                        { $eq: ["$showtimeId", "$$sidStr"] },
+                        { $eq: ["$show", "$$sid"] },
+                        { $eq: ["$show", "$$sidStr"] }
+                      ]
+                    },
+                    // only confirmed/paid
+                    { $in: [{ $toUpper: { $ifNull: ["$status", ""] } }, ["CONFIRMED", "PAID"]] }
                   ]
                 },
-                createdAt: { $gte: since },
-                $expr: { $in: [{ $toUpper: { $ifNull: ["$status", ""] } }, ["CONFIRMED", "PAID"]] }
+                createdAt: { $gte: since }
               }
             },
-            { $project: { seats: 1, quantity: 1 } }
+            { $project: { seats: 1, quantity: 1, status: 1 } }
           ],
           as: "bookingsForShow"
         }
@@ -263,7 +274,7 @@ router.get("/", async (req, res, next) => {
       { $addFields: { _statusUpper: { $toUpper: { $ifNull: ["$status", ""] } } } },
       { $match: { _statusUpper: { $in: ["CONFIRMED", "PAID"] } } },
 
-      // try to resolve showtime to get movieId if booking doesn't have movie info
+      // try to resolve showtime to get movie if booking doesn't have movie info
       {
         $lookup: {
           from: "showtimes",
@@ -279,29 +290,30 @@ router.get("/", async (req, res, next) => {
                 }
               }
             },
-            { $project: { movieId: 1, title: 1 } }
+            // project actual 'movie' field (objectId) and any title showtime carries
+            { $project: { movie: 1, title: 1 } }
           ],
           as: "showtime"
         }
       },
       { $unwind: { path: "$showtime", preserveNullAndEmptyArrays: true } },
 
-      // build movie group key (string)
+      // build movie group key (string) using tolerant switch
       {
         $addFields: {
           movieKey: {
             $switch: {
               branches: [
-                { case: { $and: [{ $ne: ["$movie._id", null] }] }, then: { $toString: "$movie._id" } },
+                { case: { $ne: ["$movie._id", null] }, then: { $toString: "$movie._id" } },
                 { case: { $eq: [{ $type: "$movie" }, "objectId"] }, then: { $toString: "$movie" } },
                 { case: { $ne: ["$movieId", null] }, then: { $toString: "$movieId" } },
-                { case: { $ne: ["$showtime.movieId", null] }, then: { $toString: "$showtime.movieId" } },
+                { case: { $ne: ["$showtime.movie", null] }, then: { $toString: "$showtime.movie" } },
                 { case: { $eq: [{ $type: "$movie" }, "string"] }, then: "$movie" }
               ],
-              default: null
+              default: { $ifNull: ["$movie.title", "$showtime.title"] }
             }
           },
-          movieEmbeddedTitle: { $ifNull: ["$movie.title", "$movie.name", null] }
+          movieEmbeddedTitle: { $ifNull: ["$movie.title", "$movie.name", "$showtime.title", null] }
         }
       },
 
@@ -442,7 +454,7 @@ router.get("/occupancy", async (req, res, next) => {
                 $expr: { $or: [{ $eq: ["$theater", "$$tid"] }, { $eq: ["$theater", "$$tidStr"] }] }
               }
             },
-            { $project: { _id: 1, capacity: 1, totalSeats: 1, seats: 1 } }
+            { $project: { _id: 1, movie: 1, title: 1, capacity: 1, totalSeats: 1, seats: 1 } }
           ],
           as: "shows"
         }
@@ -457,16 +469,21 @@ router.get("/occupancy", async (req, res, next) => {
             {
               $match: {
                 $expr: {
-                  $or: [
-                    { $eq: ["$showtime", "$$sid"] },
-                    { $eq: ["$showtime", "$$sidStr"] },
-                    { $eq: ["$showtimeId", "$$sid"] },
-                    { $eq: ["$showtimeId", "$$sidStr"] },
-                    { $eq: ["$show", "$$sid"] },
-                    { $eq: ["$show", "$$sidStr"] }
+                  $and: [
+                    {
+                      $or: [
+                        { $eq: ["$showtime", "$$sid"] },
+                        { $eq: ["$showtime", "$$sidStr"] },
+                        { $eq: ["$showtimeId", "$$sid"] },
+                        { $eq: ["$showtimeId", "$$sidStr"] },
+                        { $eq: ["$show", "$$sid"] },
+                        { $eq: ["$show", "$$sidStr"] }
+                      ]
+                    },
+                    { $in: [{ $toUpper: { $ifNull: ["$status", ""] } }, ["CONFIRMED", "PAID"]] }
                   ]
                 },
-                createdAt: { $gte: since },
+                createdAt: { $gte: since }
               }
             },
             { $project: { quantity: 1, seats: 1, status: 1 } }
@@ -559,7 +576,7 @@ router.get("/movies/popular", async (req, res, next) => {
             {
               $match: { $expr: { $or: [{ $eq: ["$_id", "$$s1"] }, { $eq: [{ $toString: "$_id" }, "$$s1"] }] } }
             },
-            { $project: { movieId: 1, title: 1 } }
+            { $project: { movie: 1, title: 1 } }
           ],
           as: "showtime"
         }
@@ -571,16 +588,16 @@ router.get("/movies/popular", async (req, res, next) => {
           movieKey: {
             $switch: {
               branches: [
-                { case: { $and: [{ $ne: ["$movie._id", null] }] }, then: { $toString: "$movie._id" } },
+                { case: { $ne: ["$movie._id", null] }, then: { $toString: "$movie._id" } },
                 { case: { $eq: [{ $type: "$movie" }, "objectId"] }, then: { $toString: "$movie" } },
                 { case: { $ne: ["$movieId", null] }, then: { $toString: "$movieId" } },
-                { case: { $ne: ["$showtime.movieId", null] }, then: { $toString: "$showtime.movieId" } },
+                { case: { $ne: ["$showtime.movie", null] }, then: { $toString: "$showtime.movie" } },
                 { case: { $eq: [{ $type: "$movie" }, "string"] }, then: "$movie" }
               ],
-              default: null
+              default: { $ifNull: ["$movie.title", "$showtime.title"] }
             }
           },
-          movieEmbeddedTitle: { $ifNull: ["$movie.title", "$movie.name", null] }
+          movieEmbeddedTitle: { $ifNull: ["$movie.title", "$movie.name", "$showtime.title", null] }
         }
       },
 
