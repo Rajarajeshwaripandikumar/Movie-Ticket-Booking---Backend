@@ -1,4 +1,3 @@
-// backend/src/routes/analytics.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
 import debugFactory from "debug";
@@ -97,6 +96,12 @@ router.get("/", async (req, res, next) => {
       { $project: { _id: 0, date: "$_id", total: 1 } }
     ]);
 
+    // normalize revenue shape for frontend (date + value)
+    const revenueForFront = (revenue || []).map(r => ({
+      date: r.date || r._id || null,
+      value: Number(r.total ?? 0)
+    }));
+
     // daily active users
     const users = await Booking.aggregate([
       ...normalizeCreatedAtStage,
@@ -106,6 +111,11 @@ router.get("/", async (req, res, next) => {
       { $project: { _id: 0, date: "$_id", count: { $size: "$users" } } },
       { $sort: { date: 1 } }
     ]);
+
+    const usersForFront = (users || []).map(u => ({
+      date: u.date || u._id || null,
+      value: Number(u.count ?? u.users ?? 0)
+    }));
 
     // totals: overall bookings + users (no date filter)
     const totalsAgg = await Booking.aggregate([
@@ -342,18 +352,26 @@ router.get("/", async (req, res, next) => {
       }
     ]);
 
-    const normalizedPopular = (popularMovies || []).map((m) => ({
-      movieId: m.movieId ?? null,
-      movieName: m.movieName ?? (m.movieId ? String(m.movieId) : "Unknown"),
-      bookings: Number(m.bookings ?? 0),
-      revenue: Number(m.revenue ?? 0)
-    }));
+    // safer normalization & fallbacks for movie names
+    const normalizedPopular = (popularMovies || []).map((m) => {
+      let movieNameCandidate = (m.movieName || "").toString().trim();
+      if (!movieNameCandidate || movieNameCandidate === String(m.movieId)) {
+        movieNameCandidate = m.movieId ? String(m.movieId) : "Unknown";
+      }
+
+      return {
+        movieId: m.movieId ?? null,
+        movieName: movieNameCandidate,
+        bookings: Number(m.bookings ?? m.totalBookings ?? 0),
+        revenue: Number(m.revenue ?? m.totalRevenue ?? 0)
+      };
+    });
 
     res.json({
       ok: true,
       totals,
-      revenue,
-      users,
+      revenue: revenueForFront,
+      users: usersForFront,
       occupancy: normalizedOccupancy,
       popularMovies: normalizedPopular
     });
