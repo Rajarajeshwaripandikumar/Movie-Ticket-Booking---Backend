@@ -77,6 +77,7 @@ const normalizeCreatedAtStage = [
 ];
 
 const dayProjectSimple = [
+  // build an ISO day string (YYYY-MM-DD) in _d
   { $addFields: { _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } } } },
 ];
 
@@ -96,12 +97,15 @@ router.get("/", async (req, res, next) => {
       { $addFields: { __amount_safe: AMOUNT_EXPR } },
       { $group: { _id: "$_d", total: { $sum: "$__amount_safe" } } },
       { $sort: { _id: 1 } },
-      { $project: { _id: 0, date: "$_id", total: 1 } },
+      // include dayISO for frontend reliability
+      { $project: { _id: 0, date: "$_id", dayISO: "$_id", total: 1 } },
     ]);
 
     const revenueForFront = (revenue || []).map((r) => ({
       date: r.date || r._id || null,
+      dayISO: r.dayISO || (typeof r.date === "string" ? r.date.slice(0, 10) : null),
       value: Number(r.total ?? 0),
+      total: Number(r.total ?? 0),
     }));
 
     /* ------------------------- USERS DAILY ------------------------- */
@@ -110,13 +114,15 @@ router.get("/", async (req, res, next) => {
       { $match: { createdAt: { $gte: since } } },
       ...dayProjectSimple,
       { $group: { _id: "$_d", users: { $addToSet: USER_REF } } },
-      { $project: { _id: 0, date: "$_id", count: { $size: "$users" } } },
+      { $project: { _id: 0, date: "$_id", dayISO: "$_id", count: { $size: "$users" } } },
       { $sort: { date: 1 } },
     ]);
 
     const usersForFront = (users || []).map((u) => ({
       date: u.date || u._id || null,
+      dayISO: u.dayISO || (typeof u.date === "string" ? u.date.slice(0, 10) : null),
       value: Number(u.count ?? 0),
+      count: Number(u.count ?? 0),
     }));
 
     /* ------------------------- TOTAL COUNTS ------------------------- */
@@ -458,7 +464,8 @@ router.get("/revenue/trends", async (req, res, next) => {
       { $addFields: { __amount_safe: AMOUNT_EXPR } },
       { $group: { _id: "$_d", totalRevenue: { $sum: "$__amount_safe" }, bookings: { $sum: 1 } } },
       { $sort: { _id: 1 } },
-      { $project: { date: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
+      // include dayISO explicitly
+      { $project: { date: "$_id", dayISO: "$_id", totalRevenue: 1, bookings: 1, _id: 0 } },
     ]);
     res.json(data);
   } catch (e) {
@@ -476,7 +483,7 @@ router.get("/users/active", async (req, res, next) => {
       { $match: { createdAt: { $gte: since } } },
       ...dayProjectSimple,
       { $group: { _id: "$_d", users: { $addToSet: USER_REF } } },
-      { $project: { date: "$_id", count: { $size: "$users" }, _id: 0 } },
+      { $project: { date: "$_id", dayISO: "$_id", count: { $size: "$users" }, _id: 0 } },
       { $sort: { date: 1 } },
     ]);
     res.json(data);
@@ -761,7 +768,8 @@ router.get("/bookings/summary", async (req, res, next) => {
         },
       },
       { $sort: { _id: 1 } },
-      { $project: { _id: 0, date: "$_id", confirmed: 1, cancelled: 1, revenue: 1 } },
+      // include dayISO explicitly for frontend CSV/export
+      { $project: { _id: 0, date: "$_id", dayISO: "$_id", confirmed: 1, cancelled: 1, revenue: 1 } },
     ]);
     res.json(data);
   } catch (e) {
