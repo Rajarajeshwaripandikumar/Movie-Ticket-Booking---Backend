@@ -1,3 +1,4 @@
+// backend/src/models/Booking.js
 import mongoose from "mongoose";
 import Showtime from "./Showtime.js";
 import Screen from "./Screen.js";
@@ -119,36 +120,65 @@ const bookingSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     showtime: { type: mongoose.Schema.Types.ObjectId, ref: "Showtime", required: true },
+
+    // NEW: explicit movie ref so future bookings won't end up undefined
+    movie: { type: mongoose.Schema.Types.ObjectId, ref: "Movie", required: false, index: true },
+
     seats: { type: [SeatSchema], default: [] },
-    amount: Number,
+    amount: { type: Number, default: 0 },
     status: { type: String, enum: ["CONFIRMED", "CANCELLED"], default: "CONFIRMED" },
   },
   { timestamps: true }
 );
 
-/* ------------------------- pre-save normalization ------------------------ */
+/* ------------------------- pre-validate normalization ------------------------ */
 /*
-  On save we normalize `seats` into array of {row, col, label}.
-  We try to look up showtime -> screen to get `cols` (seatsPerRow) for numeric ID translation.
-  If anything fails we fall back to 10 columns.
+  On validate we:
+   - backfill booking.movie from showtime.movie (if available)
+   - set amount from showtime.basePrice when missing
+   - normalize seats into array of {row, col, label} using screen.cols when available
 */
-bookingSchema.pre("save", async function (next) {
+bookingSchema.pre("validate", async function (next) {
   try {
     let seatsPerRow = 10;
-    try {
-      if (this.showtime) {
-        const show = await Showtime.findById(this.showtime).select("screen").lean();
-        if (show?.screen) {
-          const screen = await Screen.findById(show.screen).select("cols").lean();
-          seatsPerRow = Number(screen?.cols || seatsPerRow);
+
+    if (this.showtime) {
+      try {
+        const show = await Showtime.findById(this.showtime).select("movie screen basePrice").lean();
+        if (show) {
+          // backfill movie if missing
+          if (!this.movie && show.movie) {
+            // allow strings/objectIds — mongoose will cast when saving
+            this.movie = show.movie;
+          }
+
+          // use show.basePrice to set amount if not provided or zero
+          if ((!this.amount || this.amount === 0) && typeof show.basePrice === "number") {
+            // seats length might be unnormalized yet; use provided seats length or 1
+            const seatCount = Array.isArray(this.seats) && this.seats.length > 0 ? this.seats.length : 1;
+            this.amount = Number(show.basePrice) * seatCount;
+          }
+
+          // derive seatsPerRow from show.screen
+          if (show.screen) {
+            try {
+              const screen = await Screen.findById(show.screen).select("cols").lean();
+              seatsPerRow = Number(screen?.cols || seatsPerRow);
+            } catch (e) {
+              seatsPerRow = 10;
+            }
+          }
+        } else {
+          // showtime not found — fall back to defaults
+          seatsPerRow = 10;
         }
+      } catch (err) {
+        // non-fatal: fallback to defaults
+        seatsPerRow = 10;
       }
-    } catch (err) {
-      // non-fatal: fallback to default seatsPerRow
-      seatsPerRow = 10;
     }
 
-    // Only normalize if seats is not already objects with label/row/col
+    // Only normalize seats if not already objects with label/row/col
     const needNormalize =
       !Array.isArray(this.seats) ||
       this.seats.length === 0 ||
@@ -179,11 +209,12 @@ bookingSchema.pre("save", async function (next) {
         return { row: s.row ?? null, col: s.col ?? null, label: String(`${s.row ?? ""}-${s.col ?? ""}`).replace(/^-|-$|^$/, "").trim() };
       });
     }
-    next();
+
+    return next();
   } catch (err) {
-    // if normalization fails, don't block save — best-effort only
-    console.warn("Booking pre-save normalization failed:", err);
-    next();
+    // if normalization/backfill fails, don't block save — best-effort only
+    console.warn("Booking pre-validate normalization failed:", err);
+    return next();
   }
 });
 
