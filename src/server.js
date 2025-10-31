@@ -10,6 +10,7 @@ import mongoose from "mongoose";
 import cors from "cors";
 import helmet from "helmet";
 import { v2 as cloudinary } from "cloudinary";
+import { pathToFileURL } from "url";
 
 // SSE helpers (start watcher + emit snapshots)
 import sse from "./socket/sse.js";
@@ -234,13 +235,9 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
 /*
   Use the centralized SSE module (socket/sse.js) which handles authentication,
   client registration, init payloads (notifications), and push helpers.
-  The old local sseStreamHandler that wrote comments/sampleTicker is removed.
 */
-// SSE preflight (OPTIONS)
-// ensure both /api/notifications/stream and /notifications/stream are covered
 app.options("/api/notifications/stream", sse.ssePreflight);
 app.get("/api/notifications/stream", sse.sseHandler);
-
 app.options("/notifications/stream", sse.ssePreflight);
 app.get("/notifications/stream", sse.sseHandler);
 
@@ -272,24 +269,34 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
   }
 });
 
-/* --------------------------- Mount other routers --------------------------- */
+/* --------------------------- Mount other routers (ESM-safe) --------------------------- */
 try {
-  // dynamic mount if file exists
   const routers = ["./routes/theaters.routes.js", "./routes/movies.routes.js", "./routes/upload.routes.js"];
-  routers.forEach((rpath) => {
+
+  for (const rpath of routers) {
     try {
-      if (fs.existsSync(path.join(process.cwd(), rpath))) {
-        // import dynamically so missing files don't crash startup
-        // eslint-disable-next-line global-require, import/no-dynamic-require
-        const mod = require(rpath);
-        const router = mod.default || mod;
-        app.use(router.routesPrefix || "/api", router); // router may export routesPrefix
-        console.log(`[mount] ${rpath} mounted`);
+      const absPath = path.join(process.cwd(), rpath);
+      if (!fs.existsSync(absPath)) {
+        console.log(`[mount] ${rpath} not found, skipping`);
+        continue;
+      }
+
+      // convert to file:// URL and use dynamic import (ESM)
+      const fileUrl = pathToFileURL(absPath).href;
+      const mod = await import(fileUrl);
+      const router = mod.default || mod;
+      const prefix = router && router.routesPrefix ? router.routesPrefix : "/api";
+
+      if (router && (typeof router === "function" || router?.stack)) {
+        app.use(prefix, router);
+        console.log(`[mount] ${rpath} mounted at ${prefix}`);
+      } else {
+        console.warn(`[mount] ${rpath} imported but did not export a router (default export missing)`);
       }
     } catch (e) {
       console.warn(`[mount] failed to mount ${rpath}:`, e?.message || e);
     }
-  });
+  }
 } catch (e) {
   console.warn("[mount] router auto-mount skipped:", e?.message || e);
 }
@@ -378,9 +385,9 @@ function getMountedRoutes() {
   return routes;
 }
 
-function routeExists(path) {
+function routeExists(pathToFind) {
   const routes = getMountedRoutes();
-  return routes.some((r) => r.path === path);
+  return routes.some((r) => r.path === pathToFind);
 }
 
 // Expose mounted routes for quick verification
@@ -418,7 +425,7 @@ async function start() {
     });
 
     server.listen(PORT, () => {
-      console.log(`🚀 API listening on http://localhost:${PORT} (port ${PORT})`);
+      console.log(`🚀 API listening on port ${PORT} (env=${process.env.NODE_ENV || "development"})`);
     });
 
     mongoose.connection.on("error", (err) => console.error("MongoDB error:", err));
@@ -437,7 +444,12 @@ async function start() {
 
     // Start SSE helpers: change-stream watcher + periodic snapshot emitter
     try {
-      sse.startBookingWatcher();
+      if (sse && typeof sse.startBookingWatcher === "function") {
+        sse.startBookingWatcher();
+      } else {
+        console.warn("SSE module missing startBookingWatcher — skipping watcher start");
+      }
+
       const SNAPSHOT_INTERVAL_MS = Number(process.env.SNAPSHOT_INTERVAL_MS || 60_000);
       if (SNAPSHOT_INTERVAL_MS > 0) {
         setInterval(() => {
