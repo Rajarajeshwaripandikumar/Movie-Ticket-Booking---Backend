@@ -6,7 +6,12 @@ const userSchema = new mongoose.Schema(
     name: { type: String, default: "" },
     email: { type: String, required: true, unique: true, lowercase: true },
     phone: { type: String, default: "" },
-    role: { type: String, enum: ["USER", "ADMIN"], default: "USER" },
+    role: {
+      type: String,
+      enum: ["USER", "THEATRE_ADMIN", "SUPER_ADMIN"],
+      default: "USER",
+    },
+    theatreId: { type: mongoose.Schema.Types.ObjectId, ref: "Theatre", default: null },
     password: { type: String, required: true, select: false },
 
     preferences: {
@@ -25,9 +30,7 @@ const userSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-/* -------------------------------------------------------------------------- */
-/* 🔐 Pre-save hook — hash password before saving                             */
-/* -------------------------------------------------------------------------- */
+/* 🔐 Hash password before saving */
 userSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
   try {
@@ -39,9 +42,7 @@ userSchema.pre("save", async function (next) {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/* 🔑 Compare passwords                                                       */
-/* -------------------------------------------------------------------------- */
+/* 🔑 Compare passwords */
 userSchema.methods.compare = async function (enteredPassword) {
   try {
     return await bcrypt.compare(enteredPassword, this.password);
@@ -51,8 +52,6 @@ userSchema.methods.compare = async function (enteredPassword) {
   }
 };
 
-/* -------------------------------------------------------------------------- */
-/* ✅ Export model                                                            */
-/* -------------------------------------------------------------------------- */
+/* ✅ Export model */
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 export default User;
