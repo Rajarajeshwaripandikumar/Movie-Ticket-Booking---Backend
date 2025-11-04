@@ -12,7 +12,7 @@ export const requireAuth = (req, res, next) => {
 
     // 1️⃣ Authorization header
     const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith("Bearer ")) {
+    if (authHeader && typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
       token = authHeader.slice(7).trim();
     }
 
@@ -21,18 +21,18 @@ export const requireAuth = (req, res, next) => {
       token = String(req.cookies.token);
     }
 
-    // 3️⃣ Query param (allowed only in non-production)
+    // 3️⃣ Query param (allowed only in non-production OR stream endpoints)
     if (
       !token &&
       req.query?.token &&
-      (process.env.NODE_ENV !== "production" ||
-        (req.path && req.path.includes("/stream")))
+      (process.env.NODE_ENV !== "production" || (req.path && req.path.includes("/stream")))
     ) {
       token = String(req.query.token);
     }
 
-    if (!token)
+    if (!token) {
       return res.status(401).json({ message: "Missing Authorization token" });
+    }
 
     // 🔐 Verify and decode
     const decoded = jwt.verify(token, JWT_SECRET);
@@ -40,8 +40,9 @@ export const requireAuth = (req, res, next) => {
     const userId = String(
       decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId
     );
-    if (!userId)
+    if (!userId) {
       return res.status(401).json({ message: "Token missing subject (sub)" });
+    }
 
     const rawRole =
       decoded.role ??
@@ -56,13 +57,15 @@ export const requireAuth = (req, res, next) => {
       email: decoded.email || null,
       name: decoded.name || decoded.fullName || null,
       role: normalizedRole,
-      theatreId: decoded.theatreId || null, // carry theatre link for theatre-admins
+      theatreId: decoded.theatreId ?? decoded.theatre?.id ?? null, // carry theatre link for theatre-admins
     };
 
+    // convenient local
     res.locals.userId = userId;
+
     next();
   } catch (err) {
-    console.error("[Auth] Invalid token:", err.message);
+    console.error("[Auth] Invalid token:", err && (err.message || err));
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 };
@@ -70,18 +73,22 @@ export const requireAuth = (req, res, next) => {
 /* -------------------------------------------------------------------------- */
 /* 🛡️ Middleware: Require specific roles                                       */
 /* Usage: app.post("/admin", requireAuth, requireRoles("SUPER_ADMIN"), handler)*/
+/* Accepts either multiple args or a single array: requireRoles("A","B") or requireRoles(["A","B"]) */
 /* -------------------------------------------------------------------------- */
-export const requireRoles = (...allowed) => {
-  return (req, res, next) => {
-    if (!req.user)
-      return res.status(401).json({ message: "Unauthorized (no user)" });
+export const requireRoles = (...allowedArgs) => {
+  // support requireRoles(["A","B"]) or requireRoles("A","B")
+  const allowed = Array.isArray(allowedArgs[0]) ? allowedArgs[0] : allowedArgs;
+  const normalized = allowed.map((r) => String(r || "").toUpperCase());
 
-    const role = req.user.role?.toUpperCase?.() || "USER";
-    if (!allowed.includes(role)) {
-      console.warn("[Auth] Access denied for role:", role, "allowed:", allowed);
-      return res
-        .status(403)
-        .json({ message: "Access denied — insufficient role" });
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ message: "Unauthorized (no user)" });
+    }
+
+    const role = String(req.user.role || "USER").toUpperCase();
+    if (!normalized.includes(role)) {
+      console.warn("[Auth] Access denied for role:", role, "allowed:", normalized);
+      return res.status(403).json({ message: "Access denied — insufficient role" });
     }
 
     next();
@@ -90,22 +97,42 @@ export const requireRoles = (...allowed) => {
 
 /* -------------------------------------------------------------------------- */
 /* 🎭 Middleware: Require theatre ownership                                    */
-/* Ensures a theatre-admin can only edit their own theatre                    */
+/* Ensures a theatre-admin can only edit/manage their own theatre              */
+/* Example usage:
+     router.put("/admin/theaters/:theatreId", requireAuth, requireRoles("SUPER_ADMIN","THEATRE_ADMIN"), requireTheatreOwnership, handler)
+   SUPER_ADMIN bypasses this check (has global rights)
+   THEATRE_ADMIN must have req.user.theatreId === targetTheatreId
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
-  const targetTheatreId = req.body.theatreId || req.params.theatreId;
+  const targetTheatreId = req.body?.theatreId ?? req.params?.theatreId ?? req.query?.theatreId;
   const user = req.user;
 
-  if (user.role === "SUPER_ADMIN") return next();
+  // SUPER_ADMIN can manage any theatre
+  if (user?.role === "SUPER_ADMIN") return next();
+
+  // Theatre admin must have theatreId and match target
   if (
-    user.role === "THEATRE_ADMIN" &&
+    user?.role === "THEATRE_ADMIN" &&
     user.theatreId &&
     String(user.theatreId) === String(targetTheatreId)
   ) {
     return next();
   }
 
-  return res
-    .status(403)
-    .json({ message: "Forbidden — you can only manage your own theatre" });
+  return res.status(403).json({ message: "Forbidden — you can only manage your own theatre" });
 };
+
+/* -------------------------------------------------------------------------- */
+/* Backwards-compatible aliases and convenience guards                         */
+/* - requireAdmin: old code may import this directly                           */
+/* - requireSuperAdmin / requireTheatreAdmin: explicit helpers                 */
+/* -------------------------------------------------------------------------- */
+
+// requireAdmin: keep old import working — allow any admin flavour
+export const requireAdmin = requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN");
+
+// requireSuperAdmin: explicit single-role helper
+export const requireSuperAdmin = requireRoles("SUPER_ADMIN");
+
+// requireTheatreAdmin: explicit single-role helper (does NOT include SUPER_ADMIN)
+export const requireTheatreAdmin = requireRoles("THEATRE_ADMIN");
