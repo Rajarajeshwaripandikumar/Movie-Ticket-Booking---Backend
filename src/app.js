@@ -27,9 +27,10 @@ import screensRoutes from "./routes/screens.routes.js";
 import pricingRoutes from "./routes/pricing.routes.js";
 import debugMailRoutes from "./routes/debug-mail.js";
 import ordersRouter from "./routes/orders.routes.js";
+import superAdminRoutes from "./routes/superadmin.routes.js";
 
 // ─────────────────────────────── MIDDLEWARE ───────────────────────────────
-import { requireAuth, requireAdmin } from "./middleware/auth.js";
+import { requireAuth, requireRoles } from "./middleware/auth.js";
 
 const app = express();
 
@@ -39,7 +40,7 @@ app.set("trust proxy", 1); // Render / Netlify / ELB
 // ─────────────────────────────── SECURITY HEADERS ───────────────────────────────
 app.use(
   helmet({
-    crossOriginResourcePolicy: false, // allow uploads cross-origin
+    crossOriginResourcePolicy: false,
     contentSecurityPolicy: false, // relaxed for dev
   })
 );
@@ -54,8 +55,8 @@ const DEV_ORIGINS = [
 ];
 
 const PROD_ORIGINS = [
-  "https://movieticketbooking-rajy.netlify.app", // frontend
-  "https://movie-ticket-booking-backend-o1m2.onrender.com", // backend (self)
+  "https://movieticketbooking-rajy.netlify.app",
+  "https://movie-ticket-booking-backend-o1m2.onrender.com",
   ...(process.env.APP_ORIGINS_PROD
     ? process.env.APP_ORIGINS_PROD.split(",").map((s) => s.trim()).filter(Boolean)
     : []),
@@ -68,15 +69,8 @@ console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) {
-        // no origin (server-to-server or same-origin) — allow
-        console.log("[CORS] No origin (likely same-origin/preflight)");
-        return cb(null, true);
-      }
-      if (ALLOWED_ORIGINS.includes(origin)) {
-        console.log("[CORS] ✅ Allowed:", origin);
-        return cb(null, true);
-      }
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       console.warn("[CORS] ❌ Blocked:", origin);
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
@@ -94,7 +88,7 @@ app.use(
   })
 );
 
-// Preflight handler (allow the common origins list)
+// Preflight handler
 app.options("*", cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
 // ─────────────────────────────── LOGGING & PARSERS ───────────────────────────────
@@ -121,6 +115,7 @@ app.use((req, _res, next) => {
 });
 
 // ─────────────────────────────── ROUTES ───────────────────────────────
+
 // Health check
 app.get("/api/health", (_req, res) =>
   res.json({
@@ -131,7 +126,7 @@ app.get("/api/health", (_req, res) =>
   })
 );
 
-// Uploads (single mount only)
+// Uploads
 app.use("/api/upload", uploadRoutes);
 
 // Public/basic routes
@@ -145,8 +140,8 @@ app.use("/api/payments", paymentsRoutes);
 app.use("/_debug", debugMailRoutes);
 app.use("/api/orders", ordersRouter);
 
-// Pricing (protected admin)
-app.use("/api/pricing", requireAuth, requireAdmin, pricingRoutes);
+// Pricing (protected for admins)
+app.use("/api/pricing", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), pricingRoutes);
 
 // Notifications
 app.use("/api/notifications", notificationsRoutes);
@@ -155,39 +150,35 @@ app.use("/api/notification-prefs", notificationPrefRoutes);
 // Profiles
 app.use("/api/profile", profileRoutes);
 
-// Admin (top-level) routes
-app.use("/api/admin", requireAuth, requireAdmin, adminRoutes);
+// ✅ Super Admin routes (create/manage theatre admins)
+app.use("/api/superadmin", requireAuth, requireRoles("SUPER_ADMIN"), superAdminRoutes);
+
+// ✅ Admin routes (both Super Admin & Theatre Admin)
+app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), adminRoutes);
 
 // Screens
 app.use("/api/screens", screensRoutes);
 
-/**
- * PRE-AUTH MIDDLEWARE FOR SSE STREAM
- *
- * EventSource (SSE) in browsers cannot set custom Authorization headers.
- * To allow using a token in the URL for the stream, we copy req.query.token
- * into req.headers.authorization for the specific stream path BEFORE auth middleware runs.
- *
- * NOTE: Accepting tokens via querystring can expose them in logs/referrers. Keep scope minimal.
- * You can remove or gate this behind NODE_ENV !== 'production' if you prefer.
- */
+/* -------------------------------------------------------------------------- */
+/* 🎯 SSE STREAM TOKEN FIX FOR ANALYTICS                                      */
+/* -------------------------------------------------------------------------- */
 app.use("/api/analytics/stream", (req, _res, next) => {
   try {
     if (!req.headers.authorization && req.query && req.query.token) {
       const tok = String(req.query.token);
       req.headers.authorization = `Bearer ${tok}`;
-      console.debug(`[PREAUTH] copied token from query -> Authorization header for ${req.originalUrl} (token preview: ${tok.slice(0, 8)}...)`);
+      console.debug(
+        `[PREAUTH] Copied token from query -> Authorization header for ${req.originalUrl} (token preview: ${tok.slice(0, 8)}...)`
+      );
     }
   } catch (e) {
-    console.debug("[PREAUTH] failed to copy token:", e && e.message);
+    console.debug("[PREAUTH] Failed to copy token:", e && e.message);
   }
   next();
 });
 
-// Analytics (protected)
-// Accept token via ?token=... only for the stream route (copied above).
-// Now mount the analytics routes with auth/admin middleware.
-app.use("/api/analytics", requireAuth, requireAdmin, analyticsRoutes);
+// ✅ Analytics routes (protected)
+app.use("/api/analytics", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), analyticsRoutes);
 
 // ─────────────────────────────── 404 HANDLER ───────────────────────────────
 app.use((req, res, next) => {
