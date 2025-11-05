@@ -31,7 +31,65 @@ if (appRoutes && typeof appRoutes.use === "function") {
   app = express();
 }
 
-// basic middlewares
+/* -------------------------------------------------------------------------- */
+/*                             CORS — PUT FIRST!                              */
+/* -------------------------------------------------------------------------- */
+const envOrigins = (process.env.FRONTEND_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = new Set([
+  process.env.FRONTEND_ORIGIN || "https://movieticketbooking-rajy.netlify.app",
+  "http://localhost:5173",
+  ...envOrigins,
+]);
+
+// Non-throwing origin callback. Returning false makes preflight fail cleanly,
+// but still lets our universal header middleware add Vary/ACAO consistently.
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // server-to-server / curl
+    if (allowedOrigins.has(origin)) return cb(null, true);
+    console.warn(`[CORS] blocked origin ${origin}`);
+    return cb(null, false);
+  },
+  credentials: false, // using Authorization header, not cookies
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Role"],
+  exposedHeaders: ["Content-Length", "Content-Type"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// Belt-and-suspenders: make sure ALL responses (incl. 404/500) have basic CORS
+app.use((req, res, next) => {
+  try {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    } else if (process.env.FRONTEND_ORIGIN) {
+      res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
+      res.setHeader("Vary", "Origin");
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With, Accept, X-Role"
+    );
+    // We are NOT using cookies; keep credentials false to avoid ACAO/credential mismatch.
+    res.setHeader("Access-Control-Allow-Credentials", "false");
+    if (req.method === "OPTIONS") return res.sendStatus(corsOptions.optionsSuccessStatus || 204);
+  } catch {}
+  next();
+});
+
+/* -------------------------------------------------------------------------- */
+/*                               Basic middlewares                            */
+/* -------------------------------------------------------------------------- */
 app.set("trust proxy", true);
 app.use(helmet());
 app.use(express.json({ limit: "5mb" }));
@@ -60,65 +118,6 @@ app.use((req, res, next) => {
   next();
 });
 // ---------------------------------------------------------------------------
-
-/* ----------------------------- CORS config -------------------------------- */
-const envOrigins = (process.env.FRONTEND_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const allowedOrigins = new Set([
-  process.env.FRONTEND_ORIGIN || "https://movieticketbooking-rajy.netlify.app",
-  "http://localhost:5173",
-  ...envOrigins,
-]);
-
-// Centralized CORS options
-const corsOptions = {
-  origin: (origin, cb) => {
-    // allow non-browser requests with no origin (curl, server-to-server)
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.has(origin)) return cb(null, true);
-    console.warn(`[CORS] blocked origin ${origin}`);
-    return cb(new Error("Origin not allowed by CORS"), false);
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-  // ⬇️ include X-Role
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Role"],
-  exposedHeaders: ["Content-Length", "Content-Type"],
-  optionsSuccessStatus: 204,
-};
-
-// Use cors middleware early so it always runs before routes
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
-
-/**
- * Additional robust CORS header middleware
- */
-app.use((req, res, next) => {
-  try {
-    const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Vary", "Origin");
-    } else if (process.env.FRONTEND_ORIGIN) {
-      res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
-      res.setHeader("Vary", "Origin");
-    }
-    // ensure these are present for browsers during preflight
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
-    // ⬇️ include X-Role
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, X-Role");
-    // if you use cookies or other credentials, keep this true and avoid wildcard origin
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    if (req.method === "OPTIONS") return res.sendStatus(corsOptions.optionsSuccessStatus || 204);
-  } catch (err) {
-    console.warn("[CORS-middleware] header set failed:", err?.message || err);
-  }
-  next();
-});
 
 /* -------------------------- Optional COOP / COEP --------------------------- */
 if (process.env.ENABLE_COOP_COEP === "true") {
@@ -184,7 +183,9 @@ if (fs.existsSync(uploadsPath) && fs.statSync(uploadsPath).isDirectory()) {
   );
   console.log(`🖼️  Serving static uploads from: ${uploadsPath}`);
 } else {
-  console.log("🖼️  Uploads directory not available — /uploads will 404 (use Cloudinary preferred in production)");
+  console.log(
+    "🖼️  Uploads directory not available — /uploads will 404 (use Cloudinary preferred in production)"
+  );
 }
 
 /* ------------------------- Cloudinary configuration ------------------------ */
@@ -222,6 +223,13 @@ app.get("/api/notifications/stream", sse.sseHandler);
 app.options("/notifications/stream", sse.ssePreflight);
 app.get("/notifications/stream", sse.sseHandler);
 
+/* ----------------------------- Notifications REST ------------------------- */
+/* Replace this stub with your real controller/router. It prevents 404s in UI. */
+app.get("/api/notifications/mine", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
+  return res.json({ ok: true, items: [], limit });
+});
+
 /* ----------------------------- /api/upload route --------------------------- */
 import multer from "multer";
 import streamifier from "streamifier";
@@ -257,6 +265,7 @@ try {
     "./routes/upload.routes.js",
     "./routes/showtimes.routes.js",     // ✅ mount showtimes (includes admin alias)
     "./routes/superadmin.routes.js",    // ✅ mount superadmin routes
+    // "./routes/notifications.routes.js", // ← mount when you add a real notifications router
   ];
 
   for (const rpath of routers) {
