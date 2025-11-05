@@ -10,7 +10,7 @@ export const ROLE = {
 };
 
 // Accept both spellings, but we'll normalize to THEATRE_ADMIN via `set`
-const ROLE_ENUM_ACCEPTED = [ROLE.USER, ROLE.THEATRE_ADMIN, ROLE.SUPER_ADMIN, "THEATER_ADMIN"];
+const ROLE_ENUM_ACCEPTED = [USER, THEATRE_ADMIN, SUPER_ADMIN, "THEATER_ADMIN"];
 
 const userSchema = new mongoose.Schema(
   {
