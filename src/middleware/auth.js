@@ -8,9 +8,23 @@ function normalizeRole(raw) {
   if (raw === undefined || raw === null) return "USER";
   try {
     const v = String(raw).trim().toUpperCase().replace(/\s+/g, "_");
-    if (v === "THEATRE_ADMIN") return "THEATER_ADMIN"; // UK -> US spelling
-    if (v === "ADMIN") return "SUPER_ADMIN";           // legacy -> canonical
-    return v;
+
+    // Canonicalization map
+    const map = {
+      // Super admin aliases
+      ADMIN: "SUPER_ADMIN",
+      SUPERUSER: "SUPER_ADMIN",
+
+      // Theatre admin / manager variants
+      THEATRE_ADMIN: "THEATER_ADMIN",   // UK -> US spelling
+      THEATRE_MANAGER: "THEATER_ADMIN",
+      THEATER_MANAGER: "THEATER_ADMIN",
+      PVR_MANAGER: "THEATER_ADMIN",     // 👈 key alias
+      PVR_ADMIN: "THEATER_ADMIN",
+      MANAGER: "THEATER_ADMIN",         // generic fall-in, if used
+    };
+
+    return map[v] ?? v;
   } catch {
     return "USER";
   }
@@ -29,7 +43,7 @@ export const requireAuth = (req, res, next) => {
   try {
     let token = null;
 
-    // 1️⃣ Authorization header
+    // 1️⃣ Authorization header (Bearer)
     const authHeader = req.headers.authorization;
     if (authHeader && typeof authHeader === "string" && /^Bearer\s+/i.test(authHeader)) {
       token = authHeader.replace(/^Bearer\s+/i, "").trim();
@@ -40,7 +54,7 @@ export const requireAuth = (req, res, next) => {
       token = String(req.cookies.token);
     }
 
-    // 3️⃣ Query param (allowed only in non-production OR stream endpoints)
+    // 3️⃣ Query param (allowed only in non-production OR for /stream endpoints)
     if (
       !token &&
       req.query?.token &&
@@ -84,7 +98,7 @@ export const requireAuth = (req, res, next) => {
       id: userId,
       email: decoded.email || null,
       name: decoded.name || decoded.fullName || null,
-      role,                // canonicalized: USER | THEATER_ADMIN | SUPER_ADMIN
+      role,                                // canonical: USER | THEATER_ADMIN | SUPER_ADMIN
       theatreId: theatreId ? String(theatreId) : null, // backend naming
       theaterId: theatreId ? String(theatreId) : null, // frontend-friendly naming
     };
@@ -153,4 +167,4 @@ export const requireAdmin = requireRoles("SUPER_ADMIN", "THEATER_ADMIN", "ADMIN"
 
 // Explicit
 export const requireSuperAdmin = requireRoles("SUPER_ADMIN");
-export const requireTheatreAdmin = requireRoles("THEATER_ADMIN"); // spelling normalized internally
+export const requireTheatreAdmin = requireRoles("THEATER_ADMIN"); // UK/US spelling normalized internally
