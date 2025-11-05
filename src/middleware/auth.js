@@ -3,30 +3,48 @@ import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
-/* --------------------------------- helpers -------------------------------- */
+/* --------------------------------- Role utils -------------------------------- */
+
+export const ROLE = {
+  USER: "USER",
+  THEATRE_ADMIN: "THEATRE_ADMIN",   // canonical (UK)
+  SUPER_ADMIN: "SUPER_ADMIN",
+  ADMIN: "ADMIN",                   // distinct, do NOT escalate to SUPER_ADMIN
+};
+
+/**
+ * Normalize a single role string to canonical values:
+ * USER | THEATRE_ADMIN | ADMIN | SUPER_ADMIN
+ * Accepts common aliases; never escalates ADMIN -> SUPER_ADMIN.
+ */
 function normalizeRole(raw) {
-  if (raw === undefined || raw === null) return "USER";
+  if (raw === undefined || raw === null) return ROLE.USER;
   try {
     const v = String(raw).trim().toUpperCase().replace(/\s+/g, "_");
 
-    // Canonicalization map
-    const map = {
-      // Super admin aliases
-      ADMIN: "SUPER_ADMIN",
-      SUPERUSER: "SUPER_ADMIN",
+    // Common aliases without privilege escalation
+    if (v === "SUPERUSER" || v === "SUPER-ADMIN") return ROLE.SUPER_ADMIN;
 
-      // Theatre admin / manager variants
-      THEATRE_ADMIN: "THEATER_ADMIN",   // UK -> US spelling
-      THEATRE_MANAGER: "THEATER_ADMIN",
-      THEATER_MANAGER: "THEATER_ADMIN",
-      PVR_MANAGER: "THEATER_ADMIN",
-      PVR_ADMIN: "THEATER_ADMIN",
-      MANAGER: "THEATER_ADMIN",
-    };
+    // Theatre admin aliases (US/UK + manager variants)
+    if (
+      v === "THEATER_ADMIN" ||
+      v === "THEATER-MANAGER" ||
+      v === "THEATRE_MANAGER" ||
+      v === "PVR_ADMIN" ||
+      v === "PVR_MANAGER" ||
+      v === "MANAGER"
+    ) {
+      return ROLE.THEATRE_ADMIN;
+    }
 
-    return map[v] ?? v;
+    // Keep ADMIN as ADMIN (no escalation)
+    if (v === "ADMIN") return ROLE.ADMIN;
+
+    // Exact known keys or fallback to given value
+    if (v in ROLE) return ROLE[v];
+    return v;
   } catch {
-    return "USER";
+    return ROLE.USER;
   }
 }
 
@@ -82,7 +100,7 @@ export const requireAuth = (req, res, next) => {
       return res.status(401).json({ message: "Token missing subject (sub/id)" });
     }
 
-    // derive a single canonical role
+    // Derive a single canonical role
     const rawRole =
       decoded.role ??
       (Array.isArray(decoded.roles) ? decoded.roles[0] : null) ??
@@ -103,7 +121,7 @@ export const requireAuth = (req, res, next) => {
       id: userId,
       email: decoded.email || null,
       name: decoded.name || decoded.fullName || null,
-      role,                                      // USER | THEATER_ADMIN | SUPER_ADMIN
+      role,                                      // USER | THEATRE_ADMIN | ADMIN | SUPER_ADMIN
       theatreId: theatreId ? String(theatreId) : null,
       theaterId: theatreId ? String(theatreId) : null,
     };
@@ -141,7 +159,7 @@ export const requireRoles = (...allowedArgs) => {
 
 /* -------------------------------------------------------------------------- */
 /* 🎭 Middleware: Require theatre ownership                                    */
-/* THEATER_ADMIN can only manage their own theatre; SUPER_ADMIN bypasses       */
+/* THEATRE_ADMIN can only manage their own theatre; SUPER_ADMIN bypasses       */
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
   const targetTheatreId =
@@ -156,12 +174,12 @@ export const requireTheatreOwnership = (req, res, next) => {
   const role = normalizeRole(user?.role);
 
   // SUPER_ADMIN can manage any theatre
-  if (role === "SUPER_ADMIN") return next();
+  if (role === ROLE.SUPER_ADMIN) return next();
 
-  // THEATER_ADMIN must have a theatreId and match target
+  // THEATRE_ADMIN must have a theatreId and match target
   const myId = user?.theatreId || user?.theaterId;
   if (
-    role === "THEATER_ADMIN" &&
+    role === ROLE.THEATRE_ADMIN &&
     myId &&
     targetTheatreId &&
     String(myId) === String(targetTheatreId)
@@ -176,9 +194,9 @@ export const requireTheatreOwnership = (req, res, next) => {
 /* Backwards-compatible aliases and convenience guards                         */
 /* -------------------------------------------------------------------------- */
 
-// Any admin flavour (SUPER_ADMIN or THEATER_ADMIN)
-export const requireAdmin = requireRoles("SUPER_ADMIN", "THEATER_ADMIN", "ADMIN");
+// Any admin flavour (SUPER_ADMIN or THEATRE_ADMIN) + plain ADMIN
+export const requireAdmin = requireRoles(ROLE.SUPER_ADMIN, ROLE.THEATRE_ADMIN, ROLE.ADMIN);
 
-// Explicit
-export const requireSuperAdmin = requireRoles("SUPER_ADMIN");
-export const requireTheatreAdmin = requireRoles("THEATER_ADMIN"); // UK/US spelling normalized internally
+// Explicit guards
+export const requireSuperAdmin = requireRoles(ROLE.SUPER_ADMIN);
+export const requireTheatreAdmin = requireRoles(ROLE.THEATRE_ADMIN);
