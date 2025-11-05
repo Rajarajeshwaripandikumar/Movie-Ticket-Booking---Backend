@@ -31,7 +31,7 @@ const userSchema = new mongoose.Schema(
       get: (v) => v, // ensure we return the normalized value
     },
 
-    theatreId: { type: mongoose.Schema.Types.ObjectId, ref: "Theatre", default: null },
+    theatreId: { type: mongoose.Schema.Types.ObjectId, ref: "Theater", default: null },
 
     // Keep select:false; remember to .select('+password') when fetching for login
     password: { type: String, required: true, select: false },
