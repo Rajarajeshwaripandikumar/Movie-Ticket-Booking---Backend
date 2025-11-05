@@ -41,31 +41,22 @@ app.use(express.urlencoded({ extended: true, limit: "5mb" }));
  * Server-level middleware: copy ?token= query param into Authorization header.
  * This must run early (before any auth middleware or routers that enforce auth),
  * so EventSource clients that cannot set headers can still authenticate.
- *
- * Security note: tokens in querystrings can be leaked via logs/referrers.
- * Use short-lived tokens for SSE / ensure you do not log the full value.
  */
 function tokenQueryToHeader(req, _res, next) {
   try {
     if (!req.headers.authorization && req.query && req.query.token) {
       req.headers.authorization = `Bearer ${String(req.query.token)}`;
-      // optional debug while rolling out (comment out in production)
-      // console.debug('[auth] set Authorization header from ?token for', req.originalUrl);
     }
-  } catch (err) {
-    // ignore defensively
-  }
+  } catch {}
   next();
 }
-// Apply it very early
 app.use(tokenQueryToHeader);
 
 // ---------- TEMP DEBUG: simple request logger (remove in production) ----------
 app.use((req, res, next) => {
-  // do not log full token (sensitive) — only show path + method + timestamp
   try {
     console.log(`[REQ] ${new Date().toISOString()} ${req.ip} ${req.method} ${req.originalUrl}`);
-  } catch (e) {}
+  } catch {}
   next();
 });
 // ---------------------------------------------------------------------------
@@ -93,7 +84,8 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  // ⬇️ include X-Role
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Role"],
   exposedHeaders: ["Content-Length", "Content-Type"],
   optionsSuccessStatus: 204,
 };
@@ -103,13 +95,7 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 /**
- * Additional robust CORS header middleware:
- * - Ensure Access-Control-Allow-Origin is explicitly set on every response
- * - Set Vary: Origin so CDNs/proxies cache correctly per-origin
- * - Short-circuit OPTIONS requests if not already handled
- *
- * This helps ensure that platforms (Render, proxies) don't strip the header
- * or that some routes that send raw streaming responses still include the header.
+ * Additional robust CORS header middleware
  */
 app.use((req, res, next) => {
   try {
@@ -123,12 +109,12 @@ app.use((req, res, next) => {
     }
     // ensure these are present for browsers during preflight
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept");
+    // ⬇️ include X-Role
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, X-Role");
     // if you use cookies or other credentials, keep this true and avoid wildcard origin
     res.setHeader("Access-Control-Allow-Credentials", "true");
     if (req.method === "OPTIONS") return res.sendStatus(corsOptions.optionsSuccessStatus || 204);
   } catch (err) {
-    // continue even if header-setting fails
     console.warn("[CORS-middleware] header set failed:", err?.message || err);
   }
   next();
@@ -173,7 +159,6 @@ try {
 
 // Add header so static uploaded files can be embedded cross-origin
 app.use("/uploads", (req, res, next) => {
-  // use request origin if allowed, otherwise fallback to FRONTEND_ORIGIN
   const origin = req.headers.origin;
   if (origin && allowedOrigins.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -232,10 +217,6 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
 });
 
 /* ----------------------------- SSE / EventSource --------------------------- */
-/*
-  Use the centralized SSE module (socket/sse.js) which handles authentication,
-  client registration, init payloads (notifications), and push helpers.
-*/
 app.options("/api/notifications/stream", sse.ssePreflight);
 app.get("/api/notifications/stream", sse.sseHandler);
 app.options("/notifications/stream", sse.ssePreflight);
@@ -258,9 +239,8 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
       streamifier.createReadStream(req.file.buffer).pipe(stream);
     });
 
-    // ensure CORS header set for the response
     const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+    if (origin && allowedOrigins.has(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
 
     res.json({ ok: true, url: result.secure_url, public_id: result.public_id });
   } catch (err) {
@@ -271,7 +251,13 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
 
 /* --------------------------- Mount other routers (ESM-safe) --------------------------- */
 try {
-  const routers = ["./routes/theaters.routes.js", "./routes/movies.routes.js", "./routes/upload.routes.js"];
+  const routers = [
+    "./routes/theaters.routes.js",
+    "./routes/movies.routes.js",
+    "./routes/upload.routes.js",
+    "./routes/showtimes.routes.js",     // ✅ mount showtimes (includes admin alias)
+    "./routes/superadmin.routes.js",    // ✅ mount superadmin routes
+  ];
 
   for (const rpath of routers) {
     try {
@@ -281,7 +267,6 @@ try {
         continue;
       }
 
-      // convert to file:// URL and use dynamic import (ESM)
       const fileUrl = pathToFileURL(absPath).href;
       const mod = await import(fileUrl);
       const router = mod.default || mod;
@@ -302,7 +287,6 @@ try {
 }
 
 /* --------------------------- Dev helper routes --------------------------- */
-// Dev-only: trigger analytics snapshot to admin clients
 if ((process.env.NODE_ENV || "development") !== "production") {
   app.post("/dev/emit-snapshot", express.json(), async (req, res) => {
     try {
@@ -371,10 +355,8 @@ function getMountedRoutes() {
   const stack = app._router && app._router.stack ? app._router.stack : [];
   stack.forEach((middleware) => {
     if (middleware.route) {
-      // direct route
       routes.push({ path: middleware.route.path, methods: Object.keys(middleware.route.methods) });
     } else if (middleware.name === "router" && middleware.handle && middleware.handle.stack) {
-      // router with nested routes
       middleware.handle.stack.forEach((handler) => {
         if (handler.route) {
           routes.push({ path: handler.route.path, methods: Object.keys(handler.route.methods) });
