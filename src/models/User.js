@@ -1,16 +1,20 @@
-// backend/src/models/user.model.js
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 
 /* ------------------------------- Role constants ------------------------------ */
 export const ROLE = {
   USER: "USER",
-  THEATRE_ADMIN: "THEATRE_ADMIN", // canonical
+  THEATRE_ADMIN: "THEATRE_ADMIN",
   SUPER_ADMIN: "SUPER_ADMIN",
 };
 
-// Accept both spellings, but we'll normalize to THEATRE_ADMIN via `set`
-const ROLE_ENUM_ACCEPTED = [USER, THEATRE_ADMIN, SUPER_ADMIN, "THEATER_ADMIN"];
+// ✅ FIXED
+const ROLE_ENUM_ACCEPTED = [
+  ROLE.USER,
+  ROLE.THEATRE_ADMIN,
+  ROLE.SUPER_ADMIN,
+  "THEATER_ADMIN", // accepted spelling, normalized → THEATRE_ADMIN
+];
 
 const userSchema = new mongoose.Schema(
   {
@@ -25,15 +29,15 @@ const userSchema = new mongoose.Schema(
       set: (v) => {
         if (!v) return ROLE.USER;
         const val = String(v).toUpperCase().trim();
-        if (val === "THEATER_ADMIN") return ROLE.THEATRE_ADMIN; // normalize US -> UK
+        if (val === "THEATER_ADMIN") return ROLE.THEATRE_ADMIN;
         return val;
       },
-      get: (v) => v, // ensure we return the normalized value
+      get: (v) => v,
     },
 
+    // ✅ YOUR REF NAME IS NOW CORRECT
     theatreId: { type: mongoose.Schema.Types.ObjectId, ref: "Theater", default: null },
 
-    // Keep select:false; remember to .select('+password') when fetching for login
     password: { type: String, required: true, select: false },
 
     preferences: {
@@ -63,19 +67,13 @@ const userSchema = new mongoose.Schema(
   }
 );
 
-/* 🔐 Hash password before saving */
 userSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
-  try {
-    const salt = await bcrypt.genSalt(10);
-    this.password = await bcrypt.hash(this.password, salt);
-    next();
-  } catch (err) {
-    next(err);
-  }
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
+  next();
 });
 
-/* (Optional) Hash on findOneAndUpdate if password is being updated */
 userSchema.pre("findOneAndUpdate", async function (next) {
   const update = this.getUpdate?.() || {};
   if (update.password) {
@@ -86,16 +84,9 @@ userSchema.pre("findOneAndUpdate", async function (next) {
   next();
 });
 
-/* 🔑 Compare passwords */
 userSchema.methods.compare = async function (enteredPassword) {
-  try {
-    return await bcrypt.compare(enteredPassword, this.password);
-  } catch (err) {
-    console.error("Password comparison error:", err);
-    return false;
-  }
+  return bcrypt.compare(enteredPassword, this.password);
 };
 
-/* ✅ Export model */
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 export default User;
