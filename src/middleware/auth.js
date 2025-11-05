@@ -3,6 +3,25 @@ import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
+/* --------------------------------- helpers -------------------------------- */
+function normalizeRole(raw) {
+  if (raw === undefined || raw === null) return "USER";
+  try {
+    const v = String(raw).trim().toUpperCase().replace(/\s+/g, "_");
+    if (v === "THEATRE_ADMIN") return "THEATER_ADMIN"; // UK -> US spelling
+    if (v === "ADMIN") return "SUPER_ADMIN";           // legacy -> canonical
+    return v;
+  } catch {
+    return "USER";
+  }
+}
+
+function normalizeRoleList(xs) {
+  if (!xs) return [];
+  if (Array.isArray(xs)) return xs.map(normalizeRole);
+  return [normalizeRole(xs)];
+}
+
 /* -------------------------------------------------------------------------- */
 /* 🧩 Middleware: Verify JWT and attach user info                              */
 /* -------------------------------------------------------------------------- */
@@ -12,8 +31,8 @@ export const requireAuth = (req, res, next) => {
 
     // 1️⃣ Authorization header
     const authHeader = req.headers.authorization;
-    if (authHeader && typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
-      token = authHeader.slice(7).trim();
+    if (authHeader && typeof authHeader === "string" && /^Bearer\s+/i.test(authHeader)) {
+      token = authHeader.replace(/^Bearer\s+/i, "").trim();
     }
 
     // 2️⃣ Cookie fallback
@@ -38,26 +57,36 @@ export const requireAuth = (req, res, next) => {
     const decoded = jwt.verify(token, JWT_SECRET);
 
     const userId = String(
-      decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId
+      decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId ?? decoded.user?.id ?? ""
     );
     if (!userId) {
-      return res.status(401).json({ message: "Token missing subject (sub)" });
+      return res.status(401).json({ message: "Token missing subject (sub/id)" });
     }
 
+    // derive a single canonical role
     const rawRole =
       decoded.role ??
       (Array.isArray(decoded.roles) ? decoded.roles[0] : null) ??
       (decoded.isAdmin ? "ADMIN" : "USER");
 
-    const normalizedRole = rawRole ? String(rawRole).toUpperCase() : "USER";
+    const role = normalizeRole(rawRole);
+
+    // accept both theatreId/theaterId from token, but expose both on req.user
+    const theatreId =
+      decoded.theatreId ??
+      decoded.theatre?.id ??
+      decoded.theaterId ??
+      decoded.theater?.id ??
+      null;
 
     req.user = {
       _id: userId,
       id: userId,
       email: decoded.email || null,
       name: decoded.name || decoded.fullName || null,
-      role: normalizedRole,
-      theatreId: decoded.theatreId ?? decoded.theatre?.id ?? null, // carry theatre link for theatre-admins
+      role,                // canonicalized: USER | THEATER_ADMIN | SUPER_ADMIN
+      theatreId: theatreId ? String(theatreId) : null, // backend naming
+      theaterId: theatreId ? String(theatreId) : null, // frontend-friendly naming
     };
 
     // convenient local
@@ -72,50 +101,43 @@ export const requireAuth = (req, res, next) => {
 
 /* -------------------------------------------------------------------------- */
 /* 🛡️ Middleware: Require specific roles                                       */
-/* Usage: app.post("/admin", requireAuth, requireRoles("SUPER_ADMIN"), handler)*/
-/* Accepts either multiple args or a single array: requireRoles("A","B") or requireRoles(["A","B"]) */
+/* Accepts either multiple args or a single array                              */
 /* -------------------------------------------------------------------------- */
 export const requireRoles = (...allowedArgs) => {
-  // support requireRoles(["A","B"]) or requireRoles("A","B")
   const allowed = Array.isArray(allowedArgs[0]) ? allowedArgs[0] : allowedArgs;
-  const normalized = allowed.map((r) => String(r || "").toUpperCase());
+  const normalizedAllowed = allowed.map(normalizeRole);
 
   return (req, res, next) => {
     if (!req.user) {
       return res.status(401).json({ message: "Unauthorized (no user)" });
     }
-
-    const role = String(req.user.role || "USER").toUpperCase();
-    if (!normalized.includes(role)) {
-      console.warn("[Auth] Access denied for role:", role, "allowed:", normalized);
+    const have = normalizeRole(req.user.role);
+    if (!normalizedAllowed.includes(have)) {
+      console.warn("[Auth] Access denied for role:", have, "allowed:", normalizedAllowed);
       return res.status(403).json({ message: "Access denied — insufficient role" });
     }
-
     next();
   };
 };
 
 /* -------------------------------------------------------------------------- */
 /* 🎭 Middleware: Require theatre ownership                                    */
-/* Ensures a theatre-admin can only edit/manage their own theatre              */
-/* Example usage:
-     router.put("/admin/theaters/:theatreId", requireAuth, requireRoles("SUPER_ADMIN","THEATRE_ADMIN"), requireTheatreOwnership, handler)
-   SUPER_ADMIN bypasses this check (has global rights)
-   THEATRE_ADMIN must have req.user.theatreId === targetTheatreId
+/* THEATER_ADMIN can only manage their own theatre; SUPER_ADMIN bypasses       */
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
-  const targetTheatreId = req.body?.theatreId ?? req.params?.theatreId ?? req.query?.theatreId;
+  const targetTheatreId =
+    req.body?.theatreId ?? req.params?.theatreId ?? req.query?.theatreId ??
+    req.body?.theaterId ?? req.params?.theaterId ?? req.query?.theaterId;
+
   const user = req.user;
+  const role = normalizeRole(user?.role);
 
   // SUPER_ADMIN can manage any theatre
-  if (user?.role === "SUPER_ADMIN") return next();
+  if (role === "SUPER_ADMIN") return next();
 
-  // Theatre admin must have theatreId and match target
-  if (
-    user?.role === "THEATRE_ADMIN" &&
-    user.theatreId &&
-    String(user.theatreId) === String(targetTheatreId)
-  ) {
+  // THEATER_ADMIN must have a theatreId and match target
+  const myId = user?.theatreId || user?.theaterId;
+  if (role === "THEATER_ADMIN" && myId && targetTheatreId && String(myId) === String(targetTheatreId)) {
     return next();
   }
 
@@ -124,15 +146,11 @@ export const requireTheatreOwnership = (req, res, next) => {
 
 /* -------------------------------------------------------------------------- */
 /* Backwards-compatible aliases and convenience guards                         */
-/* - requireAdmin: old code may import this directly                           */
-/* - requireSuperAdmin / requireTheatreAdmin: explicit helpers                 */
 /* -------------------------------------------------------------------------- */
 
-// requireAdmin: keep old import working — allow any admin flavour
-export const requireAdmin = requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN");
+// Any admin flavour (SUPER_ADMIN or THEATER_ADMIN)
+export const requireAdmin = requireRoles("SUPER_ADMIN", "THEATER_ADMIN", "ADMIN");
 
-// requireSuperAdmin: explicit single-role helper
+// Explicit
 export const requireSuperAdmin = requireRoles("SUPER_ADMIN");
-
-// requireTheatreAdmin: explicit single-role helper (does NOT include SUPER_ADMIN)
-export const requireTheatreAdmin = requireRoles("THEATRE_ADMIN");
+export const requireTheatreAdmin = requireRoles("THEATER_ADMIN"); // spelling normalized internally
