@@ -4,22 +4,23 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import User from "../models/User.js";
-import Theater from "../models/Theater.js"; // for linking theatre admins
-import mailer from "../models/mailer.js"; // must export createResetUrl, resetPasswordTemplate, sendEmail
+import Theater from "../models/Theater.js"; // for linking theatre admins (kept for future use)
+import mailer from "../models/mailer.js";   // must export createResetUrl, resetPasswordTemplate, sendEmail
 
 const router = express.Router();
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                                   CONSTS                                    */
+/* -------------------------------------------------------------------------- */
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 const JWT_EXPIRES = process.env.JWT_EXPIRES || "7d";
 const TOKEN_SIZE_BYTES = 32;
-const RESET_EXPIRES_MS = Number(process.env.RESET_TOKEN_EXPIRES_MINUTES || 60) * 60 * 1000;
+const RESET_EXPIRES_MS =
+  Number(process.env.RESET_TOKEN_EXPIRES_MINUTES || 60) * 60 * 1000;
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                                   HELPERS                                   */
+/* -------------------------------------------------------------------------- */
 function signToken(user) {
   return jwt.sign(
     {
@@ -43,7 +44,8 @@ function safeUserPayload(userDoc) {
     phone: u.phone || "",
     role: u.role || "USER",
     theatreId: u.theatreId || null,
-    preferences: u.preferences || { language: "en", notifications: { email: true, sms: false } },
+    preferences:
+      u.preferences || { language: "en", notifications: { email: true, sms: false } },
     bookings: u.bookings || [],
     createdAt: u.createdAt,
   };
@@ -53,60 +55,63 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-// -----------------------------------------------------------------------------
-// USER REGISTRATION
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                              USER REGISTRATION                              */
+/* -------------------------------------------------------------------------- */
 router.post("/register", async (req, res) => {
   try {
     const { email, password, name, phone } = req.body;
-    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
 
-    const existing = await User.findOne({ email: email.toLowerCase() });
+    const existing = await User.findOne({ email: String(email).toLowerCase() });
     if (existing) return res.status(409).json({ message: "Email already registered" });
 
     const user = new User({
-      email: email.toLowerCase(),
+      email: String(email).toLowerCase(),
       name: name || "",
       phone: phone || "",
       role: "USER", // only users can self-register
-      password, // pre-save hook hashes
+      password,     // pre-save hook hashes
     });
 
     await user.save();
     const token = signToken(user);
-    res.status(201).json({ message: "Registered successfully", token, user: safeUserPayload(user) });
+    return res
+      .status(201)
+      .json({ message: "Registered successfully", token, user: safeUserPayload(user) });
   } catch (err) {
     console.error("REGISTER_ERROR:", err.message);
-    res.status(500).json({ message: "Failed to register" });
+    return res.status(500).json({ message: "Failed to register" });
   }
 });
 
-// -----------------------------------------------------------------------------
-// LOGIN (for all roles)
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                                    LOGIN                                   */
+/* -------------------------------------------------------------------------- */
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)
       return res.status(400).json({ message: "Email and password required" });
 
-    const user = await User.findOne({ email: email.toLowerCase() }).select("+password");
+    const user = await User.findOne({ email: String(email).toLowerCase() }).select("+password");
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
     const match = await user.compare(password);
     if (!match) return res.status(401).json({ message: "Incorrect password" });
 
     const token = signToken(user);
-    res.json({ message: "Login successful", token, user: safeUserPayload(user) });
+    return res.json({ message: "Login successful", token, user: safeUserPayload(user) });
   } catch (err) {
     console.error("LOGIN_ERROR:", err.message);
-    res.status(500).json({ message: "Login failed" });
+    return res.status(500).json({ message: "Login failed" });
   }
 });
 
-// -----------------------------------------------------------------------------
-// CREATE SUPER ADMIN (one-time setup)
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                           CREATE FIRST SUPER ADMIN                          */
+/* -------------------------------------------------------------------------- */
 router.post("/create-superadmin", async (req, res) => {
   try {
     const { email, password, name } = req.body;
@@ -121,16 +126,19 @@ router.post("/create-superadmin", async (req, res) => {
       role: "SUPER_ADMIN",
     });
 
-    res.json({ message: "Super Admin created successfully", superAdmin: safeUserPayload(superAdmin) });
+    return res.json({
+      message: "Super Admin created successfully",
+      superAdmin: safeUserPayload(superAdmin),
+    });
   } catch (err) {
     console.error("CREATE_SUPERADMIN_ERROR:", err.message);
-    res.status(500).json({ message: "Failed to create super admin" });
+    return res.status(500).json({ message: "Failed to create super admin" });
   }
 });
 
-// -----------------------------------------------------------------------------
-// ME (profile)
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                                     ME                                     */
+/* -------------------------------------------------------------------------- */
 router.get("/me", async (req, res) => {
   try {
     const header = req.headers.authorization || "";
@@ -141,16 +149,16 @@ router.get("/me", async (req, res) => {
     const user = await User.findById(decoded.sub);
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    res.json({ user: safeUserPayload(user) });
+    return res.json({ user: safeUserPayload(user) });
   } catch (err) {
     console.error("ME_ERROR:", err.message);
-    res.status(401).json({ message: "Invalid or expired token" });
+    return res.status(401).json({ message: "Invalid or expired token" });
   }
 });
 
-// -----------------------------------------------------------------------------
-// CHANGE PASSWORD
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                               CHANGE PASSWORD                               */
+/* -------------------------------------------------------------------------- */
 router.post("/change-password", async (req, res) => {
   try {
     const header = req.headers.authorization || "";
@@ -163,7 +171,9 @@ router.post("/change-password", async (req, res) => {
 
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword)
-      return res.status(400).json({ message: "Both current and new passwords required" });
+      return res
+        .status(400)
+        .json({ message: "Both current and new passwords required" });
 
     const match = await user.compare(currentPassword);
     if (!match) return res.status(400).json({ message: "Current password incorrect" });
@@ -171,16 +181,16 @@ router.post("/change-password", async (req, res) => {
     user.password = newPassword;
     await user.save();
 
-    res.json({ message: "Password changed successfully" });
+    return res.json({ message: "Password changed successfully" });
   } catch (err) {
     console.error("CHANGE_PASSWORD_ERROR:", err.message);
-    res.status(500).json({ message: "Failed to change password" });
+    return res.status(500).json({ message: "Failed to change password" });
   }
 });
 
-// -----------------------------------------------------------------------------
-// FORGOT PASSWORD + RESET PASSWORD (unchanged)
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/*                        FORGOT / RESET PASSWORD FLOW                         */
+/* -------------------------------------------------------------------------- */
 router.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
@@ -204,11 +214,10 @@ router.post("/forgot-password", async (req, res) => {
       userId: user._id,
       email: normalizedEmail,
     });
-    const resetUrl = resetFrontendUrl;
 
     const html = mailer.resetPasswordTemplate({
       name: user.name || user.email,
-      resetUrl,
+      resetUrl: resetFrontendUrl,
       expiresMinutes: Math.round(RESET_EXPIRES_MS / 60000),
     });
 
@@ -216,7 +225,7 @@ router.post("/forgot-password", async (req, res) => {
       to: normalizedEmail,
       subject: "Reset your password",
       html,
-      text: `Reset your password: ${resetUrl}`,
+      text: `Reset your password: ${resetFrontendUrl}`,
     });
 
     return res.json({ message: genericMsg });
@@ -260,5 +269,11 @@ router.post("/reset-password", async (req, res) => {
     return res.status(500).json({ message: "Failed to reset password." });
   }
 });
+
+/* -------------------------------------------------------------------------- */
+/*                                ROUTER PREFIX                                */
+/* -------------------------------------------------------------------------- */
+// Ensure the server auto-mounter mounts this router at /api/auth/*
+router.routesPrefix = "/api/auth";
 
 export default router;
