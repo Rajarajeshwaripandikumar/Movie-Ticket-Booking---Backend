@@ -19,9 +19,9 @@ function normalizeRole(raw) {
       THEATRE_ADMIN: "THEATER_ADMIN",   // UK -> US spelling
       THEATRE_MANAGER: "THEATER_ADMIN",
       THEATER_MANAGER: "THEATER_ADMIN",
-      PVR_MANAGER: "THEATER_ADMIN",     // 👈 key alias
+      PVR_MANAGER: "THEATER_ADMIN",
       PVR_ADMIN: "THEATER_ADMIN",
-      MANAGER: "THEATER_ADMIN",         // generic fall-in, if used
+      MANAGER: "THEATER_ADMIN",
     };
 
     return map[v] ?? v;
@@ -40,6 +40,11 @@ function normalizeRoleList(xs) {
 /* 🧩 Middleware: Verify JWT and attach user info                              */
 /* -------------------------------------------------------------------------- */
 export const requireAuth = (req, res, next) => {
+  // ✅ Never block CORS preflight (lets the browser proceed to the real request)
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
   try {
     let token = null;
 
@@ -49,7 +54,7 @@ export const requireAuth = (req, res, next) => {
       token = authHeader.replace(/^Bearer\s+/i, "").trim();
     }
 
-    // 2️⃣ Cookie fallback
+    // 2️⃣ Cookie fallback (only relevant if you actually set cookies)
     if (!token && req.cookies?.token) {
       token = String(req.cookies.token);
     }
@@ -98,9 +103,9 @@ export const requireAuth = (req, res, next) => {
       id: userId,
       email: decoded.email || null,
       name: decoded.name || decoded.fullName || null,
-      role,                                // canonical: USER | THEATER_ADMIN | SUPER_ADMIN
-      theatreId: theatreId ? String(theatreId) : null, // backend naming
-      theaterId: theatreId ? String(theatreId) : null, // frontend-friendly naming
+      role,                                      // USER | THEATER_ADMIN | SUPER_ADMIN
+      theatreId: theatreId ? String(theatreId) : null,
+      theaterId: theatreId ? String(theatreId) : null,
     };
 
     // convenient local
@@ -140,8 +145,12 @@ export const requireRoles = (...allowedArgs) => {
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
   const targetTheatreId =
-    req.body?.theatreId ?? req.params?.theatreId ?? req.query?.theatreId ??
-    req.body?.theaterId ?? req.params?.theaterId ?? req.query?.theaterId;
+    req.body?.theatreId ??
+    req.params?.theatreId ??
+    req.query?.theatreId ??
+    req.body?.theaterId ??
+    req.params?.theaterId ??
+    req.query?.theaterId;
 
   const user = req.user;
   const role = normalizeRole(user?.role);
@@ -151,7 +160,12 @@ export const requireTheatreOwnership = (req, res, next) => {
 
   // THEATER_ADMIN must have a theatreId and match target
   const myId = user?.theatreId || user?.theaterId;
-  if (role === "THEATER_ADMIN" && myId && targetTheatreId && String(myId) === String(targetTheatreId)) {
+  if (
+    role === "THEATER_ADMIN" &&
+    myId &&
+    targetTheatreId &&
+    String(myId) === String(targetTheatreId)
+  ) {
     return next();
   }
 
