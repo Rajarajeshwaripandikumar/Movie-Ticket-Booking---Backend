@@ -2,17 +2,30 @@
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import debugFactory from "debug";
+
 const debug = debugFactory("app:sse");
 
-/* ----------------------------- config ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/*                                   CONFIG                                   */
+/* -------------------------------------------------------------------------- */
 const JWT_SECRET =
-  process.env.JWT_SECRET || process.env.JWT_SECRET_BASE64 || "dev_jwt_secret_change_me";
+  process.env.JWT_SECRET ||
+  process.env.JWT_SECRET_BASE64 ||
+  "dev_jwt_secret_change_me";
 const JWT_PUBLIC_KEY = process.env.JWT_PUBLIC_KEY || null;
 
 const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
-const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
+const MAX_CLIENTS_PER_USER = parseInt(
+  process.env.SSE_MAX_CLIENTS_PER_USER || "8",
+  10
+);
 
-/* -------------------------- helpers --------------------------- */
+// In-memory channel -> Set<res>
+global.sseClients = global.sseClients || new Map();
+
+/* -------------------------------------------------------------------------- */
+/*                                  HELPERS                                   */
+/* -------------------------------------------------------------------------- */
 function sseWriteRaw(res, str) {
   try {
     if (!res || res.writableEnded || res.destroyed) return false;
@@ -22,6 +35,7 @@ function sseWriteRaw(res, str) {
     return false;
   }
 }
+
 function sseWrite(res, { event, id, data }) {
   if (!res || res.writableEnded || res.destroyed) return false;
   if (event) sseWriteRaw(res, `event: ${event}\n`);
@@ -29,7 +43,10 @@ function sseWrite(res, { event, id, data }) {
   try {
     sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
   } catch {
-    sseWriteRaw(res, `data: ${JSON.stringify({ error: "stringify_failed" })}\n\n`);
+    sseWriteRaw(
+      res,
+      `data: ${JSON.stringify({ error: "stringify_failed" })}\n\n`
+    );
   }
   return true;
 }
@@ -39,7 +56,10 @@ function parseCookie(header) {
   if (!header) return out;
   header.split(";").forEach((pair) => {
     const i = pair.indexOf("=");
-    if (i > -1) out[pair.slice(0, i).trim()] = decodeURIComponent(pair.slice(i + 1).trim());
+    if (i > -1)
+      out[pair.slice(0, i).trim()] = decodeURIComponent(
+        pair.slice(i + 1).trim()
+      );
   });
   return out;
 }
@@ -60,19 +80,19 @@ function sanitizeToken(raw) {
   try {
     raw = decodeURIComponent(raw);
   } catch {}
-  if ((raw.match(/\./g) || []).length !== 2) return null;
+  if ((raw.match(/\./g) || []).length !== 2) return null; // basic JWT shape
   return raw;
 }
 
 function roleFromDecoded(decoded) {
-  const r = decoded?.role || decoded?.roleName || decoded?.roles?.[0] || "USER";
+  const r =
+    decoded?.role || decoded?.roleName || decoded?.roles?.[0] || "USER";
   return String(r).toUpperCase().includes("ADMIN") ? "ADMIN" : "USER";
 }
 
-/* ----------------------- in-process client store ------------------- */
-global.sseClients = global.sseClients || new Map();
-
-/* -------------------------- CORS preflight ------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                CORS PREFLIGHT                              */
+/* -------------------------------------------------------------------------- */
 export const ssePreflight = (req, res) => {
   const origin = req.headers.origin;
   if (origin) {
@@ -80,16 +100,22 @@ export const ssePreflight = (req, res) => {
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-Role");
-  // You’re using Authorization headers (not cookies), so credentials not needed:
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    // Include Origin because some browsers list it in Access-Control-Request-Headers
+    "Authorization, Content-Type, Last-Event-ID, X-Role, Origin"
+  );
+  // You are using Authorization headers (not cookies)
   res.setHeader("Access-Control-Allow-Credentials", "false");
   return res.sendStatus(204);
 };
 
-/* ------------------------------ SSE handler ------------------------ */
+/* -------------------------------------------------------------------------- */
+/*                                 SSE HANDLER                                */
+/* -------------------------------------------------------------------------- */
 export const sseHandler = async (req, res) => {
   try {
-    // Always set CORS headers first so even errors include ACAO
+    // CORS first so even auth errors include ACAO
     const origin = req.headers.origin;
     if (origin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
@@ -97,9 +123,9 @@ export const sseHandler = async (req, res) => {
     }
     res.setHeader("Access-Control-Allow-Credentials", "false");
 
+    // ---- Auth (supports header, query, cookie) ----
     const rawToken = extractToken(req);
     const token = sanitizeToken(rawToken);
-
     if (!token) {
       res.status(401).type("text/plain; charset=utf-8");
       return res.end("Unauthorized: missing or invalid ?token");
@@ -115,7 +141,12 @@ export const sseHandler = async (req, res) => {
       return res.end(`Unauthorized: invalid token (${err?.name})`);
     }
 
-    const userId = decoded.sub || decoded._id || decoded.id || decoded.userId || decoded.user?.id;
+    const userId =
+      decoded.sub ||
+      decoded._id ||
+      decoded.id ||
+      decoded.userId ||
+      decoded.user?.id;
     if (!userId) {
       res.status(401).type("text/plain; charset=utf-8");
       return res.end("Unauthorized: token missing user id");
@@ -126,44 +157,59 @@ export const sseHandler = async (req, res) => {
     const scope = (req.query?.scope || "user").toLowerCase();
     const channel = isAdmin && scope === "admin" ? "admin" : String(userId);
 
-    // SSE headers
-    res.setHeader("Content-Type", "text/event-stream");
+    // ---- SSE headers (do NOT use writeHead) ----
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
-    sseWriteRaw(res, "retry: 10000\n\n");
+    res.setHeader("X-Accel-Buffering", "no"); // nginx hint (no buffering)
+
+    // EventSource backoff hint + hello comment (useful in DevTools)
+    sseWriteRaw(res, "retry: 10000\n");
+    sseWriteRaw(res, `: hello ${Date.now()}\n\n`);
+
+    // Flush headers early (when supported)
     res.flushHeaders?.();
 
-    // Register client
+    // ---- Register client ----
     const set = global.sseClients.get(channel) || new Set();
     if (set.size >= MAX_CLIENTS_PER_USER) {
-      sseWrite(res, { event: "error", data: { message: "too_many_connections" } });
+      sseWrite(res, {
+        event: "error",
+        data: { message: "too_many_connections" },
+      });
       return res.end();
     }
     set.add(res);
     global.sseClients.set(channel, set);
 
+    // ---- Initial events ----
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-    // Initial payload
     try {
+      // Optional initial notifications payload
       const Notification = mongoose.model("Notification");
       const limit = Math.min(Number(req.query?.limit) || 20, 100);
       const or =
         channel === "admin"
           ? [{ audience: "ADMIN" }, { audience: "ALL" }]
           : [{ user: userId }, { audience: "ALL" }];
+
       const initial = await Notification.find({ $or: or })
         .sort({ createdAt: -1 })
         .limit(limit)
         .lean();
+
       sseWrite(res, { event: "init", data: { notifications: initial } });
-    } catch {
+    } catch (e) {
+      // If the model isn't registered, just send an empty init
       sseWrite(res, { event: "init", data: { notifications: [] } });
     }
 
-    // Heartbeat
-    const ping = setInterval(() => sseWriteRaw(res, `: ping ${Date.now()}\n\n`), HEARTBEAT_MS);
+    // ---- Heartbeat to keep intermediaries from closing the stream ----
+    const ping = setInterval(
+      () => sseWriteRaw(res, `: ping ${Date.now()}\n\n`),
+      HEARTBEAT_MS
+    );
 
     const cleanup = () => {
       clearInterval(ping);
@@ -188,7 +234,9 @@ export const sseHandler = async (req, res) => {
   }
 };
 
-/* ------------------------ Push helpers ---------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                PUSH HELPERS                                */
+/* -------------------------------------------------------------------------- */
 function pushToChannel(channelKey, payload, { eventName } = {}) {
   const set = global.sseClients.get(String(channelKey));
   if (!set) return 0;
@@ -199,23 +247,69 @@ function pushToChannel(channelKey, payload, { eventName } = {}) {
 
 export const pushToUser = (userId, payload, opts = {}) =>
   pushToChannel(String(userId), payload, opts);
-export const pushToAdmins = (payload, opts = {}) => pushToChannel("admin", payload, opts);
+
+export const pushToAdmins = (payload, opts = {}) =>
+  pushToChannel("admin", payload, opts);
 
 export const pushNotification = (doc) => {
   const payload = doc?.toObject ? doc.toObject() : doc;
-  if (payload.audience === "ADMIN") return pushToAdmins(payload, { eventName: "notification" });
+  if (payload.audience === "ADMIN")
+    return pushToAdmins(payload, { eventName: "notification" });
+
   if (payload.audience === "ALL") {
     pushToAdmins(payload, { eventName: "notification" });
-    if (payload.user) pushToUser(payload.user, payload, { eventName: "notification" });
+    if (payload.user)
+      pushToUser(payload.user, payload, { eventName: "notification" });
     return;
   }
-  if (payload.user) pushToUser(payload.user, payload, { eventName: "notification" });
+
+  if (payload.user)
+    pushToUser(payload.user, payload, { eventName: "notification" });
 };
 
-/* ---------------------- Analytics / Watcher stubs ----------------- */
-export async function emitAnalyticsSnapshot(options = {}) { /* unchanged */ }
-export function startBookingWatcher() { /* unchanged */ }
+/* -------------------------------------------------------------------------- */
+/*                     ANALYTICS SNAPSHOT / WATCHER STUBS                     */
+/* -------------------------------------------------------------------------- */
+// Emits a lightweight analytics snapshot to admins; customize as needed.
+export async function emitAnalyticsSnapshot(options = {}) {
+  try {
+    const { days = 30 } = options;
+    const payload = {
+      type: "analytics_snapshot",
+      days,
+      ts: Date.now(),
+      // add real numbers here if you want:
+      metrics: {
+        activeUsers: undefined,
+        ticketsSold: undefined,
+        revenue: undefined,
+      },
+    };
+    return pushToAdmins(payload, { eventName: "analytics" });
+  } catch (e) {
+    debug("emitAnalyticsSnapshot error:", e?.message || e);
+    return 0;
+  }
+}
 
+// Example watcher stub; plug in a Mongo change stream if desired.
+export function startBookingWatcher() {
+  try {
+    // Example: attach to a Mongoose model change stream and push to admins
+    // const Booking = mongoose.model("Booking");
+    // const cs = Booking.watch([], { fullDocument: "updateLookup" });
+    // cs.on("change", (change) => {
+    //   pushToAdmins({ type: "booking_change", change }, { eventName: "booking" });
+    // });
+    debug("startBookingWatcher: no-op (stub). Add change streams if needed.");
+  } catch (e) {
+    debug("startBookingWatcher error:", e?.message || e);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   EXPORTS                                  */
+/* -------------------------------------------------------------------------- */
 export default {
   sseHandler,
   ssePreflight,
