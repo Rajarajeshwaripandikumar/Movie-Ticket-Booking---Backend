@@ -7,13 +7,17 @@ import Theater from "../models/Theater.js";
 import { requireAuth, requireRoles } from "../middleware/auth.js";
 
 const router = Router();
-// ✅ ensure it mounts at /api/superadmin (server.js uses routesPrefix if present)
+// Mount at /api/superadmin (server.js should honor routesPrefix if implemented)
 router.routesPrefix = "/api/superadmin";
+
+/* utils */
+const normEmail = (e) => String(e || "").trim().toLowerCase();
+const isObjId = (v) => mongoose.isValidObjectId(String(v || ""));
 
 /* -------------------------------------------------------------------------- */
 /* 🎭 Create Theatre Admin (SUPER_ADMIN only)                                  */
 /* POST /api/superadmin/create-theatre-admin                                   */
-/* Body: { name, email, password, theatreId }                                  */
+/* Body: { name, email, password, theatreId | theaterId }                      */
 /* -------------------------------------------------------------------------- */
 router.post(
   "/create-theatre-admin",
@@ -21,42 +25,49 @@ router.post(
   requireRoles("SUPER_ADMIN"),
   async (req, res) => {
     try {
-      const { name, email, password, theatreId } = req.body;
+      const name = String(req.body?.name || "").trim();
+      const email = normEmail(req.body?.email);
+      const password = String(req.body?.password || "");
+      // accept both spellings; store on User as `theatreId` if your schema uses that
+      const theatreId = req.body?.theatreId || req.body?.theaterId;
 
       if (!name || !email || !password || !theatreId) {
-        return res.status(400).json({ message: "All fields are required" });
+        return res.status(400).json({ code: "BAD_REQUEST", message: "name, email, password, theatreId required" });
       }
-      if (!mongoose.isValidObjectId(String(theatreId))) {
-        return res.status(400).json({ message: "Invalid theatreId" });
+      if (!isObjId(theatreId)) {
+        return res.status(400).json({ code: "INVALID_THEATRE_ID", message: "Invalid theatreId" });
       }
 
-      // 409 #1: email already used
-      const existingByEmail = await User.findOne({ email }).select("_id");
+      // 409 #1: email already used (case-insensitive)
+      const existingByEmail = await User.findOne({ email }).select("_id").lean();
       if (existingByEmail) {
-        return res.status(409).json({ message: "Email already exists" });
+        return res.status(409).json({ code: "EMAIL_TAKEN", message: "Email already exists" });
       }
 
-      const theatre = await Theater.findById(theatreId).select("_id name city");
-      if (!theatre) return res.status(404).json({ message: "Theatre not found" });
+      const theatre = await Theater.findById(theatreId).select("_id name city").lean();
+      if (!theatre) {
+        return res.status(404).json({ code: "THEATER_NOT_FOUND", message: "Theatre not found" });
+      }
 
       // 409 #2: theatre already has an admin
-      const existingAdminForTheatre = await User.findOne({
+      const existingAdmin = await User.findOne({
         role: { $in: ["THEATER_ADMIN", "THEATRE_ADMIN"] },
+        // 🔑 keep this field name aligned with your User schema
         theatreId: theatreId,
-      }).select("_id");
-      if (existingAdminForTheatre) {
-        return res.status(409).json({ message: "Theatre already has an admin" });
+      }).select("_id").lean();
+
+      if (existingAdmin) {
+        return res.status(409).json({ code: "THEATER_ALREADY_HAS_ADMIN", message: "Theatre already has an admin" });
       }
 
-      const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash(password, salt);
+      const hashedPassword = await bcrypt.hash(password, 10);
 
       const newAdmin = await User.create({
         name,
-        email,
+        email,                   // already lowercased
         password: hashedPassword,
-        role: "THEATER_ADMIN", // store canonical; frontend maps both
-        theatreId,
+        role: "THEATER_ADMIN",   // canonical
+        theatreId,               // keep same field name as in your User model
       });
 
       return res.status(201).json({
@@ -70,7 +81,7 @@ router.post(
       });
     } catch (err) {
       console.error("[SuperAdmin] create theatre admin error:", err);
-      return res.status(500).json({ message: "Failed to create theatre admin", error: err.message });
+      return res.status(500).json({ code: "INTERNAL", message: "Failed to create theatre admin" });
     }
   }
 );
@@ -90,12 +101,13 @@ router.get(
       })
         .populate("theatreId", "name city")
         .select("name email theatreId createdAt")
-        .sort({ createdAt: -1, _id: -1 });
+        .sort({ createdAt: -1, _id: -1 })
+        .lean();
 
-      return res.json(admins);
+      return res.json({ data: admins });
     } catch (err) {
       console.error("[SuperAdmin] list theatre admins error:", err);
-      return res.status(500).json({ message: "Failed to load theatre admins", error: err.message });
+      return res.status(500).json({ code: "INTERNAL", message: "Failed to load theatre admins" });
     }
   }
 );
