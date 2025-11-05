@@ -1,13 +1,13 @@
 // backend/src/routes/superadmin.routes.js
 import { Router } from "express";
-import bcrypt from "bcryptjs";
+// ❌ remove bcrypt here (model already hashes in pre('save'))
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import Theater from "../models/Theater.js";
 import { requireAuth, requireRoles } from "../middleware/auth.js";
 
 const router = Router();
-// Mount at /api/superadmin (server.js should honor routesPrefix if implemented)
+// Optional metadata for your server to mount with a prefix
 router.routesPrefix = "/api/superadmin";
 
 /* utils */
@@ -28,7 +28,7 @@ router.post(
       const name = String(req.body?.name || "").trim();
       const email = normEmail(req.body?.email);
       const password = String(req.body?.password || "");
-      // accept both spellings; store on User as `theatreId` if your schema uses that
+      // accept both spellings; store on User as `theatreId` (matches your schema)
       const theatreId = req.body?.theatreId || req.body?.theaterId;
 
       if (!name || !email || !password || !theatreId) {
@@ -51,23 +51,21 @@ router.post(
 
       // 409 #2: theatre already has an admin
       const existingAdmin = await User.findOne({
-        role: { $in: ["THEATER_ADMIN", "THEATRE_ADMIN"] },
-        // 🔑 keep this field name aligned with your User schema
-        theatreId: theatreId,
+        role: "THEATRE_ADMIN",          // ✅ canonical spelling
+        theatreId: theatreId,           // ✅ matches your schema field
       }).select("_id").lean();
 
       if (existingAdmin) {
         return res.status(409).json({ code: "THEATER_ALREADY_HAS_ADMIN", message: "Theatre already has an admin" });
       }
 
-      const hashedPassword = await bcrypt.hash(password, 10);
-
+      // ✅ DO NOT hash here. Let userSchema.pre('save') hash it.
       const newAdmin = await User.create({
         name,
-        email,                   // already lowercased
-        password: hashedPassword,
-        role: "THEATER_ADMIN",   // canonical
-        theatreId,               // keep same field name as in your User model
+        email,
+        password,                       // plain; model will hash
+        role: "THEATRE_ADMIN",          // ✅ canonical spelling
+        theatreId,
       });
 
       return res.status(201).json({
@@ -76,11 +74,19 @@ router.post(
           id: newAdmin._id,
           name: newAdmin.name,
           email: newAdmin.email,
+          role: newAdmin.role,
           theatreId: newAdmin.theatreId,
         },
       });
     } catch (err) {
       console.error("[SuperAdmin] create theatre admin error:", err);
+      // bubble up validation + dup key cleanly
+      if (err?.name === "ValidationError") {
+        return res.status(400).json({ code: "VALIDATION_ERROR", message: err.message });
+      }
+      if (err?.code === 11000) {
+        return res.status(409).json({ code: "EMAIL_TAKEN", message: "Email already exists" });
+      }
       return res.status(500).json({ code: "INTERNAL", message: "Failed to create theatre admin" });
     }
   }
@@ -96,11 +102,9 @@ router.get(
   requireRoles("SUPER_ADMIN"),
   async (_req, res) => {
     try {
-      const admins = await User.find({
-        role: { $in: ["THEATER_ADMIN", "THEATRE_ADMIN"] },
-      })
+      const admins = await User.find({ role: "THEATRE_ADMIN" })  // ✅ canonical
         .populate("theatreId", "name city")
-        .select("name email theatreId createdAt")
+        .select("name email role theatreId createdAt")
         .sort({ createdAt: -1, _id: -1 })
         .lean();
 
