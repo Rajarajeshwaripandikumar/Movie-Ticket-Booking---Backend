@@ -11,6 +11,8 @@ import cors from "cors";
 import helmet from "helmet";
 import { v2 as cloudinary } from "cloudinary";
 import { pathToFileURL } from "url";
+import multer from "multer";
+import streamifier from "streamifier";
 
 // SSE helpers (start watcher + emit snapshots)
 import sse from "./socket/sse.js";
@@ -18,6 +20,7 @@ import sse from "./socket/sse.js";
 // import your app if it exports one (optional)
 import appRoutes from "./app.js";
 
+/* --------------------------------- App init -------------------------------- */
 let app;
 if (appRoutes && typeof appRoutes.use === "function") {
   app = appRoutes; // app.js exported an express app
@@ -45,42 +48,82 @@ const allowedOrigins = new Set([
   ...envOrigins,
 ]);
 
-// 1) Always echo Origin so ACAO is present on all responses (incl. OPTIONS)
+// 0) helper for checking origin & setting ACAO consistently
+function setAcaOrigin(res, origin) {
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (process.env.FRONTEND_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
+  } else {
+    // last resort; not used for credentialed requests
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Vary", "Origin");
+}
+
+// 1) Base CORS (echo origin) — ensures most responses include ACAO
 app.use(
   cors({
     origin: true, // echo request Origin
     credentials: false, // using Authorization header, not cookies
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Role"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Accept",
+      "X-Role",
+      "Origin",
+    ],
     exposedHeaders: ["Content-Length", "Content-Type"],
     optionsSuccessStatus: 204,
+    maxAge: 86400,
   })
 );
 
-// 2) Enforce allow-list AFTER cors sets headers (so even rejections include ACAO)
-app.use((req, res, next) => {
-  try {
+// 2) Explicit preflight handler so OPTIONS never misses ACAO
+app.options(
+  "*",
+  (req, res) => {
     const origin = req.headers.origin;
-    if (!origin) return next(); // curl/server-to-server (no Origin)
-    if (allowedOrigins.has(origin)) {
-      res.setHeader("Vary", "Origin");
-      if (req.method === "OPTIONS") return res.sendStatus(204);
-      return next();
-    }
-    console.warn(`[CORS] blocked origin ${origin}`);
-    res.setHeader("Vary", "Origin");
-    return res.status(403).json({ ok: false, message: `Origin not allowed: ${origin}` });
-  } catch (err) {
-    console.warn("[CORS-guard] error:", err?.message || err);
-    return res.status(403).json({ ok: false, message: "CORS guard error" });
+    setAcaOrigin(res, origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With, Accept, X-Role, Origin"
+    );
+    // res.setHeader("Access-Control-Allow-Credentials", "true"); // only if using cookies
+    return res.sendStatus(204);
   }
+);
+
+// 3) Allow-list guard AFTER base cors so even rejections include ACAO
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin) return next(); // curl/server-to-server (no Origin)
+  if (allowedOrigins.has(origin)) {
+    setAcaOrigin(res, origin);
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    return next();
+  }
+  console.warn(`[CORS] blocked origin ${origin}`);
+  setAcaOrigin(res, null); // fall back (no credentials)
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  return res.status(403).json({ ok: false, message: `Origin not allowed: ${origin}` });
 });
 
 /* -------------------------------------------------------------------------- */
 /*                               Basic middlewares                            */
 /* -------------------------------------------------------------------------- */
 app.set("trust proxy", true);
-app.use(helmet());
+
+// Helmet with relaxed cross-origin resource policy (for images/assets)
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false,
+  })
+);
+
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
@@ -146,14 +189,7 @@ try {
 
 // Add header so static uploaded files can be embedded cross-origin
 app.use("/uploads", (req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else if (process.env.FRONTEND_ORIGIN) {
-    res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
+  setAcaOrigin(res, req.headers.origin);
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -205,22 +241,58 @@ app.post("/api/movies/test-cloud", async (_req, res) => {
   }
 });
 
-/* ----------------------------- SSE / EventSource --------------------------- */
-app.options("/api/notifications/stream", sse.ssePreflight);
-app.get("/api/notifications/stream", sse.sseHandler);
-app.options("/notifications/stream", sse.ssePreflight);
-app.get("/notifications/stream", sse.sseHandler);
+/* ----------------------------- SSE helpers -------------------------------- */
+// Force CORS + SSE headers before delegating to your sse handlers
+function sseCorsHeaders(req, res, next) {
+  const origin = req.headers.origin;
+  setAcaOrigin(res, origin);
+  // Only set SSE headers for GET; OPTIONS handled elsewhere
+  if (req.method === "GET") {
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    // If you ever switch to cookie-based auth, also add:
+    // res.setHeader("Access-Control-Allow-Credentials", "true");
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
+  }
+  next();
+}
+
+app.options("/api/notifications/stream", (req, res) => {
+  const origin = req.headers.origin;
+  setAcaOrigin(res, origin);
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With, Accept, X-Role, Origin"
+  );
+  return res.sendStatus(204);
+});
+app.get("/api/notifications/stream", sseCorsHeaders, sse.sseHandler);
+
+// Legacy alias if your frontend points here
+app.options("/notifications/stream", (req, res) => {
+  const origin = req.headers.origin;
+  setAcaOrigin(res, origin);
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With, Accept, X-Role, Origin"
+  );
+  return res.sendStatus(204);
+});
+app.get("/notifications/stream", sseCorsHeaders, sse.sseHandler);
 
 /* ----------------------------- Notifications REST ------------------------- */
 /* Replace this stub with your real controller/router. It prevents 404s in UI. */
 app.get("/api/notifications/mine", (req, res) => {
+  const origin = req.headers.origin;
+  setAcaOrigin(res, origin);
   const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
   return res.json({ ok: true, items: [], limit });
 });
 
 /* ----------------------------- /api/upload route --------------------------- */
-import multer from "multer";
-import streamifier from "streamifier";
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 app.post("/api/upload", upload.single("image"), async (req, res) => {
@@ -235,9 +307,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
       streamifier.createReadStream(req.file.buffer).pipe(stream);
     });
 
-    const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
-
+    setAcaOrigin(res, req.headers.origin);
     res.json({ ok: true, url: result.secure_url, public_id: result.public_id });
   } catch (err) {
     console.error("[/api/upload] upload error:", err);
@@ -245,7 +315,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
   }
 });
 
-/* --------------------------- Mount other routers (ESM-safe) --------------------------- */
+/* --------------------------- Mount other routers (ESM-safe) ---------------- */
 try {
   const routers = [
     "./routes/theaters.routes.js",
@@ -309,6 +379,7 @@ console.log("  CLOUDINARY_FOLDER =", process.env.CLOUDINARY_FOLDER || "(default 
 console.log("  FRONTEND_ORIGINS =", process.env.FRONTEND_ORIGINS || "(none)");
 
 app.get("/_health", (_req, res) => {
+  setAcaOrigin(res, _req.headers.origin);
   res.json({ ok: true, uptime: process.uptime(), env: process.env.NODE_ENV || "development" });
 });
 
@@ -373,6 +444,7 @@ function routeExists(pathToFind) {
 app.get("/debug/routes", (_req, res) => {
   try {
     const routes = getMountedRoutes();
+    setAcaOrigin(res, _req.headers.origin);
     res.json({ ok: true, count: routes.length, routes });
   } catch (e) {
     console.error("/debug/routes error:", e);
