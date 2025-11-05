@@ -45,46 +45,35 @@ const allowedOrigins = new Set([
   ...envOrigins,
 ]);
 
-// Non-throwing origin callback. Returning false makes preflight fail cleanly,
-// but still lets our universal header middleware add Vary/ACAO consistently.
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // server-to-server / curl
-    if (allowedOrigins.has(origin)) return cb(null, true);
-    console.warn(`[CORS] blocked origin ${origin}`);
-    return cb(null, false);
-  },
-  credentials: false, // using Authorization header, not cookies
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Role"],
-  exposedHeaders: ["Content-Length", "Content-Type"],
-  optionsSuccessStatus: 204,
-};
+// 1) Always echo Origin so ACAO is present on all responses (incl. OPTIONS)
+app.use(
+  cors({
+    origin: true, // echo request Origin
+    credentials: false, // using Authorization header, not cookies
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "X-Role"],
+    exposedHeaders: ["Content-Length", "Content-Type"],
+    optionsSuccessStatus: 204,
+  })
+);
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
-
-// Belt-and-suspenders: make sure ALL responses (incl. 404/500) have basic CORS
+// 2) Enforce allow-list AFTER cors sets headers (so even rejections include ACAO)
 app.use((req, res, next) => {
   try {
     const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
+    if (!origin) return next(); // curl/server-to-server (no Origin)
+    if (allowedOrigins.has(origin)) {
       res.setHeader("Vary", "Origin");
-    } else if (process.env.FRONTEND_ORIGIN) {
-      res.setHeader("Access-Control-Allow-Origin", process.env.FRONTEND_ORIGIN);
-      res.setHeader("Vary", "Origin");
+      if (req.method === "OPTIONS") return res.sendStatus(204);
+      return next();
     }
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With, Accept, X-Role"
-    );
-    // We are NOT using cookies; keep credentials false to avoid ACAO/credential mismatch.
-    res.setHeader("Access-Control-Allow-Credentials", "false");
-    if (req.method === "OPTIONS") return res.sendStatus(corsOptions.optionsSuccessStatus || 204);
-  } catch {}
-  next();
+    console.warn(`[CORS] blocked origin ${origin}`);
+    res.setHeader("Vary", "Origin");
+    return res.status(403).json({ ok: false, message: `Origin not allowed: ${origin}` });
+  } catch (err) {
+    console.warn("[CORS-guard] error:", err?.message || err);
+    return res.status(403).json({ ok: false, message: "CORS guard error" });
+  }
 });
 
 /* -------------------------------------------------------------------------- */
@@ -97,8 +86,7 @@ app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
 /**
  * Server-level middleware: copy ?token= query param into Authorization header.
- * This must run early (before any auth middleware or routers that enforce auth),
- * so EventSource clients that cannot set headers can still authenticate.
+ * Must run early so EventSource clients that can't set headers can still auth.
  */
 function tokenQueryToHeader(req, _res, next) {
   try {
