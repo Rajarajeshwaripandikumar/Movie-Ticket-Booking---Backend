@@ -96,7 +96,10 @@ function resolveOrigin(req) {
 export const ssePreflight = (req, res) => {
   const origin = resolveOrigin(req);
   res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Access-Control-Allow-Credentials", "true");
+  // ✅ only set credentials when origin is not "*"
+  if (origin !== "*") {
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
   // allow the headers EventSource clients may need; last-event-id is useful
   res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, last-event-id");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -137,7 +140,10 @@ export const sseHandler = async (req, res) => {
       return;
     }
 
-    const userId = String(decoded._id || decoded.id || decoded.userId || decoded.sub || "");
+    // ✅ add decoded.user?.id fallback
+    const userId = String(
+      decoded._id || decoded.id || decoded.userId || decoded.sub || decoded.user?.id || ""
+    );
     if (!userId) {
       debug("JWT missing user id/payload", decoded);
       res.status(401).type("text").send("Unauthorized: token missing user id");
@@ -155,7 +161,10 @@ export const sseHandler = async (req, res) => {
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
+    // ✅ only set credentials when origin is not "*"
+    if (origin !== "*") {
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
     // retry hint for clients
     res.write("retry: 10000\n\n");
     res.flushHeaders?.();
@@ -183,7 +192,10 @@ export const sseHandler = async (req, res) => {
     // INIT payload: attempt to load recent notifications (if model exists)
     let Notification = null;
     try {
-      Notification = mongoose.models.Notification || (await import("../models/Notification.js").then((m) => m.default)).model || mongoose.model("Notification");
+      Notification =
+        mongoose.models.Notification ||
+        (await import("../models/Notification.js").then((m) => m.default)).model ||
+        mongoose.model("Notification");
     } catch (err) {
       Notification = null;
     }
