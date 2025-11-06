@@ -4,13 +4,13 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import User from "../models/User.js";
-import Theater from "../models/Theater.js"; // for linking theatre admins (kept for future use)
+import Theater from "../models/Theater.js"; // to validate/link theatre-admins
 import mailer from "../models/mailer.js";   // must export createResetUrl, resetPasswordTemplate, sendEmail
 
 const router = express.Router();
 
 /* -------------------------------------------------------------------------- */
-/*                                   CONSTS                                    */
+/*                                   CONSTS                                   */
 /* -------------------------------------------------------------------------- */
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 const JWT_EXPIRES = process.env.JWT_EXPIRES || "7d";
@@ -18,8 +18,15 @@ const TOKEN_SIZE_BYTES = 32;
 const RESET_EXPIRES_MS =
   Number(process.env.RESET_TOKEN_EXPIRES_MINUTES || 60) * 60 * 1000;
 
+const ROLES = {
+  USER: "USER",
+  ADMIN: "ADMIN",
+  THEATRE_ADMIN: "THEATRE_ADMIN",
+  SUPER_ADMIN: "SUPER_ADMIN",
+};
+
 /* -------------------------------------------------------------------------- */
-/*                                   HELPERS                                   */
+/*                                   HELPERS                                  */
 /* -------------------------------------------------------------------------- */
 function signToken(user) {
   return jwt.sign(
@@ -42,7 +49,7 @@ function safeUserPayload(userDoc) {
     email: u.email,
     name: u.name || "",
     phone: u.phone || "",
-    role: u.role || "USER",
+    role: u.role || ROLES.USER,
     theatreId: u.theatreId || null,
     preferences:
       u.preferences || { language: "en", notifications: { email: true, sms: false } },
@@ -55,8 +62,31 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+// lightweight header-based auth (for this router)
+function requireAuthHdr(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const [, token] = header.split(" ");
+    if (!token) return res.status(401).json({ message: "Missing token" });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.auth = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    const role = req.auth?.role;
+    if (!role) return res.status(401).json({ message: "Unauthorized" });
+    if (!roles.includes(role)) return res.status(403).json({ message: "Forbidden" });
+    next();
+  };
+}
+
 /* -------------------------------------------------------------------------- */
-/*                              USER REGISTRATION                              */
+/*                              USER REGISTRATION                             */
 /* -------------------------------------------------------------------------- */
 router.post("/register", async (req, res) => {
   try {
@@ -71,8 +101,8 @@ router.post("/register", async (req, res) => {
       email: String(email).toLowerCase(),
       name: name || "",
       phone: phone || "",
-      role: "USER", // only users can self-register
-      password,     // pre-save hook hashes
+      role: ROLES.USER, // only users can self-register
+      password,         // pre-save hook hashes
     });
 
     await user.save();
@@ -87,7 +117,7 @@ router.post("/register", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                                    LOGIN                                   */
+/*                                   LOGIN                                    */
 /* -------------------------------------------------------------------------- */
 router.post("/login", async (req, res) => {
   try {
@@ -110,20 +140,20 @@ router.post("/login", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                           CREATE FIRST SUPER ADMIN                          */
+/*                           CREATE FIRST SUPER ADMIN                         */
 /* -------------------------------------------------------------------------- */
 router.post("/create-superadmin", async (req, res) => {
   try {
     const { email, password, name } = req.body;
-    const exists = await User.findOne({ role: "SUPER_ADMIN" });
+    const exists = await User.findOne({ role: ROLES.SUPER_ADMIN });
     if (exists) return res.status(409).json({ message: "Super Admin already exists" });
 
     const hashed = await bcrypt.hash(password, 10);
     const superAdmin = await User.create({
-      email,
+      email: String(email).toLowerCase(),
       password: hashed,
       name,
-      role: "SUPER_ADMIN",
+      role: ROLES.SUPER_ADMIN,
     });
 
     return res.json({
@@ -137,7 +167,7 @@ router.post("/create-superadmin", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                                     ME                                     */
+/*                                   ME                                       */
 /* -------------------------------------------------------------------------- */
 router.get("/me", async (req, res) => {
   try {
@@ -157,7 +187,7 @@ router.get("/me", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                               CHANGE PASSWORD                               */
+/*                               CHANGE PASSWORD                              */
 /* -------------------------------------------------------------------------- */
 router.post("/change-password", async (req, res) => {
   try {
@@ -189,7 +219,7 @@ router.post("/change-password", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                        FORGOT / RESET PASSWORD FLOW                         */
+/*                        FORGOT / RESET PASSWORD FLOW                        */
 /* -------------------------------------------------------------------------- */
 router.post("/forgot-password", async (req, res) => {
   try {
@@ -271,9 +301,164 @@ router.post("/reset-password", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                                ROUTER PREFIX                                */
+/*                          TOKEN VERIFY / INTROSPECT                         */
 /* -------------------------------------------------------------------------- */
-// Ensure the server auto-mounter mounts this router at /api/auth/*
+router.get("/verify", requireAuthHdr, (req, res) => {
+  return res.json({ ok: true, token: req.auth });
+});
+
+/* -------------------------------------------------------------------------- */
+/*                        ADMIN: CREATE / MANAGE ADMINS                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/auth/admin/create
+ * Create an ADMIN or THEATRE_ADMIN (optionally link theatreId).
+ * Only SUPER_ADMIN can call.
+ * body: { email, password, name, role: "ADMIN"|"THEATRE_ADMIN", theatreId? }
+ */
+router.post("/admin/create", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
+  try {
+    const { email, password, name, role, theatreId } = req.body;
+
+    if (!email || !password || !role) {
+      return res.status(400).json({ message: "email, password and role are required" });
+    }
+    if (![ROLES.ADMIN, ROLES.THEATRE_ADMIN].includes(role)) {
+      return res.status(400).json({ message: "role must be ADMIN or THEATRE_ADMIN" });
+    }
+
+    const exists = await User.findOne({ email: String(email).toLowerCase() });
+    if (exists) return res.status(409).json({ message: "Email already registered" });
+
+    let theatreRef = undefined;
+    if (role === ROLES.THEATRE_ADMIN && theatreId) {
+      const t = await Theater.findById(theatreId).select("_id");
+      if (!t) return res.status(400).json({ message: "Invalid theatreId" });
+      theatreRef = t._id;
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+    const admin = await User.create({
+      email: String(email).toLowerCase(),
+      password: hashed,
+      name: name || "",
+      role,
+      theatreId: theatreRef || null,
+    });
+
+    return res.status(201).json({ ok: true, user: safeUserPayload(admin) });
+  } catch (err) {
+    console.error("ADMIN_CREATE_ERROR:", err);
+    return res.status(500).json({ message: "Failed to create admin" });
+  }
+});
+
+/**
+ * PATCH /api/auth/admin/:userId/role
+ * Change a user's role (SUPER_ADMIN only).
+ * body: { role }
+ */
+router.patch("/admin/:userId/role", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+    if (!role || !Object.values(ROLES).includes(role)) {
+      return res.status(400).json({ message: "Invalid role" });
+    }
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: { role } },
+      { new: true, runValidators: true }
+    );
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ ok: true, user: safeUserPayload(user) });
+  } catch (err) {
+    console.error("ADMIN_ROLE_UPDATE_ERROR:", err);
+    return res.status(500).json({ message: "Failed to update role" });
+  }
+});
+
+/**
+ * PATCH /api/auth/admin/:userId/theatre
+ * Link or unlink a theatre for a THEATRE_ADMIN.
+ * body: { theatreId: "<id>" | null }
+ */
+router.patch("/admin/:userId/theatre", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { theatreId } = req.body;
+
+    let theatreRef = null;
+    if (theatreId) {
+      const t = await Theater.findById(theatreId).select("_id");
+      if (!t) return res.status(400).json({ message: "Invalid theatreId" });
+      theatreRef = t._id;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: { theatreId: theatreRef } },
+      { new: true, runValidators: true }
+    );
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    return res.json({ ok: true, user: safeUserPayload(user) });
+  } catch (err) {
+    console.error("ADMIN_THEATRE_LINK_ERROR:", err);
+    return res.status(500).json({ message: "Failed to update theatre link" });
+  }
+});
+
+/**
+ * GET /api/auth/admin/users?role=&q=&page=&limit=
+ * List/search users (SUPER_ADMIN or ADMIN).
+ * - SUPER_ADMIN: sees all
+ * - ADMIN: sees all non-SUPER_ADMIN
+ */
+router.get("/admin/users", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN, ROLES.ADMIN), async (req, res) => {
+  try {
+    const { role, q, page = 1, limit = 20 } = req.query;
+
+    const filter = {};
+    if (role && Object.values(ROLES).includes(role)) filter.role = role;
+
+    if (q && String(q).trim()) {
+      const rx = new RegExp(String(q).trim(), "i");
+      filter.$or = [{ email: rx }, { name: rx }, { phone: rx }];
+    }
+
+    // ADMINs cannot see SUPER_ADMIN accounts
+    if (req.auth.role === ROLES.ADMIN) {
+      filter.role = { $ne: ROLES.SUPER_ADMIN, ...(filter.role ? { $eq: filter.role } : {}) };
+    }
+
+    const safeLimit = Math.min(Number(limit) || 20, 200);
+    const safePage = Math.max(Number(page) || 1, 1);
+    const skip = (safePage - 1) * safeLimit;
+
+    const [rows, total] = await Promise.all([
+      User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(safeLimit).lean(),
+      User.countDocuments(filter),
+    ]);
+
+    return res.json({
+      ok: true,
+      users: rows.map(safeUserPayload),
+      page: safePage,
+      limit: safeLimit,
+      total,
+      hasMore: skip + rows.length < total,
+    });
+  } catch (err) {
+    console.error("ADMIN_USERS_LIST_ERROR:", err);
+    return res.status(500).json({ message: "Failed to list users" });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                                ROUTER PREFIX                               */
+/* -------------------------------------------------------------------------- */
 router.routesPrefix = "/api/auth";
 
 export default router;
