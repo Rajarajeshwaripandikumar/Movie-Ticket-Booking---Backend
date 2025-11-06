@@ -134,6 +134,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/movies", moviesRoutes);
 app.use("/api/showtimes", showtimesRoutes);
 app.use("/api/theaters", theatersRouter);
+app.use("/api/theatres", theatresRouter);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
