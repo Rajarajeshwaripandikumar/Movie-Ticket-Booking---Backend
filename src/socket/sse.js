@@ -1,17 +1,18 @@
+// backend/src/socket/sse.js
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import debugFactory from "debug";
 
 const debug = debugFactory("app:sse");
 
+/* ------------------------------- CONFIG ---------------------------------- */
 const JWT_SECRET =
   process.env.JWT_SECRET ||
   process.env.JWT_SECRET_BASE64 ||
   "dev_jwt_secret_change_me";
-
 const JWT_PUBLIC_KEY = process.env.JWT_PUBLIC_KEY || null;
 
-// Heartbeat every 10 seconds (safe across proxies)
+// Heartbeat every 10 seconds (safe across proxies/CDNs)
 const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 10000);
 
 // Max open browser tabs allowed per user (optional)
@@ -20,10 +21,7 @@ const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8
 // Store clients: Map(channel → Set of responses)
 global.sseClients = global.sseClients || new Map();
 
-/* -------------------------------------------------------------------------- */
-/*                                LOW LEVEL WRITE                             */
-/* -------------------------------------------------------------------------- */
-
+/* ----------------------------- LOW LEVEL WRITE --------------------------- */
 function sseWriteRaw(res, str) {
   if (!res || res.writableEnded || res.destroyed) return false;
   try {
@@ -42,10 +40,7 @@ function sseWrite(res, { event, id, data }) {
   return true;
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                      JWT                                   */
-/* -------------------------------------------------------------------------- */
-
+/* --------------------------------- JWT ----------------------------------- */
 function parseCookie(header) {
   const out = {};
   if (!header) return out;
@@ -77,10 +72,7 @@ function roleFrom(decoded) {
     : "USER";
 }
 
-/* -------------------------------------------------------------------------- */
-/*                               CORS PREFLIGHT                               */
-/* -------------------------------------------------------------------------- */
-
+/* ------------------------------ CORS PREFLIGHT --------------------------- */
 export const ssePreflight = (req, res) => {
   const origin = req.headers.origin;
   if (origin) {
@@ -96,23 +88,22 @@ export const ssePreflight = (req, res) => {
   res.sendStatus(204);
 };
 
-/* -------------------------------------------------------------------------- */
-/*                                   SSE HANDLER                              */
-/* -------------------------------------------------------------------------- */
-
+/* -------------------------------- HANDLER -------------------------------- */
 export const sseHandler = async (req, res) => {
   try {
-    // Keep TCP connection alive
+    // Keep TCP connection alive (important for SSE behind proxies)
     req.socket?.setKeepAlive?.(true);
     req.socket?.setNoDelay?.(true);
     req.socket?.setTimeout?.(0);
 
+    // CORS
     const origin = req.headers.origin;
     if (origin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
     }
 
+    // Auth
     const rawToken = extractToken(req);
     if (!rawToken || !rawToken.includes(".")) return res.status(401).end("Unauthorized");
 
@@ -132,14 +123,14 @@ export const sseHandler = async (req, res) => {
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Content-Encoding", "identity");
-    res.setHeader("X-Accel-Buffering", "no"); // no reverse-proxy buffering
+    res.setHeader("X-Accel-Buffering", "no"); // nginx hint (no buffering)
 
     // Client reconnect hint + hello
     sseWriteRaw(res, "retry: 10000\n");
     sseWriteRaw(res, `: hello ${Date.now()}\n\n`);
     res.flushHeaders?.();
 
-    // Track client
+    // Register client
     const set = global.sseClients.get(channel) || new Set();
     if (set.size >= MAX_CLIENTS_PER_USER) return res.end();
     set.add(res);
@@ -148,7 +139,7 @@ export const sseHandler = async (req, res) => {
     // Connected signal
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-    // Initial notifications
+    // Initial notifications (if model exists)
     try {
       const Notification = mongoose.model("Notification");
       const initial = await Notification.find({}).sort({ createdAt: -1 }).limit(20).lean();
@@ -178,27 +169,59 @@ export const sseHandler = async (req, res) => {
   }
 };
 
-/* -------------------------------------------------------------------------- */
-/*                               PUSH EVENTS                                   */
-/* -------------------------------------------------------------------------- */
-
-export const pushToAdmins = (payload) => {
+/* --------------------------------- PUSH ---------------------------------- */
+export const pushToAdmins = (payload, { eventName = "notification" } = {}) => {
   const set = global.sseClients.get("admin") || new Set();
-  for (const res of set) sseWrite(res, { event: "notification", data: payload });
+  for (const res of set) sseWrite(res, { event: eventName, data: payload });
+  return set.size;
 };
 
-export const pushToUser = (userId, payload) => {
+export const pushToUser = (userId, payload, { eventName = "notification" } = {}) => {
   const set = global.sseClients.get(String(userId)) || new Set();
-  for (const res of set) sseWrite(res, { event: "notification", data: payload });
+  for (const res of set) sseWrite(res, { event: eventName, data: payload });
+  return set.size;
 };
 
-/* -------------------------------------------------------------------------- */
-/*                                DEFAULT EXPORT                               */
-/* -------------------------------------------------------------------------- */
+/* ----------------------- OPTIONAL ANALYTICS SNAPSHOT ---------------------- */
+export async function emitAnalyticsSnapshot(options = {}) {
+  try {
+    const { days = 30 } = options;
+    const payload = {
+      type: "analytics_snapshot",
+      days,
+      ts: Date.now(),
+      metrics: {
+        activeUsers: undefined,
+        ticketsSold: undefined,
+        revenue: undefined,
+      },
+    };
+    return pushToAdmins(payload, { eventName: "analytics" });
+  } catch (e) {
+    debug("emitAnalyticsSnapshot error:", e?.message || e);
+    return 0;
+  }
+}
 
+/* ---------------------------- OPTIONAL WATCHER ---------------------------- */
+export function startBookingWatcher() {
+  try {
+    // Example stub: attach Mongo change streams here and push events
+    // const Booking = mongoose.model("Booking");
+    // const cs = Booking.watch([], { fullDocument: "updateLookup" });
+    // cs.on("change", (ch) => pushToAdmins({ type: "booking_change", change: ch }, { eventName: "booking" }));
+    debug("startBookingWatcher: no-op (stub). Add change streams if needed.");
+  } catch (e) {
+    debug("startBookingWatcher error:", e?.message || e);
+  }
+}
+
+/* ---------------------------- DEFAULT EXPORT ------------------------------ */
 export default {
   sseHandler,
   ssePreflight,
   pushToUser,
   pushToAdmins,
+  emitAnalyticsSnapshot,
+  startBookingWatcher,
 };
