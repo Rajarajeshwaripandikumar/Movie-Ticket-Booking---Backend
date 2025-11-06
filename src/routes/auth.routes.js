@@ -1,11 +1,10 @@
-// backend/src/routes/auth.js
 import express from "express";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import User from "../models/User.js";
-import Theater from "../models/Theater.js"; // to validate/link theatre-admins
-import mailer from "../models/mailer.js";   // must export createResetUrl, resetPasswordTemplate, sendEmail
+import Theater from "../models/Theater.js"; 
+import mailer from "../models/mailer.js";
 
 const router = express.Router();
 
@@ -34,7 +33,7 @@ function signToken(user) {
       sub: user._id,
       email: user.email,
       role: user.role,
-      theatreId: user.theatreId || null, // include theatre reference for theatre-admins
+      theatreId: user.theatreId || null,
     },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES }
@@ -62,7 +61,6 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-// lightweight header-based auth (for this router)
 function requireAuthHdr(req, res, next) {
   try {
     const header = req.headers.authorization || "";
@@ -71,7 +69,7 @@ function requireAuthHdr(req, res, next) {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.auth = decoded;
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 }
@@ -101,15 +99,17 @@ router.post("/register", async (req, res) => {
       email: String(email).toLowerCase(),
       name: name || "",
       phone: phone || "",
-      role: ROLES.USER, // only users can self-register
-      password,         // pre-save hook hashes
+      role: ROLES.USER,
+      password,
     });
 
     await user.save();
     const token = signToken(user);
-    return res
-      .status(201)
-      .json({ message: "Registered successfully", token, user: safeUserPayload(user) });
+    return res.status(201).json({
+      message: "Registered successfully",
+      token,
+      user: safeUserPayload(user),
+    });
   } catch (err) {
     console.error("REGISTER_ERROR:", err.message);
     return res.status(500).json({ message: "Failed to register" });
@@ -136,6 +136,34 @@ router.post("/login", async (req, res) => {
   } catch (err) {
     console.error("LOGIN_ERROR:", err.message);
     return res.status(500).json({ message: "Login failed" });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                           ADMIN LOGIN (ADMIN ONLY)                         */
+/* -------------------------------------------------------------------------- */
+router.post("/admin-login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
+
+    const user = await User.findOne({ email: String(email).toLowerCase() }).select("+password");
+    if (!user) return res.status(401).json({ message: "Email not registered" });
+
+    // ✅ Only admins can login here
+    if (user.role !== ROLES.SUPER_ADMIN && user.role !== ROLES.THEATRE_ADMIN) {
+      return res.status(403).json({ message: "Admins only" });
+    }
+
+    const match = await user.compare(password);
+    if (!match) return res.status(401).json({ message: "Incorrect password" });
+
+    const token = signToken(user);
+    return res.json({ message: "Admin login successful", token, user: safeUserPayload(user) });
+  } catch (err) {
+    console.error("ADMIN_LOGIN_ERROR:", err.message);
+    return res.status(500).json({ message: "Failed to login admin" });
   }
 });
 
@@ -187,7 +215,7 @@ router.get("/me", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                               CHANGE PASSWORD                              */
+/*                                   CHANGE PASSWORD                          */
 /* -------------------------------------------------------------------------- */
 router.post("/change-password", async (req, res) => {
   try {
@@ -201,9 +229,7 @@ router.post("/change-password", async (req, res) => {
 
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword)
-      return res
-        .status(400)
-        .json({ message: "Both current and new passwords required" });
+      return res.status(400).json({ message: "Both current and new passwords required" });
 
     const match = await user.compare(currentPassword);
     if (!match) return res.status(400).json({ message: "Current password incorrect" });
@@ -219,7 +245,7 @@ router.post("/change-password", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                        FORGOT / RESET PASSWORD FLOW                        */
+/*                        PASSWORD RESET (Email Flow)                         */
 /* -------------------------------------------------------------------------- */
 router.post("/forgot-password", async (req, res) => {
   try {
@@ -301,22 +327,15 @@ router.post("/reset-password", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                          TOKEN VERIFY / INTROSPECT                         */
+/*                             TOKEN VERIFY                                   */
 /* -------------------------------------------------------------------------- */
 router.get("/verify", requireAuthHdr, (req, res) => {
   return res.json({ ok: true, token: req.auth });
 });
 
 /* -------------------------------------------------------------------------- */
-/*                        ADMIN: CREATE / MANAGE ADMINS                       */
+/*                     ADMIN MANAGEMENT (SUPER ADMIN)                         */
 /* -------------------------------------------------------------------------- */
-
-/**
- * POST /api/auth/admin/create
- * Create an ADMIN or THEATRE_ADMIN (optionally link theatreId).
- * Only SUPER_ADMIN can call.
- * body: { email, password, name, role: "ADMIN"|"THEATRE_ADMIN", theatreId? }
- */
 router.post("/admin/create", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
   try {
     const { email, password, name, role, theatreId } = req.body;
@@ -354,111 +373,6 @@ router.post("/admin/create", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), asy
   }
 });
 
-/**
- * PATCH /api/auth/admin/:userId/role
- * Change a user's role (SUPER_ADMIN only).
- * body: { role }
- */
-router.patch("/admin/:userId/role", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { role } = req.body;
-    if (!role || !Object.values(ROLES).includes(role)) {
-      return res.status(400).json({ message: "Invalid role" });
-    }
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: { role } },
-      { new: true, runValidators: true }
-    );
-    if (!user) return res.status(404).json({ message: "User not found" });
-    return res.json({ ok: true, user: safeUserPayload(user) });
-  } catch (err) {
-    console.error("ADMIN_ROLE_UPDATE_ERROR:", err);
-    return res.status(500).json({ message: "Failed to update role" });
-  }
-});
-
-/**
- * PATCH /api/auth/admin/:userId/theatre
- * Link or unlink a theatre for a THEATRE_ADMIN.
- * body: { theatreId: "<id>" | null }
- */
-router.patch("/admin/:userId/theatre", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { theatreId } = req.body;
-
-    let theatreRef = null;
-    if (theatreId) {
-      const t = await Theater.findById(theatreId).select("_id");
-      if (!t) return res.status(400).json({ message: "Invalid theatreId" });
-      theatreRef = t._id;
-    }
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: { theatreId: theatreRef } },
-      { new: true, runValidators: true }
-    );
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    return res.json({ ok: true, user: safeUserPayload(user) });
-  } catch (err) {
-    console.error("ADMIN_THEATRE_LINK_ERROR:", err);
-    return res.status(500).json({ message: "Failed to update theatre link" });
-  }
-});
-
-/**
- * GET /api/auth/admin/users?role=&q=&page=&limit=
- * List/search users (SUPER_ADMIN or ADMIN).
- * - SUPER_ADMIN: sees all
- * - ADMIN: sees all non-SUPER_ADMIN
- */
-router.get("/admin/users", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN, ROLES.ADMIN), async (req, res) => {
-  try {
-    const { role, q, page = 1, limit = 20 } = req.query;
-
-    const filter = {};
-    if (role && Object.values(ROLES).includes(role)) filter.role = role;
-
-    if (q && String(q).trim()) {
-      const rx = new RegExp(String(q).trim(), "i");
-      filter.$or = [{ email: rx }, { name: rx }, { phone: rx }];
-    }
-
-    // ADMINs cannot see SUPER_ADMIN accounts
-    if (req.auth.role === ROLES.ADMIN) {
-      filter.role = { $ne: ROLES.SUPER_ADMIN, ...(filter.role ? { $eq: filter.role } : {}) };
-    }
-
-    const safeLimit = Math.min(Number(limit) || 20, 200);
-    const safePage = Math.max(Number(page) || 1, 1);
-    const skip = (safePage - 1) * safeLimit;
-
-    const [rows, total] = await Promise.all([
-      User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(safeLimit).lean(),
-      User.countDocuments(filter),
-    ]);
-
-    return res.json({
-      ok: true,
-      users: rows.map(safeUserPayload),
-      page: safePage,
-      limit: safeLimit,
-      total,
-      hasMore: skip + rows.length < total,
-    });
-  } catch (err) {
-    console.error("ADMIN_USERS_LIST_ERROR:", err);
-    return res.status(500).json({ message: "Failed to list users" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/*                                ROUTER PREFIX                               */
 /* -------------------------------------------------------------------------- */
 router.routesPrefix = "/api/auth";
-
 export default router;
