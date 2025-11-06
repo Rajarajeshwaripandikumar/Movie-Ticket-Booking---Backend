@@ -19,7 +19,7 @@ import paymentsRoutes from "./routes/payments.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
 import profileRoutes from "./routes/profile.routes.js";
 import ticketRoutes from "./routes/ticket.routes.js";
-import theatersRouter from "./routes/theaters.routes.js";
+import theatersRouter from "./routes/theaters.routes.js"; // US spelling
 import notificationsRoutes from "./routes/notifications.routes.js";
 import notificationPrefRoutes from "./routes/notificationPref.routes.js";
 import analyticsRoutes from "./routes/analytics.routes.js";
@@ -114,6 +114,14 @@ app.use((req, _res, next) => {
   next();
 });
 
+// ────────────────── NORMALIZE UK/US THEAT(RE)RS PATH ──────────────────
+app.use((req, _res, next) => {
+  if (req.url.startsWith("/api/theatres")) {
+    req.url = req.url.replace(/^\/api\/theatres\b/, "/api/theaters");
+  }
+  next();
+});
+
 // ─────────────────────────────── ROUTES ───────────────────────────────
 
 // Health check
@@ -133,8 +141,8 @@ app.use("/api/upload", uploadRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/movies", moviesRoutes);
 app.use("/api/showtimes", showtimesRoutes);
-app.use("/api/theaters", theatersRouter);
-app.use("/api/theatres", theatresRouter);
+app.use("/api/theaters", theatersRouter); // canonical
+app.use("/api/theatres", theatersRouter); // alias (same router, NOT 'theatresRouter')
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
