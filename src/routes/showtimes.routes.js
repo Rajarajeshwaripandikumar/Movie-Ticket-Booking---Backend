@@ -7,6 +7,13 @@ import Screen from "../models/Screen.js";
 import SeatLock from "../models/SeatLock.js";
 import Theater from "../models/Theater.js";
 import Movie from "../models/Movie.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import {
+  requireScopedTheatre,
+  assertInScopeOrThrow,
+  isSuperOrOwner,
+  getTheatreId,
+} from "../middleware/scope.js";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
@@ -32,7 +39,6 @@ function toYmdIST(d = new Date()) {
   return `${y}-${m}-${day}`;
 }
 const nowUtc = () => new Date();
-const pad = (n) => String(n).padStart(2, "0");
 
 /* -------------------------------------------------------------------------- */
 /* Misc helpers                                                               */
@@ -269,7 +275,7 @@ router.get("/my-theatre", async (req, res) => {
 /* -------------------------------------------------------------------------- */
 router.get("/availability", async (req, res) => {
   try {
-    const { movieId, theaterId, screenId, city, from, to } = req.query;
+    const { from, to } = req.query;
 
     const startY = from && /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : toYmdIST();
     const endY =
@@ -412,10 +418,11 @@ router.get("/:id", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* CREATE: POST /showtimes                                                    */
-/* Auto-fill city from Theater, minute-level uniqueness, init seats           */
+/* CREATE: POST /showtimes (scoped)                                           */
+/* Auto-fill city from Theater, verify screen belongs to theater,             */
+/* minute-level uniqueness, init seats                                        */
 /* -------------------------------------------------------------------------- */
-router.post("/", async (req, res) => {
+router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const { movie, theater, screen, startTime, basePrice, dynamicPricing } = req.body;
     if (!movie || !theater || !screen || !startTime || basePrice == null) {
@@ -425,9 +432,17 @@ router.post("/", async (req, res) => {
     const [m, t, s] = await Promise.all([
       Movie.findById(movie).select("_id").lean(),
       Theater.findById(theater).select("_id city").lean(),
-      Screen.findById(screen).select("_id rows cols").lean(),
+      Screen.findById(screen).select("_id theater rows cols").lean(),
     ]);
     if (!m || !t || !s) return res.status(400).json({ message: "Invalid movie/theater/screen" });
+
+    // Screen must belong to Theater
+    if (String(s.theater) !== String(t._id)) {
+      return res.status(400).json({ message: "Screen does not belong to the selected theater" });
+    }
+
+    // Scope: theatre admin may only create inside their theatre
+    assertInScopeOrThrow(t._id, req);
 
     const when = new Date(startTime);
     if (Number.isNaN(when.getTime())) return res.status(400).json({ message: "Invalid startTime" });
@@ -435,8 +450,8 @@ router.post("/", async (req, res) => {
 
     const doc = await Showtime.create({
       movie,
-      theater,
-      screen,
+      theater: t._id,
+      screen: s._id,
       city: t.city,
       startTime: when,
       basePrice: Number(basePrice),
@@ -457,18 +472,31 @@ router.post("/", async (req, res) => {
     if (e?.code === 11000) {
       return res.status(409).json({ message: "Showtime already exists for this screen & minute" });
     }
+    const code = Number(e?.status) || 500;
     console.error("❌ POST /showtimes error:", e);
-    return res.status(500).json({ message: "Failed to create showtime" });
+    return res.status(code).json({ message: "Failed to create showtime", error: e.message });
   }
 });
 
 /* -------------------------------------------------------------------------- */
-/* UPDATE: PATCH /showtimes/:id                                               */
+/* UPDATE: PATCH /showtimes/:id (scoped)                                      */
+/* Validates scope; does not allow changing theater/screen via this endpoint. */
 /* -------------------------------------------------------------------------- */
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
-    const doc = await Showtime.findById(req.params.id);
+    const doc = await Showtime.findById(req.params.id).populate("theater", "_id city");
     if (!doc) return res.status(404).json({ message: "Showtime not found" });
+
+    // Scope check against the show's theater
+    assertInScopeOrThrow(doc.theater?._id || doc.theater, req);
+
+    // Prevent moving show across theater/screen via patch
+    if (req.body.theater && String(req.body.theater) !== String(doc.theater?._id || doc.theater)) {
+      return res.status(400).json({ message: "Cannot change theater via update" });
+    }
+    if (req.body.screen && String(req.body.screen) !== String(doc.screen)) {
+      return res.status(400).json({ message: "Cannot change screen via update" });
+    }
 
     if (req.body.startTime) {
       const d = new Date(req.body.startTime);
@@ -492,8 +520,9 @@ router.patch("/:id", async (req, res) => {
     if (e?.code === 11000) {
       return res.status(409).json({ message: "Another showtime already exists at that minute on this screen" });
     }
+    const code = Number(e?.status) || 500;
     console.error("❌ PATCH /showtimes/:id error:", e);
-    return res.status(500).json({ message: "Failed to update showtime" });
+    return res.status(code).json({ message: "Failed to update showtime", error: e.message });
   }
 });
 
