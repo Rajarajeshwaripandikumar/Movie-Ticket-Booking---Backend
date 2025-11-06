@@ -1,9 +1,10 @@
+// backend/src/routes/auth.js
 import express from "express";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import User from "../models/User.js";
-import Theater from "../models/Theater.js"; 
+import Theater from "../models/Theater.js";
 import mailer from "../models/mailer.js";
 
 const router = express.Router();
@@ -61,6 +62,7 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+// Lightweight header-based auth for this router
 function requireAuthHdr(req, res, next) {
   try {
     const header = req.headers.authorization || "";
@@ -99,8 +101,8 @@ router.post("/register", async (req, res) => {
       email: String(email).toLowerCase(),
       name: name || "",
       phone: phone || "",
-      role: ROLES.USER,
-      password,
+      role: ROLES.USER,   // self-registers are always USER
+      password,           // pre-save hook hashes
     });
 
     await user.save();
@@ -117,7 +119,7 @@ router.post("/register", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                                   LOGIN                                    */
+/*                                   LOGIN (PUBLIC, USER-ONLY)                */
 /* -------------------------------------------------------------------------- */
 router.post("/login", async (req, res) => {
   try {
@@ -127,6 +129,11 @@ router.post("/login", async (req, res) => {
 
     const user = await User.findOne({ email: String(email).toLowerCase() }).select("+password");
     if (!user) return res.status(401).json({ message: "Email not registered" });
+
+    // ⛔ Block all admin roles from using the public login
+    if ([ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN].includes(user.role)) {
+      return res.status(403).json({ message: "Admins must login from /admin/login" });
+    }
 
     const match = await user.compare(password);
     if (!match) return res.status(401).json({ message: "Incorrect password" });
@@ -140,7 +147,7 @@ router.post("/login", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                           ADMIN LOGIN (ADMIN ONLY)                         */
+/*                           ADMIN LOGIN (ADMIN-ONLY)                         */
 /* -------------------------------------------------------------------------- */
 router.post("/admin-login", async (req, res) => {
   try {
@@ -152,7 +159,7 @@ router.post("/admin-login", async (req, res) => {
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
     // ✅ Only admins can login here
-    if (user.role !== ROLES.SUPER_ADMIN && user.role !== ROLES.THEATRE_ADMIN) {
+    if (user.role !== ROLES.SUPER_ADMIN && user.role !== ROLES.THEATRE_ADMIN && user.role !== ROLES.ADMIN) {
       return res.status(403).json({ message: "Admins only" });
     }
 
@@ -215,7 +222,7 @@ router.get("/me", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                                   CHANGE PASSWORD                          */
+/*                               CHANGE PASSWORD                              */
 /* -------------------------------------------------------------------------- */
 router.post("/change-password", async (req, res) => {
   try {
@@ -336,42 +343,51 @@ router.get("/verify", requireAuthHdr, (req, res) => {
 /* -------------------------------------------------------------------------- */
 /*                     ADMIN MANAGEMENT (SUPER ADMIN)                         */
 /* -------------------------------------------------------------------------- */
-router.post("/admin/create", requireAuthHdr, requireRole(ROLES.SUPER_ADMIN), async (req, res) => {
-  try {
-    const { email, password, name, role, theatreId } = req.body;
+router.post(
+  "/admin/create",
+  requireAuthHdr,
+  requireRole(ROLES.SUPER_ADMIN),
+  async (req, res) => {
+    try {
+      const { email, password, name, role, theatreId } = req.body;
 
-    if (!email || !password || !role) {
-      return res.status(400).json({ message: "email, password and role are required" });
+      if (!email || !password || !role) {
+        return res
+          .status(400)
+          .json({ message: "email, password and role are required" });
+      }
+      if (![ROLES.ADMIN, ROLES.THEATRE_ADMIN].includes(role)) {
+        return res
+          .status(400)
+          .json({ message: "role must be ADMIN or THEATRE_ADMIN" });
+      }
+
+      const exists = await User.findOne({ email: String(email).toLowerCase() });
+      if (exists) return res.status(409).json({ message: "Email already registered" });
+
+      let theatreRef = undefined;
+      if (role === ROLES.THEATRE_ADMIN && theatreId) {
+        const t = await Theater.findById(theatreId).select("_id");
+        if (!t) return res.status(400).json({ message: "Invalid theatreId" });
+        theatreRef = t._id;
+      }
+
+      const hashed = await bcrypt.hash(password, 10);
+      const admin = await User.create({
+        email: String(email).toLowerCase(),
+        password: hashed,
+        name: name || "",
+        role,
+        theatreId: theatreRef || null,
+      });
+
+      return res.status(201).json({ ok: true, user: safeUserPayload(admin) });
+    } catch (err) {
+      console.error("ADMIN_CREATE_ERROR:", err);
+      return res.status(500).json({ message: "Failed to create admin" });
     }
-    if (![ROLES.ADMIN, ROLES.THEATRE_ADMIN].includes(role)) {
-      return res.status(400).json({ message: "role must be ADMIN or THEATRE_ADMIN" });
-    }
-
-    const exists = await User.findOne({ email: String(email).toLowerCase() });
-    if (exists) return res.status(409).json({ message: "Email already registered" });
-
-    let theatreRef = undefined;
-    if (role === ROLES.THEATRE_ADMIN && theatreId) {
-      const t = await Theater.findById(theatreId).select("_id");
-      if (!t) return res.status(400).json({ message: "Invalid theatreId" });
-      theatreRef = t._id;
-    }
-
-    const hashed = await bcrypt.hash(password, 10);
-    const admin = await User.create({
-      email: String(email).toLowerCase(),
-      password: hashed,
-      name: name || "",
-      role,
-      theatreId: theatreRef || null,
-    });
-
-    return res.status(201).json({ ok: true, user: safeUserPayload(admin) });
-  } catch (err) {
-    console.error("ADMIN_CREATE_ERROR:", err);
-    return res.status(500).json({ message: "Failed to create admin" });
   }
-});
+);
 
 /* -------------------------------------------------------------------------- */
 router.routesPrefix = "/api/auth";
