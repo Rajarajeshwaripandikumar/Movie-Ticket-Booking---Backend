@@ -77,11 +77,16 @@ export const requireAuth = (req, res, next) => {
       token = String(req.cookies.token);
     }
 
-    // 3️⃣ Query param (allowed only in non-production OR for /stream endpoints)
+    // 3️⃣ Query param fallback
+    //    - Always allow for analytics routes (frontend may add ?token= as a safe fallback)
+    //    - Always allow for /stream endpoints
+    //    - Allow in non-production everywhere else (dev convenience)
+    const isAnalytics = (req.baseUrl && req.baseUrl.includes("/api/analytics"));
+    const isStream = (req.path && req.path.includes("/stream"));
     if (
       !token &&
       req.query?.token &&
-      (process.env.NODE_ENV !== "production" || (req.path && req.path.includes("/stream")))
+      (isAnalytics || isStream || process.env.NODE_ENV !== "production")
     ) {
       token = String(req.query.token);
     }
