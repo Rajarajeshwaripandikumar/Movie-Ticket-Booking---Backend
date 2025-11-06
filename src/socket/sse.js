@@ -5,61 +5,35 @@ import debugFactory from "debug";
 
 const debug = debugFactory("app:sse");
 
-/* -------------------------------------------------------------------------- */
-/*                                   CONFIG                                   */
-/* -------------------------------------------------------------------------- */
 const JWT_SECRET =
   process.env.JWT_SECRET ||
   process.env.JWT_SECRET_BASE64 ||
   "dev_jwt_secret_change_me";
 const JWT_PUBLIC_KEY = process.env.JWT_PUBLIC_KEY || null;
 
-const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
-const MAX_CLIENTS_PER_USER = parseInt(
-  process.env.SSE_MAX_CLIENTS_PER_USER || "8",
-  10
-);
+const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 10000);
+const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
 
-// In-memory channel -> Set<res>
 global.sseClients = global.sseClients || new Map();
 
-/* -------------------------------------------------------------------------- */
-/*                                  HELPERS                                   */
-/* -------------------------------------------------------------------------- */
 function sseWriteRaw(res, str) {
-  try {
-    if (!res || res.writableEnded || res.destroyed) return false;
-    res.write(str);
-    return true;
-  } catch {
-    return false;
-  }
+  if (!res || res.writableEnded || res.destroyed) return false;
+  res.write(str);
+  return true;
 }
 
 function sseWrite(res, { event, id, data }) {
-  if (!res || res.writableEnded || res.destroyed) return false;
   if (event) sseWriteRaw(res, `event: ${event}\n`);
   if (id) sseWriteRaw(res, `id: ${id}\n`);
-  try {
-    sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
-  } catch {
-    sseWriteRaw(
-      res,
-      `data: ${JSON.stringify({ error: "stringify_failed" })}\n\n`
-    );
-  }
-  return true;
+  sseWriteRaw(res, `data: ${JSON.stringify(data)}\n\n`);
 }
 
 function parseCookie(header) {
   const out = {};
   if (!header) return out;
-  header.split(";").forEach((pair) => {
-    const i = pair.indexOf("=");
-    if (i > -1)
-      out[pair.slice(0, i).trim()] = decodeURIComponent(
-        pair.slice(i + 1).trim()
-      );
+  header.split(";").forEach((p) => {
+    const i = p.indexOf("=");
+    if (i > -1) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
   });
   return out;
 }
@@ -67,32 +41,24 @@ function parseCookie(header) {
 function extractToken(req) {
   const authHeader = req.headers.authorization || "";
   const cookies = parseCookie(req.headers.cookie || "");
-  let token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  if (!token && req.query?.token) token = req.query.token;
-  if (!token && cookies.token) token = cookies.token;
-  if (!token && cookies.access_token) token = cookies.access_token;
-  if (!token && cookies.jwt) token = cookies.jwt;
-  return token ? String(token).trim() : null;
+  return (
+    (authHeader.startsWith("Bearer ") && authHeader.slice(7)) ||
+    req.query?.token ||
+    cookies.token ||
+    cookies.access_token ||
+    cookies.jwt ||
+    null
+  );
 }
 
-function sanitizeToken(raw) {
-  if (!raw) return null;
-  try {
-    raw = decodeURIComponent(raw);
-  } catch {}
-  if ((raw.match(/\./g) || []).length !== 2) return null; // basic JWT shape
-  return raw;
+function roleFrom(decoded) {
+  return String(decoded?.role || decoded?.roles?.[0] || "USER")
+    .toUpperCase()
+    .includes("ADMIN")
+    ? "ADMIN"
+    : "USER";
 }
 
-function roleFromDecoded(decoded) {
-  const r =
-    decoded?.role || decoded?.roleName || decoded?.roles?.[0] || "USER";
-  return String(r).toUpperCase().includes("ADMIN") ? "ADMIN" : "USER";
-}
-
-/* -------------------------------------------------------------------------- */
-/*                                CORS PREFLIGHT                              */
-/* -------------------------------------------------------------------------- */
 export const ssePreflight = (req, res) => {
   const origin = req.headers.origin;
   if (origin) {
@@ -100,222 +66,89 @@ export const ssePreflight = (req, res) => {
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    // Include Origin because some browsers list it in Access-Control-Request-Headers
-    "Authorization, Content-Type, Last-Event-ID, X-Role, Origin"
-  );
-  // You are using Authorization headers (not cookies)
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-Role, Origin");
   res.setHeader("Access-Control-Allow-Credentials", "false");
-  return res.sendStatus(204);
+  res.sendStatus(204);
 };
 
-/* -------------------------------------------------------------------------- */
-/*                                 SSE HANDLER                                */
-/* -------------------------------------------------------------------------- */
 export const sseHandler = async (req, res) => {
   try {
-    // CORS first so even auth errors include ACAO
+    req.socket?.setKeepAlive?.(true);
+    req.socket?.setNoDelay?.(true);
+    req.socket?.setTimeout?.(0);
+
     const origin = req.headers.origin;
     if (origin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
     }
-    res.setHeader("Access-Control-Allow-Credentials", "false");
 
-    // ---- Auth (supports header, query, cookie) ----
     const rawToken = extractToken(req);
-    const token = sanitizeToken(rawToken);
-    if (!token) {
-      res.status(401).type("text/plain; charset=utf-8");
-      return res.end("Unauthorized: missing or invalid ?token");
-    }
+    const token = rawToken ? String(rawToken).trim() : null;
+    if (!token || !token.includes(".")) return res.status(401).end("Unauthorized");
 
     let decoded;
-    try {
-      decoded = JWT_PUBLIC_KEY
-        ? jwt.verify(token, JWT_PUBLIC_KEY, { algorithms: ["RS256"] })
-        : jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
-    } catch (err) {
-      res.status(401).type("text/plain; charset=utf-8");
-      return res.end(`Unauthorized: invalid token (${err?.name})`);
-    }
+    decoded = JWT_PUBLIC_KEY
+      ? jwt.verify(token, JWT_PUBLIC_KEY, { algorithms: ["RS256"] })
+      : jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
 
-    const userId =
-      decoded.sub ||
-      decoded._id ||
-      decoded.id ||
-      decoded.userId ||
-      decoded.user?.id;
-    if (!userId) {
-      res.status(401).type("text/plain; charset=utf-8");
-      return res.end("Unauthorized: token missing user id");
-    }
+    const userId = decoded.sub || decoded.id || decoded.userId || decoded.user?.id;
+    if (!userId) return res.status(401).end("Unauthorized");
 
-    const role = roleFromDecoded(decoded);
-    const isAdmin = role === "ADMIN";
-    const scope = (req.query?.scope || "user").toLowerCase();
-    const channel = isAdmin && scope === "admin" ? "admin" : String(userId);
+    const role = roleFrom(decoded);
+    const scope = String(req.query.scope || "user").toLowerCase();
+    const channel = role === "ADMIN" && scope === "admin" ? "admin" : String(userId);
 
-    // ---- SSE headers (do NOT use writeHead) ----
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no"); // nginx hint (no buffering)
+    res.setHeader("Content-Encoding", "identity");
+    res.setHeader("X-Accel-Buffering", "no");
 
-    // EventSource backoff hint + hello comment (useful in DevTools)
     sseWriteRaw(res, "retry: 10000\n");
     sseWriteRaw(res, `: hello ${Date.now()}\n\n`);
-
-    // Flush headers early (when supported)
     res.flushHeaders?.();
 
-    // ---- Register client ----
     const set = global.sseClients.get(channel) || new Set();
-    if (set.size >= MAX_CLIENTS_PER_USER) {
-      sseWrite(res, {
-        event: "error",
-        data: { message: "too_many_connections" },
-      });
-      return res.end();
-    }
+    if (set.size >= MAX_CLIENTS_PER_USER) return res.end();
     set.add(res);
     global.sseClients.set(channel, set);
 
-    // ---- Initial events ----
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
     try {
-      // Optional initial notifications payload
       const Notification = mongoose.model("Notification");
-      const limit = Math.min(Number(req.query?.limit) || 20, 100);
-      const or =
-        channel === "admin"
-          ? [{ audience: "ADMIN" }, { audience: "ALL" }]
-          : [{ user: userId }, { audience: "ALL" }];
-
-      const initial = await Notification.find({ $or: or })
-        .sort({ createdAt: -1 })
-        .limit(limit)
-        .lean();
-
+      const initial = await Notification.find({}).sort({ createdAt: -1 }).limit(20).lean();
       sseWrite(res, { event: "init", data: { notifications: initial } });
-    } catch (e) {
-      // If the model isn't registered, just send an empty init
+    } catch {
       sseWrite(res, { event: "init", data: { notifications: [] } });
     }
 
-    // ---- Heartbeat to keep intermediaries from closing the stream ----
-    const ping = setInterval(
-      () => sseWriteRaw(res, `: ping ${Date.now()}\n\n`),
-      HEARTBEAT_MS
-    );
+    const ping = setInterval(() => {
+      sseWriteRaw(res, `: ping ${Date.now()}\n\n`);
+    }, HEARTBEAT_MS);
 
     const cleanup = () => {
       clearInterval(ping);
       const c = global.sseClients.get(channel);
       if (c) c.delete(res);
-      if (!c || c.size === 0) global.sseClients.delete(channel);
+      if (c?.size === 0) global.sseClients.delete(channel);
     };
 
     req.on("close", cleanup);
-    req.on("end", cleanup);
     res.on("error", cleanup);
   } catch (err) {
-    debug("sseHandler error:", err?.message);
-    if (!res.headersSent) {
-      const origin = req.headers?.origin;
-      if (origin) {
-        res.setHeader("Access-Control-Allow-Origin", origin);
-        res.setHeader("Vary", "Origin");
-      }
-      res.status(500).json({ message: "SSE failed" });
-    }
+    debug("sseHandler error:", err);
+    if (!res.headersSent) res.status(500).json({ message: "SSE failed" });
   }
 };
 
-/* -------------------------------------------------------------------------- */
-/*                                PUSH HELPERS                                */
-/* -------------------------------------------------------------------------- */
-function pushToChannel(channelKey, payload, { eventName } = {}) {
-  const set = global.sseClients.get(String(channelKey));
-  if (!set) return 0;
-  const event = eventName || "message";
-  for (const res of [...set]) sseWrite(res, { event, data: payload });
-  return set.size;
-}
+export const pushToAdmins = (payload) =>
+  (global.sseClients.get("admin") || new Set()).forEach((res) =>
+    sseWrite(res, { event: "notification", data: payload })
+  );
 
-export const pushToUser = (userId, payload, opts = {}) =>
-  pushToChannel(String(userId), payload, opts);
-
-export const pushToAdmins = (payload, opts = {}) =>
-  pushToChannel("admin", payload, opts);
-
-export const pushNotification = (doc) => {
-  const payload = doc?.toObject ? doc.toObject() : doc;
-  if (payload.audience === "ADMIN")
-    return pushToAdmins(payload, { eventName: "notification" });
-
-  if (payload.audience === "ALL") {
-    pushToAdmins(payload, { eventName: "notification" });
-    if (payload.user)
-      pushToUser(payload.user, payload, { eventName: "notification" });
-    return;
-  }
-
-  if (payload.user)
-    pushToUser(payload.user, payload, { eventName: "notification" });
-};
-
-/* -------------------------------------------------------------------------- */
-/*                     ANALYTICS SNAPSHOT / WATCHER STUBS                     */
-/* -------------------------------------------------------------------------- */
-// Emits a lightweight analytics snapshot to admins; customize as needed.
-export async function emitAnalyticsSnapshot(options = {}) {
-  try {
-    const { days = 30 } = options;
-    const payload = {
-      type: "analytics_snapshot",
-      days,
-      ts: Date.now(),
-      // add real numbers here if you want:
-      metrics: {
-        activeUsers: undefined,
-        ticketsSold: undefined,
-        revenue: undefined,
-      },
-    };
-    return pushToAdmins(payload, { eventName: "analytics" });
-  } catch (e) {
-    debug("emitAnalyticsSnapshot error:", e?.message || e);
-    return 0;
-  }
-}
-
-// Example watcher stub; plug in a Mongo change stream if desired.
-export function startBookingWatcher() {
-  try {
-    // Example: attach to a Mongoose model change stream and push to admins
-    // const Booking = mongoose.model("Booking");
-    // const cs = Booking.watch([], { fullDocument: "updateLookup" });
-    // cs.on("change", (change) => {
-    //   pushToAdmins({ type: "booking_change", change }, { eventName: "booking" });
-    // });
-    debug("startBookingWatcher: no-op (stub). Add change streams if needed.");
-  } catch (e) {
-    debug("startBookingWatcher error:", e?.message || e);
-  }
-}
-
-/* -------------------------------------------------------------------------- */
-/*                                   EXPORTS                                  */
-/* -------------------------------------------------------------------------- */
-export default {
-  sseHandler,
-  ssePreflight,
-  pushToUser,
-  pushToAdmins,
-  pushNotification,
-  emitAnalyticsSnapshot,
-  startBookingWatcher,
-};
+export const pushToUser = (userId, payload) =>
+  (global.sseClients.get(String(userId)) || new Set()).forEach((res) =>
+    sseWrite(res, { event: "notification", data: payload })
+  );
