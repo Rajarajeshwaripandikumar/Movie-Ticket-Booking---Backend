@@ -329,6 +329,12 @@ try {
       if (router && (typeof router === "function" || router?.stack)) {
         app.use(prefix, router);
         console.log(`[mount] ${rpath} mounted at ${prefix}`);
+
+        // ✅ UK spelling alias for theaters
+        if (prefix === "/api/theaters") {
+          app.use("/api/theatres", router);
+          console.log(`[alias] ${rpath} ALSO mounted at /api/theatres`);
+        }
       } else {
         console.warn(`[mount] ${rpath} imported but did not export a router (default export missing)`);
       }
