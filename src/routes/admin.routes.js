@@ -115,6 +115,178 @@ router.post(
 router.use("/movies", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), moviesRouter);
 
 /* -------------------------------------------------------------------------- */
+/*                         THEATRE ADMIN USER MANAGEMENT                      */
+/* -------------------------------------------------------------------------- */
+
+// List theatre admins (SUPER_ADMIN only)
+router.get(
+  "/theatre-admins",
+  requireAuth,
+  requireRoles("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const admins = await User.find({ role: "THEATRE_ADMIN" })
+        .select("_id name email role theatreId createdAt")
+        .populate("theatreId", "name city")
+        .sort({ createdAt: -1 })
+        .lean();
+
+      const rows = admins.map(a => ({
+        id: a._id,
+        name: a.name,
+        email: a.email,
+        role: a.role,
+        theatre: a.theatreId
+          ? { id: a.theatreId._id, name: a.theatreId.name, city: a.theatreId.city }
+          : null,
+        createdAt: a.createdAt,
+      }));
+
+      res.json(rows);
+    } catch (err) {
+      console.error("[Admin] list theatre admins error:", err);
+      res.status(500).json({ message: "Failed to load theatre admins" });
+    }
+  }
+);
+
+// Create a theatre admin (SUPER_ADMIN only)
+router.post(
+  "/theatre-admins",
+  requireAuth,
+  requireRoles("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { name, email, theatreId, password } = req.body || {};
+      if (!name || !email || !theatreId) {
+        return res.status(400).json({ message: "name, email, theatreId required" });
+      }
+      if (!isId(theatreId)) {
+        return res.status(400).json({ message: "Invalid theatreId" });
+      }
+
+      const theatre = await Theater.findById(theatreId).lean();
+      if (!theatre) return res.status(404).json({ message: "Theatre not found" });
+
+      const existing = await User.findOne({ email: String(email).toLowerCase().trim() }).lean();
+      if (existing) return res.status(409).json({ message: "Email already in use" });
+
+      const salt = await bcrypt.genSalt(10);
+      const hashed = await bcrypt.hash(password || "changeme123", salt);
+
+      const created = await User.create({
+        name,
+        email: String(email).toLowerCase().trim(),
+        password: hashed,
+        role: "THEATRE_ADMIN",
+        theatreId,
+      });
+
+      const doc = await User.findById(created._id)
+        .select("_id name email role theatreId createdAt")
+        .populate("theatreId", "name city")
+        .lean();
+
+      res.status(201).json({
+        id: doc._id,
+        name: doc.name,
+        email: doc.email,
+        role: doc.role,
+        theatre: doc.theatreId
+          ? { id: doc.theatreId._id, name: doc.theatreId.name, city: doc.theatreId.city }
+          : null,
+        createdAt: doc.createdAt,
+      });
+    } catch (err) {
+      console.error("[Admin] create theatre admin error:", err);
+      res.status(500).json({ message: "Failed to create theatre admin", error: err.message });
+    }
+  }
+);
+
+// Update a theatre admin (name/theatreId and optional password)
+router.put(
+  "/theatre-admins/:id",
+  requireAuth,
+  requireRoles("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid admin id" });
+
+      const target = await User.findById(id).select("+password").lean();
+      if (!target) return res.status(404).json({ message: "User not found" });
+      if (target.role !== "THEATRE_ADMIN") {
+        return res.status(400).json({ message: "Only THEATRE_ADMIN can be updated here" });
+      }
+
+      const update = {};
+      if (req.body.name !== undefined) update.name = req.body.name;
+
+      if (req.body.theatreId !== undefined) {
+        if (!isId(req.body.theatreId)) return res.status(400).json({ message: "Invalid theatreId" });
+        const th = await Theater.findById(req.body.theatreId).lean();
+        if (!th) return res.status(404).json({ message: "Theatre not found" });
+        update.theatreId = req.body.theatreId;
+      }
+
+      if (req.body.password) {
+        const salt = await bcrypt.genSalt(10);
+        update.password = await bcrypt.hash(req.body.password, salt);
+      }
+
+      const updated = await User.findByIdAndUpdate(id, update, { new: true })
+        .select("_id name email role theatreId createdAt")
+        .populate("theatreId", "name city")
+        .lean();
+
+      res.json({
+        id: updated._id,
+        name: updated.name,
+        email: updated.email,
+        role: updated.role,
+        theatre: updated.theatreId
+          ? { id: updated.theatreId._id, name: updated.theatreId.name, city: updated.theatreId.city }
+          : null,
+        createdAt: updated.createdAt,
+      });
+    } catch (err) {
+      console.error("[Admin] update theatre admin error:", err);
+      res.status(500).json({ message: "Failed to update theatre admin", error: err.message });
+    }
+  }
+);
+
+// Delete a theatre admin
+router.delete(
+  "/theatre-admins/:id",
+  requireAuth,
+  requireRoles("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid admin id" });
+
+      // prevent deleting self or any non-THEATRE_ADMIN via this route
+      const target = await User.findById(id).lean();
+      if (!target) return res.status(404).json({ message: "User not found" });
+      if (String(target._id) === String(req.user._id || req.user.sub)) {
+        return res.status(400).json({ message: "You cannot delete yourself" });
+      }
+      if (target.role !== "THEATRE_ADMIN") {
+        return res.status(400).json({ message: "Only THEATRE_ADMIN can be deleted here" });
+      }
+
+      await User.findByIdAndDelete(id);
+      res.json({ success: true });
+    } catch (err) {
+      console.error("[Admin] delete theatre admin error:", err);
+      res.status(500).json({ message: "Failed to delete theatre admin", error: err.message });
+    }
+  }
+);
+
+/* -------------------------------------------------------------------------- */
 /*                              THEATRE MANAGEMENT                            */
 /* -------------------------------------------------------------------------- */
 
@@ -349,12 +521,6 @@ router.get(
       }
 
       // If theatre admin, scope to their theatre via showtime.theater
-      const showtimeMatch = {};
-      if (req.user.role === "THEATRE_ADMIN") {
-        showtimeMatch.theater = new mongoose.Types.ObjectId(String(req.user.theatreId));
-      }
-
-      // Fetch bookings, populated to compute revenue and statuses
       const bookings = await Booking.find(filter)
         .populate({
           path: "showtime",
@@ -366,9 +532,15 @@ router.get(
         .sort({ createdAt: -1 })
         .lean();
 
-      const scoped = req.user.role === "THEATRE_ADMIN"
-        ? bookings.filter(b => b.showtime && String(b.showtime.theater?._id || b.showtime.theater) === String(req.user.theatreId))
-        : bookings;
+      const scoped =
+        req.user.role === "THEATRE_ADMIN"
+          ? bookings.filter(
+              b =>
+                b.showtime &&
+                String(b.showtime.theater?._id || b.showtime.theater) ===
+                  String(req.user.theatreId)
+            )
+          : bookings;
 
       const revenue = scoped.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
       const countsByStatus = scoped.reduce((acc, b) => {
