@@ -22,7 +22,7 @@ const router = Router();
 router.routesPrefix = "/api/analytics";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
-/* ----------------------------- TEMP TOKEN (dev only) ----------------------------- */
+/* ----------------------------- DEV TOKEN SHIM ----------------------------- */
 router.use((req, res, next) => {
   try {
     if (!req.headers.authorization && req.query && req.query.token) {
@@ -35,21 +35,17 @@ router.use((req, res, next) => {
 });
 
 /* ----------------------------- HELPERS ----------------------------- */
-
 const AMOUNT_EXPR = {
   $toDouble: {
     $ifNull: ["$totalAmount", { $ifNull: ["$amount", { $ifNull: ["$price", 0] }] }],
   },
 };
-
-// showtime ref can be in multiple fields
 const SHOWTIME_REF = { $ifNull: ["$showtime", "$showtimeId", "$show", "$showId"] };
 const MOVIE_REF = { $ifNull: ["$movie", "$movieId"] };
 const USER_REF = { $ifNull: ["$user", "$userId"] };
 
 const toPast = (days) => new Date(Date.now() - Number(days) * 864e5);
 
-// normalize createdAt variants into createdAt: Date
 const normalizeCreatedAtStage = [
   { $addFields: { __created_raw: { $ifNull: ["$createdAt", "$created_at", "$createdAtRaw"] } } },
   {
@@ -69,12 +65,8 @@ const normalizeCreatedAtStage = [
   { $project: { __created_raw: 0 } },
 ];
 
-// project ISO day string to _d, keep dayISO for frontend
-const dayProjectSimple = [
-  { $addFields: { _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } } } },
-];
+const dayProjectSimple = [{ $addFields: { _d: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } } } }];
 
-// extract theatreId from JWT or return null
 function getTheatreIdFromReq(req) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -87,7 +79,6 @@ function getTheatreIdFromReq(req) {
   }
 }
 
-// build stages to filter BOOKINGS by theatre (via a lookup to showtimes)
 function theatreFilterStagesForBookings(theatreId) {
   if (!theatreId) return [];
   let tidObj = null;
@@ -120,7 +111,7 @@ function theatreFilterStagesForBookings(theatreId) {
       $match: {
         $expr: {
           $or: [
-            tidObj ? { $eq: ["$__st.theater", tidObj] } : { $eq: ["$__st.theater", null] }, // if not objectId, this branch won't match
+            tidObj ? { $eq: ["$__st.theater", tidObj] } : { $eq: ["$__st.theater", null] },
             { $eq: [{ $toString: "$__st.theater" }, tidStr] },
           ],
         },
@@ -130,7 +121,6 @@ function theatreFilterStagesForBookings(theatreId) {
   ];
 }
 
-// build stages to filter SHOWTIMES by theatre id (ObjectId or string)
 function theatreFilterStagesForShowtimes(theatreId) {
   if (!theatreId) return [];
   let tidObj = null;
@@ -150,13 +140,13 @@ function theatreFilterStagesForShowtimes(theatreId) {
   ];
 }
 
-/* ----------------------------- MAIN ANALYTICS DASHBOARD (GLOBAL) ----------------------------- */
+/* ----------------------------- MAIN DASHBOARD (GLOBAL) ----------------------------- */
 router.get("/", async (req, res, next) => {
   try {
     const days = Number(req.query.days || 7);
     const since = toPast(days);
 
-    /* ------------------------- REVENUE TREND ------------------------- */
+    // Revenue trend
     const revenue = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       { $match: { createdAt: { $gte: since } } },
@@ -176,7 +166,7 @@ router.get("/", async (req, res, next) => {
       total: Number(r.total ?? 0),
     }));
 
-    /* ------------------------- USERS DAILY ------------------------- */
+    // Users daily
     const users = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       { $match: { createdAt: { $gte: since } } },
@@ -193,7 +183,7 @@ router.get("/", async (req, res, next) => {
       count: Number(u.count ?? 0),
     }));
 
-    /* ------------------------- TOTAL COUNTS ------------------------- */
+    // Totals
     const totalsAgg = await Booking.aggregate([
       {
         $group: {
@@ -219,7 +209,7 @@ router.get("/", async (req, res, next) => {
     ]);
     const totals = (totalsAgg && totalsAgg[0]) || { totalBookings: 0, totalConfirmed: 0, totalCancelled: 0, totalUsers: 0 };
 
-    /* ------------------------- OCCUPANCY (GLOBAL) ------------------------- */
+    // Occupancy (global)
     const occupancyByTheater = await Theater.aggregate([
       { $project: { name: { $ifNull: ["$name", "$title", "$displayName", "Unknown"] }, tCapacity: { $ifNull: ["$capacity", "$totalSeats", null] } } },
       {
@@ -247,7 +237,7 @@ router.get("/", async (req, res, next) => {
                     { $in: [{ $toUpper: { $ifNull: ["$status", ""] } }, ["CONFIRMED", "PAID"]] },
                   ],
                 },
-                createdAt: { $gte: toPast(7) }, // last 7 days to keep it light here
+                createdAt: { $gte: toPast(7) },
               },
             },
             { $project: { seats: 1, quantity: 1 } },
@@ -299,7 +289,7 @@ router.get("/", async (req, res, next) => {
       totalCapacity: r.totalCapacity || 0,
     }));
 
-    /* ------------------------- POPULAR MOVIES (GLOBAL) ------------------------- */
+    // Popular movies (global)
     const popularMovies = await Booking.aggregate([
       ...normalizeCreatedAtStage,
       { $match: { createdAt: { $gte: since } } },
@@ -374,7 +364,7 @@ router.get("/", async (req, res, next) => {
 
 /* ----------------------------- DETAILED ENDPOINTS (GLOBAL) ----------------------------- */
 
-// revenue trends (global)
+// Revenue trends (global)
 router.get("/revenue/trends", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -393,8 +383,8 @@ router.get("/revenue/trends", async (req, res, next) => {
   } catch (e) { debug("revenue/trends error:", e.message); next(e); }
 });
 
-// users/active (global)
-router.get("/users/active", async (req, res, next) => {
+/* ====== ACTIVE USERS (global) ====== */
+async function handleUsersActive(req, res, next) {
   try {
     const since = toPast(req.query.days || 30);
     const data = await Booking.aggregate([
@@ -407,9 +397,11 @@ router.get("/users/active", async (req, res, next) => {
     ]);
     res.json(data);
   } catch (e) { debug("users/active error:", e.message); next(e); }
-});
+}
+router.get("/users/active", handleUsersActive);      // original
+router.get("/active-users", handleUsersActive);      // alias for frontend
 
-// occupancy (per-theater, global)
+// Occupancy (global)
 router.get("/occupancy", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -493,8 +485,8 @@ router.get("/occupancy", async (req, res, next) => {
   } catch (e) { debug("occupancy error:", e.message); next(e); }
 });
 
-// popular movies (global)
-router.get("/movies/popular", async (req, res, next) => {
+/* ====== POPULAR MOVIES (global) ====== */
+async function handleMoviesPopular(req, res, next) {
   try {
     const since = toPast(req.query.days || 30);
     const limit = Number(req.query.limit || 10);
@@ -568,9 +560,11 @@ router.get("/movies/popular", async (req, res, next) => {
 
     res.json(out);
   } catch (e) { debug("movies/popular error:", e.message); next(e); }
-});
+}
+router.get("/movies/popular", handleMoviesPopular);   // original
+router.get("/popular-movies", handleMoviesPopular);   // alias for frontend
 
-// bookings summary (global)
+// Bookings summary (global)
 router.get("/bookings/summary", async (req, res, next) => {
   try {
     const since = toPast(req.query.days || 30);
@@ -595,7 +589,6 @@ router.get("/bookings/summary", async (req, res, next) => {
 
 /* ----------------------------- THEATRE-SCOPED (“MINE”) ----------------------------- */
 
-// Main dashboard (mine)
 router.get("/mine", async (req, res, next) => {
   try {
     const theatreId = getTheatreIdFromReq(req);
@@ -659,7 +652,7 @@ router.get("/mine", async (req, res, next) => {
     ]);
     const totals = (totalsAgg && totalsAgg[0]) || { totalBookings: 0, totalConfirmed: 0, totalCancelled: 0, totalUsers: 0 };
 
-    // Occupancy (just my theatre)
+    // Occupancy (mine)
     let tidObj = null; try { tidObj = new mongoose.Types.ObjectId(String(theatreId)); } catch {}
     const tidStr = String(theatreId);
 
@@ -700,7 +693,7 @@ router.get("/mine", async (req, res, next) => {
                     { $in: [{ $toUpper: { $ifNull: ["$status", ""] } }, ["CONFIRMED", "PAID"]] },
                   ],
                 },
-                createdAt: { $gte: toPast(7) },
+                createdAt: { $gte: since },
               },
             },
             { $project: { seats: 1, quantity: 1 } },
@@ -825,7 +818,7 @@ router.get("/mine", async (req, res, next) => {
   }
 });
 
-// revenue trends (mine)
+// Revenue trends (mine)
 router.get("/revenue/trends/mine", async (req, res, next) => {
   try {
     const theatreId = getTheatreIdFromReq(req);
@@ -847,7 +840,7 @@ router.get("/revenue/trends/mine", async (req, res, next) => {
   } catch (e) { debug("revenue/trends/mine error:", e.message); next(e); }
 });
 
-// users/active (mine)
+// Users active (mine)
 router.get("/users/active/mine", async (req, res, next) => {
   try {
     const theatreId = getTheatreIdFromReq(req);
@@ -866,7 +859,7 @@ router.get("/users/active/mine", async (req, res, next) => {
   } catch (e) { debug("users/active/mine error:", e.message); next(e); }
 });
 
-// occupancy (mine)
+// Occupancy (mine)
 router.get("/occupancy/mine", async (req, res, next) => {
   try {
     const theatreId = getTheatreIdFromReq(req);
@@ -962,7 +955,7 @@ router.get("/occupancy/mine", async (req, res, next) => {
   } catch (e) { debug("occupancy/mine error:", e.message); next(e); }
 });
 
-// popular movies (mine)
+// Popular movies (mine)
 router.get("/movies/popular/mine", async (req, res, next) => {
   try {
     const theatreId = getTheatreIdFromReq(req);
@@ -1042,7 +1035,7 @@ router.get("/movies/popular/mine", async (req, res, next) => {
   } catch (e) { debug("movies/popular/mine error:", e.message); next(e); }
 });
 
-// bookings summary (mine)
+// Bookings summary (mine)
 router.get("/bookings/summary/mine", async (req, res, next) => {
   try {
     const theatreId = getTheatreIdFromReq(req);
