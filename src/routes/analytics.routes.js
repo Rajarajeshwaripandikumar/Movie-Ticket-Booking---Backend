@@ -19,6 +19,7 @@ const Movie =
   mongoose.model("Movie", new mongoose.Schema({}, { strict: false }));
 
 const router = Router();
+router.routesPrefix = "/api/analytics";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 /* ----------------------------- TEMP TOKEN (dev only) ----------------------------- */
