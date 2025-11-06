@@ -1,6 +1,7 @@
 // backend/src/routes/showtimes.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
+import jwt from "jsonwebtoken";
 import Showtime from "../models/Showtime.js";
 import Screen from "../models/Screen.js";
 import SeatLock from "../models/SeatLock.js";
@@ -8,6 +9,7 @@ import Theater from "../models/Theater.js";
 import Movie from "../models/Movie.js";
 
 const router = Router();
+const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 /* -------------------------------------------------------------------------- */
 /* Time helpers (IST-aware)                                                   */
@@ -200,6 +202,64 @@ router.get("/", async (req, res) => {
   } catch (err) {
     console.error("❌ GET /showtimes error:", err);
     return res.status(500).json({ message: "Failed to fetch showtimes", error: err.message });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* NEW: GET /showtimes/my-theatre?date=YYYY-MM-DD&movieId=&screenId=         */
+/* Returns ONLY the logged-in manager's theatre showtimes (JWT.theatreId).    */
+/* Same date rules (IST) as other list endpoints.                             */
+/* -------------------------------------------------------------------------- */
+router.get("/my-theatre", async (req, res) => {
+  try {
+    const h = req.headers.authorization || "";
+    const [, token] = h.split(" ");
+    if (!token) return res.status(401).json({ message: "Missing token" });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    const theatreId = decoded?.theatreId;
+    if (!theatreId || !mongoose.isValidObjectId(String(theatreId))) {
+      return res.json([]); // not a theatre admin or not linked
+    }
+
+    const { movieId, screenId, date } = req.query;
+
+    const q = { theater: new mongoose.Types.ObjectId(String(theatreId)) };
+    if (movieId && mongoose.isValidObjectId(String(movieId))) q.movie = new mongoose.Types.ObjectId(String(movieId));
+    if (screenId && mongoose.isValidObjectId(String(screenId))) q.screen = new mongoose.Types.ObjectId(String(screenId));
+
+    const todayYmd = toYmdIST();
+    const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
+
+    if (!ymd) {
+      q.startTime = { $gte: nowUtc() };
+    } else if (ymd < todayYmd) {
+      return res.json([]); // no past
+    } else if (ymd === todayYmd) {
+      const { endUtc } = istBoundsUtc(ymd);
+      q.startTime = { $gte: nowUtc(), $lt: endUtc };
+    } else {
+      const { startUtc, endUtc } = istBoundsUtc(ymd);
+      q.startTime = { $gte: startUtc, $lt: endUtc };
+    }
+
+    const docs = await Showtime.find(q)
+      .sort({ startTime: 1 })
+      .populate("movie", "title posterUrl runtime languages censorRating genres")
+      .populate("theater", "name city address")
+      .populate("screen", "name rows cols format")
+      .lean();
+
+    return res.json(docs.map(toDto));
+  } catch (e) {
+    console.error("❌ GET /showtimes/my-theatre error:", e);
+    return res.status(500).json({ message: "Failed to fetch theatre showtimes" });
   }
 });
 
