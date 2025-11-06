@@ -19,6 +19,7 @@ import Booking from "../models/Booking.js";
 import moviesRouter from "./movies.routes.js";
 
 const router = Router();
+const isId = (id) => mongoose.isValidObjectId(id);
 
 /* -------------------------------------------------------------------------- */
 /*                          DEBUG / USER PROFILE ROUTES                       */
@@ -28,67 +29,85 @@ const router = Router();
 router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }));
 
 // Get current admin profile
-router.get("/me", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), async (req, res) => {
-  try {
-    const id = req.user?._id || req.user?.sub;
-    if (!id) return res.status(401).json({ message: "Unauthenticated" });
+router.get(
+  "/me",
+  requireAuth,
+  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  async (req, res) => {
+    try {
+      const id = req.user?._id || req.user?.sub;
+      if (!id) return res.status(401).json({ message: "Unauthenticated" });
 
-    const doc = await User.findById(id).lean();
-    if (!doc) return res.status(404).json({ message: "Admin not found" });
+      const doc = await User.findById(id).lean();
+      if (!doc) return res.status(404).json({ message: "Admin not found" });
 
-    const { _id, email, role, name, phone, createdAt, updatedAt } = doc;
-    res.json({ id: _id, email, role, name, phone, createdAt, updatedAt });
-  } catch (err) {
-    console.error("[Admin] /me error:", err);
-    res.status(500).json({ message: "Failed to fetch profile" });
+      const { _id, email, role, name, phone, createdAt, updatedAt } = doc;
+      res.json({ id: _id, email, role, name, phone, createdAt, updatedAt });
+    } catch (err) {
+      console.error("[Admin] /me error:", err);
+      res.status(500).json({ message: "Failed to fetch profile" });
+    }
   }
-});
+);
 
 // Update admin profile
-router.put("/profile", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), async (req, res) => {
-  try {
-    const id = req.user?._id || req.user?.sub;
-    if (!id) return res.status(401).json({ message: "Unauthenticated" });
+router.put(
+  "/profile",
+  requireAuth,
+  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  async (req, res) => {
+    try {
+      const id = req.user?._id || req.user?.sub;
+      if (!id) return res.status(401).json({ message: "Unauthenticated" });
 
-    const allowed = ["name", "phone"];
-    const update = {};
-    for (const k of allowed) if (req.body[k] !== undefined) update[k] = req.body[k];
+      const allowed = ["name", "phone"];
+      const update = {};
+      for (const k of allowed) if (req.body[k] !== undefined) update[k] = req.body[k];
 
-    const updated = await User.findByIdAndUpdate(id, update, { new: true, runValidators: true }).lean();
-    if (!updated) return res.status(404).json({ message: "Admin not found" });
+      const updated = await User.findByIdAndUpdate(id, update, {
+        new: true,
+        runValidators: true,
+      }).lean();
+      if (!updated) return res.status(404).json({ message: "Admin not found" });
 
-    const { _id, email, role, name, phone, createdAt, updatedAt } = updated;
-    res.json({ id: _id, email, role, name, phone, createdAt, updatedAt });
-  } catch (err) {
-    console.error("[Admin] update profile error:", err);
-    res.status(500).json({ message: "Failed to update profile" });
+      const { _id, email, role, name, phone, createdAt, updatedAt } = updated;
+      res.json({ id: _id, email, role, name, phone, createdAt, updatedAt });
+    } catch (err) {
+      console.error("[Admin] update profile error:", err);
+      res.status(500).json({ message: "Failed to update profile" });
+    }
   }
-});
+);
 
 // Change password
-router.post("/change-password", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), async (req, res) => {
-  try {
-    const { currentPassword, newPassword } = req.body || {};
-    if (!currentPassword || !newPassword || newPassword.length < 6)
-      return res.status(400).json({ ok: false, message: "Invalid input" });
+router.post(
+  "/change-password",
+  requireAuth,
+  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  async (req, res) => {
+    try {
+      const { currentPassword, newPassword } = req.body || {};
+      if (!currentPassword || !newPassword || newPassword.length < 6)
+        return res.status(400).json({ ok: false, message: "Invalid input" });
 
-    const id = req.user?._id || req.user?.sub;
-    const user = await User.findById(id).select("+password");
-    if (!user) return res.status(404).json({ ok: false, message: "User not found" });
+      const id = req.user?._id || req.user?.sub;
+      const user = await User.findById(id).select("+password");
+      if (!user) return res.status(404).json({ ok: false, message: "User not found" });
 
-    const matches = await bcrypt.compare(currentPassword, user.password || "");
-    if (!matches) return res.status(400).json({ ok: false, message: "Current password incorrect" });
+      const matches = await bcrypt.compare(currentPassword, user.password || "");
+      if (!matches) return res.status(400).json({ ok: false, message: "Current password incorrect" });
 
-    const salt = await bcrypt.genSalt(10);
-    user.password = await bcrypt.hash(newPassword, salt);
-    await user.save();
+      const salt = await bcrypt.genSalt(10);
+      user.password = await bcrypt.hash(newPassword, salt);
+      await user.save();
 
-    res.json({ ok: true, message: "Password updated" });
-  } catch (err) {
-    console.error("[Admin] change-password error:", err);
-    res.status(500).json({ ok: false, message: "Failed to change password" });
+      res.json({ ok: true, message: "Password updated" });
+    } catch (err) {
+      console.error("[Admin] change-password error:", err);
+      res.status(500).json({ ok: false, message: "Failed to change password" });
+    }
   }
-});
+);
 
 /* -------------------------------------------------------------------------- */
 /*                              MOVIES MANAGEMENT                             */
@@ -99,61 +118,90 @@ router.use("/movies", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
 /*                              THEATRE MANAGEMENT                            */
 /* -------------------------------------------------------------------------- */
 
-// ✅ SUPER_ADMIN — can create theatres
-router.post("/theaters", requireAuth, requireRoles("SUPER_ADMIN"), async (req, res) => {
-  try {
-    const { name, city, address } = req.body || {};
-    if (!name || !city) return res.status(400).json({ message: "name and city required" });
+// SUPER_ADMIN — create theatres
+router.post(
+  "/theaters",
+  requireAuth,
+  requireRoles("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { name, city, address } = req.body || {};
+      if (!name || !city) return res.status(400).json({ message: "name and city required" });
 
-    const exists = await Theater.findOne({ name, city }).lean();
-    if (exists) return res.status(409).json({ message: "Theatre already exists in this city" });
+      const exists = await Theater.findOne({ name, city }).lean();
+      if (exists) return res.status(409).json({ message: "Theatre already exists in this city" });
 
-    const theatre = await Theater.create({ name, city, address });
-    res.status(201).json(theatre);
-  } catch (err) {
-    console.error("[Admin] create theatre error:", err);
-    res.status(500).json({ message: "Failed to create theatre", error: err.message });
-  }
-});
-
-// ✅ BOTH SUPER_ADMIN and THEATRE_ADMIN (filtered for theatre-admin)
-router.get("/theaters", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), async (req, res) => {
-  try {
-    let query = {};
-    if (req.user.role === "THEATRE_ADMIN") {
-      query._id = req.user.theatreId;
+      const theatre = await Theater.create({ name, city, address });
+      res.status(201).json(theatre);
+    } catch (err) {
+      console.error("[Admin] create theatre error:", err);
+      res.status(500).json({ message: "Failed to create theatre", error: err.message });
     }
-    const theatres = await Theater.find(query).sort({ createdAt: -1 });
-    res.json(theatres);
-  } catch (err) {
-    console.error("[Admin] load theatres error:", err);
-    res.status(500).json({ message: "Failed to load theatres", error: err.message });
   }
-});
+);
+
+// SUPER_ADMIN & THEATRE_ADMIN — list theatres (theatre-admin sees only their own)
+router.get(
+  "/theaters",
+  requireAuth,
+  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  async (req, res) => {
+    try {
+      const query = req.user.role === "THEATRE_ADMIN" ? { _id: req.user.theatreId } : {};
+      const theatres = await Theater.find(query).sort({ createdAt: -1 }).lean();
+      res.json(theatres);
+    } catch (err) {
+      console.error("[Admin] load theatres error:", err);
+      res.status(500).json({ message: "Failed to load theatres", error: err.message });
+    }
+  }
+);
 
 /* -------------------------------------------------------------------------- */
 /*                               SCREEN MANAGEMENT                            */
 /* -------------------------------------------------------------------------- */
+
+// Create screen for a theatre (uses standardized 'columns')
 router.post(
   "/theaters/:id/screens",
   requireAuth,
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
-  requireTheatreOwnership,
+  requireTheatreOwnership, // ensures THEATRE_ADMIN can only touch their theatre
   async (req, res) => {
     try {
-      const { name, rows, cols } = req.body || {};
-      if (!name || !rows || !cols)
-        return res.status(400).json({ message: "name, rows, cols required" });
+      const { id } = req.params;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid theater id" });
 
-      const screen = await Screen.create({ theater: req.params.id, name, rows, cols });
+      const { name, rows, cols, columns } = req.body || {};
+      const R = Number(rows);
+      const C = Number(cols ?? columns);
+      if (!name || !R || !C) {
+        return res.status(400).json({ message: "name, rows, columns (or cols) required" });
+      }
+      if (R <= 0 || C <= 0) {
+        return res.status(400).json({ message: "rows and columns must be positive numbers" });
+      }
+
+      // Store as 'columns' to be consistent with screens.routes.js
+      const screen = await Screen.create({
+        theater: id,
+        name: String(name).trim(),
+        rows: R,
+        columns: C,
+      });
+
       res.status(201).json(screen);
     } catch (err) {
       console.error("[Admin] create screen error:", err);
+      if (err?.code === 11000) {
+        return res.status(409).json({ message: "Screen name already exists for this theater" });
+      }
       res.status(500).json({ message: "Failed to create screen", error: err.message });
     }
   }
 );
 
+// List screens for a theatre
 router.get(
   "/theaters/:id/screens",
   requireAuth,
@@ -161,7 +209,10 @@ router.get(
   requireTheatreOwnership,
   async (req, res) => {
     try {
-      const screens = await Screen.find({ theater: req.params.id }).sort({ createdAt: -1 });
+      const { id } = req.params;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid theater id" });
+
+      const screens = await Screen.find({ theater: id }).sort({ createdAt: -1 }).lean();
       res.json(screens);
     } catch (err) {
       console.error("[Admin] load screens error:", err);
@@ -173,6 +224,8 @@ router.get(
 /* -------------------------------------------------------------------------- */
 /*                              SHOWTIME MANAGEMENT                           */
 /* -------------------------------------------------------------------------- */
+
+// List showtimes (THEATRE_ADMIN scoped to their theatre)
 router.get(
   "/showtimes",
   requireAuth,
@@ -185,10 +238,11 @@ router.get(
       }
 
       const showtimes = await Showtime.find(filter)
-        .populate("movie", "title genre durationMins language")
-        .populate("screen", "name rows cols")
+        .populate("movie", "title genres runtime languages censorRating")
+        .populate("screen", "name rows columns")
         .populate("theater", "name city")
-        .sort({ startTime: -1 });
+        .sort({ startTime: -1 })
+        .lean();
 
       res.json(showtimes);
     } catch (err) {
@@ -198,44 +252,73 @@ router.get(
   }
 );
 
+// Create showtime (seats initialized from screen.rows/columns)
+// THEATRE_ADMIN can only create for their own theatre (via screen ownership)
 router.post(
   "/showtimes",
   requireAuth,
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
-  requireTheatreOwnership,
   async (req, res) => {
     try {
-      const { movie, screen: screenId, city, startTime, basePrice, rows, cols } = req.body || {};
-      if (!movie || !screenId || !city || !startTime)
-        return res.status(400).json({ message: "movie, screen, city, startTime required" });
-
-      const screen = await Screen.findById(screenId);
-      if (!screen) return res.status(404).json({ message: "Screen not found" });
-
-      const theater = screen.theater;
-      const R = Number(rows ?? screen.rows);
-      const C = Number(cols ?? screen.cols);
-      if (!R || !C)
-        return res.status(400).json({ message: "rows and cols required" });
-
-      const seats = [];
-      for (let r = 1; r <= R; r++) {
-        for (let c = 1; c <= C; c++) seats.push({ row: r, col: c, status: "AVAILABLE" });
+      const { movie, screen: screenId, startTime, basePrice } = req.body || {};
+      if (!movie || !screenId || !startTime || basePrice == null) {
+        return res
+          .status(400)
+          .json({ message: "movie, screen, startTime, basePrice are required" });
       }
 
-      const showtime = await Showtime.create({
+      // Validate screen
+      const screen = await Screen.findById(screenId).lean();
+      if (!screen) return res.status(404).json({ message: "Screen not found" });
+
+      // Ownership check for THEATRE_ADMIN
+      if (req.user.role === "THEATRE_ADMIN") {
+        if (String(screen.theater) !== String(req.user.theatreId)) {
+          return res.status(403).json({ message: "Forbidden" });
+        }
+      }
+
+      // Derive theater + city from screen.theater
+      const theater = await Theater.findById(screen.theater).select("city").lean();
+      if (!theater) return res.status(400).json({ message: "Theater missing for screen" });
+
+      // Time normalization: minute precision
+      const when = new Date(startTime);
+      if (Number.isNaN(when.getTime())) return res.status(400).json({ message: "Invalid startTime" });
+      when.setSeconds(0, 0);
+
+      const rows = Number(screen.rows) || 10;
+      const cols = Number(screen.columns ?? screen.cols) || 10;
+
+      // Initialize seats on create for admin tool
+      const seats = [];
+      for (let r = 1; r <= rows; r++) {
+        for (let c = 1; c <= cols; c++) seats.push({ row: r, col: c, status: "AVAILABLE" });
+      }
+
+      const doc = await Showtime.create({
         movie,
         screen: screenId,
-        theater,
-        city,
-        startTime: new Date(startTime),
-        basePrice,
+        theater: screen.theater,
+        city: theater.city,
+        startTime: when,
+        basePrice: Number(basePrice),
         seats,
       });
 
-      res.status(201).json(showtime);
+      const populated = await Showtime.findById(doc._id)
+        .populate("movie", "title genres runtime languages censorRating")
+        .populate("screen", "name rows columns")
+        .populate("theater", "name city")
+        .lean();
+
+      res.status(201).json(populated);
     } catch (err) {
       console.error("[Admin] create showtime error:", err);
+      if (err?.code === 11000) {
+        // if you’ve added a unique compound index on (screen, startTime-minute)
+        return res.status(409).json({ message: "Showtime already exists for this screen & minute" });
+      }
       res.status(500).json({ message: "Failed to create showtime", error: err.message });
     }
   }
@@ -251,8 +334,9 @@ router.get(
   async (req, res) => {
     try {
       const { from, to } = req.query;
-      const filter = {};
 
+      // Base filter by date
+      const filter = {};
       if (from || to) {
         const createdAt = {};
         if (from) createdAt.$gte = new Date(from);
@@ -264,10 +348,13 @@ router.get(
         filter.createdAt = createdAt;
       }
 
+      // If theatre admin, scope to their theatre via showtime.theater
+      const showtimeMatch = {};
       if (req.user.role === "THEATRE_ADMIN") {
-        filter["showtime.theater"] = req.user.theatreId;
+        showtimeMatch.theater = new mongoose.Types.ObjectId(String(req.user.theatreId));
       }
 
+      // Fetch bookings, populated to compute revenue and statuses
       const bookings = await Booking.find(filter)
         .populate({
           path: "showtime",
@@ -276,16 +363,21 @@ router.get(
             { path: "theater", select: "name city" },
           ],
         })
-        .sort({ createdAt: -1 });
+        .sort({ createdAt: -1 })
+        .lean();
 
-      const revenue = bookings.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
-      const countsByStatus = bookings.reduce((acc, b) => {
+      const scoped = req.user.role === "THEATRE_ADMIN"
+        ? bookings.filter(b => b.showtime && String(b.showtime.theater?._id || b.showtime.theater) === String(req.user.theatreId))
+        : bookings;
+
+      const revenue = scoped.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+      const countsByStatus = scoped.reduce((acc, b) => {
         const s = (b.status || "unknown").toLowerCase();
         acc[s] = (acc[s] || 0) + 1;
         return acc;
       }, {});
 
-      res.json({ count: bookings.length, revenue, countsByStatus, bookings });
+      res.json({ count: scoped.length, revenue, countsByStatus, bookings: scoped });
     } catch (err) {
       console.error("[Admin] report error:", err);
       res.status(500).json({ message: "Failed to generate report", error: err.message });
