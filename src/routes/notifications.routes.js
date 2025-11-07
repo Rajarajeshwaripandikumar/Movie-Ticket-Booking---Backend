@@ -1,14 +1,14 @@
 // backend/src/routes/notifications.routes.js
 import { Router } from "express";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import Notification from "../models/Notification.js";
 import { requireAuth } from "../middleware/auth.js";
-import { sendEmail } from "../utils/sendEmail.js"; // NEW: email helper
+import { sendEmail } from "../utils/sendEmail.js"; // email helper
 
 const router = Router();
 
 // In-memory registry (channel -> Set<Response>)
-// channel is either a userId (string) or the literal "admin"
 const clients = new Map();
 
 const JWT_SECRET   = process.env.JWT_SECRET   || "dev_jwt_secret_change_me";
@@ -36,7 +36,6 @@ function getAuthFromReq(req) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     const userId = decoded.sub || decoded.id || decoded.userId || decoded._id;
-    // role claim examples: "ADMIN", "USER", "ROLE_ADMIN"
     const roleRaw =
       decoded.role ||
       (Array.isArray(decoded.roles) && decoded.roles.find(r => String(r).toUpperCase().includes("ADMIN"))) ||
@@ -77,13 +76,9 @@ function visibilityOr({ isAdmin, userId, includeAll = true }) {
     return or;
   }
   const or = [
-    // user-scoped + back-compat (audience may be missing/USER)
     { user: userId, $or: [{ audience: { $exists: false } }, { audience: null }, { audience: "USER" }] },
   ];
-  if (includeAll) {
-    // ALL intended for everyone (usually has user: null)
-    or.push({ audience: "ALL" });
-  }
+  if (includeAll) or.push({ audience: "ALL" });
   return or;
 }
 
@@ -92,9 +87,17 @@ function unreadCond(readerId) {
   return {
     $and: [
       { $or: [{ readBy: { $exists: false } }, { readBy: { $nin: [readerId] } }] },
-      { $or: [{ readAt: { $exists: false } }, { readAt: null }] }, // keep legacy readAt compatibility
+      { $or: [{ readAt: { $exists: false } }, { readAt: null }] },
     ],
   };
+}
+
+// Can the viewer see this single doc?
+function canSeeNotification({ doc, isAdmin, userId }) {
+  if (!doc) return false;
+  if (doc.audience === "ADMIN") return isAdmin;
+  if (doc.audience === "ALL") return true;
+  return String(doc.user || "") === String(userId);
 }
 
 /* -------------------------- routes -------------------------- */
@@ -134,26 +137,20 @@ router.get("/stream", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
-  // Improve socket behavior for long-lived streams
   req.socket?.setKeepAlive?.(true, 30_000);
   req.socket?.setNoDelay?.(true);
 
-  // reconnection backoff (ms) for EventSource
   res.write("retry: 10000\n\n");
   res.flushHeaders?.();
 
   addClient(channel, res);
-
-  // mark response as writable until closed
   res._sseWritable = () => !res.writableEnded && !res.destroyed;
 
   const listeners = clients.get(channel)?.size || 0;
   console.log(`[SSE] CONNECT channel=${channel} listeners=${listeners}`);
 
-  // initial hello event
   sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-  // (Optional) seed recent on connect: /stream?seed=1
   if (String(req.query.seed || "") === "1") {
     try {
       const limit = Math.min(Number(req.query.limit) || 20, 100);
@@ -166,9 +163,7 @@ router.get("/stream", async (req, res) => {
         .limit(limit)
         .lean();
 
-      for (const n of items) {
-        sseWrite(res, { id: n._id, data: n }); // event defaults to "notification"
-      }
+      for (const n of items) sseWrite(res, { id: n._id, data: n });
     } catch (e) {
       sseWrite(res, { event: "error", data: { message: "seed_failed" } });
     }
@@ -195,7 +190,7 @@ export function broadcastToUser(userId, payload) {
   let delivered = 0;
   for (const r of set) {
     if (r._sseWritable && !r._sseWritable()) continue;
-    sseWrite(r, { id: payload?._id, data: payload }); // always "notification"
+    sseWrite(r, { id: payload?._id, data: payload });
     delivered++;
   }
   console.log(`[SSE] delivered=${delivered} to channel=${key}`);
@@ -239,11 +234,6 @@ export function broadcastAll(payload) {
 
 /**
  * Push a saved Notification document to the correct channel after you create it.
- *   const doc = await Notification.create(...);
- *   pushNotification(doc);
- *
- *  NOTE: this function now attempts to send an email (if an address is available)
- *        while preserving your existing SSE broadcast behavior.
  */
 export async function pushNotification(doc) {
   if (!doc) return 0;
@@ -251,7 +241,7 @@ export async function pushNotification(doc) {
   const payload = doc.toObject ? doc.toObject() : doc;
   const audience = payload.audience;
 
-  // 1) SSE broadcast (unchanged)
+  // 1) SSE broadcast
   let delivered = 0;
   if (audience === "ADMIN") {
     delivered += broadcastToAdmins(payload);
@@ -263,11 +253,8 @@ export async function pushNotification(doc) {
     if (userId) delivered += broadcastToUser(userId, payload);
   }
 
-  // 2) Email (best-effort) — will not throw (errors logged)
+  // 2) Email (best-effort)
   try {
-    // Determine recipient email:
-    // - If Notification doc includes an email field or user.email, use it
-    // - Fallback to SUPPORT_EMAIL or ADMIN email env var if set (useful for admin/ALL)
     const recipient =
       payload.email ||
       (payload.user && (payload.user.email || payload.user.emailAddress)) ||
@@ -285,7 +272,6 @@ export async function pushNotification(doc) {
           <small>This is an automated message from MovieBook</small>
         </div>
       `;
-      // sendEmail returns true/false — best-effort
       const ok = await sendEmail({ to: recipient, subject, html });
       console.log(`[pushNotification] email_sent=${ok} to=${recipient} id=${String(payload._id || "")}`);
     } else {
@@ -310,7 +296,7 @@ router.post("/notify", (req, res) => {
 });
 
 /* --------------- REST: list / counts / mark read (readBy-aware) --------------- */
-router.get("/mine", requireAuth, async (req, res) => {
+async function listMine(req, res) {
   try {
     const isAdmin = isAdminRole(req.user);
     const userId = String(req.user._id);
@@ -330,7 +316,11 @@ router.get("/mine", requireAuth, async (req, res) => {
     console.error("[notifications] list error:", e?.message);
     res.status(500).json({ message: "Failed to load notifications" });
   }
-});
+}
+
+router.get("/mine", requireAuth, listMine);
+// Alias to avoid frontend mismatches
+router.get("/me", requireAuth, listMine);
 
 router.get("/unread-count", requireAuth, async (req, res) => {
   try {
@@ -359,16 +349,13 @@ router.patch("/:id/read", requireAuth, async (req, res) => {
     const readerId = isAdmin ? "admin" : userId;
     const { id } = req.params;
 
-    // must be visible to caller
     const vis = visibilityOr({ isAdmin, userId, includeAll: true });
 
-    // fetch first (we need to know audience & user to decide readAt legacy)
     const doc = await Notification.findOne({ _id: id, $or: vis });
     if (!doc) return res.status(404).json({ message: "Not found" });
 
     const update = { $addToSet: { readBy: readerId } };
 
-    // Back-compat: if it's a USER/legacy item for this exact user, set readAt too
     const isUserItemForCaller =
       !isAdmin &&
       String(doc.user || "") === userId &&
@@ -392,10 +379,8 @@ router.post("/read-all", requireAuth, async (req, res) => {
     const userId = String(req.user._id);
     const readerId = isAdmin ? "admin" : userId;
 
-    // visible to caller
     const vis = visibilityOr({ isAdmin, userId, includeAll: true });
 
-    // add caller to readBy; also set readAt for legacy user docs
     const update = { $addToSet: { readBy: readerId } };
     if (!isAdmin) update.$set = { readAt: new Date() };
 
@@ -404,6 +389,62 @@ router.post("/read-all", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("[notifications] read-all error:", e?.message);
     res.status(500).json({ message: "Failed to mark all read" });
+  }
+});
+
+/* -------------------- NEW: detail + open endpoints -------------------- */
+router.get("/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const isAdmin = isAdminRole(req.user);
+    const userId = String(req.user._id);
+
+    const doc = await Notification.findById(id).lean();
+    if (!doc || !canSeeNotification({ doc, isAdmin, userId })) {
+      return res.status(404).json({ message: "Not found" });
+    }
+    return res.json(doc);
+  } catch (e) {
+    console.error("[notifications] detail error:", e?.message);
+    res.status(500).json({ message: "Failed to load notification" });
+  }
+});
+
+router.post("/:id/open", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const isAdmin = isAdminRole(req.user);
+    const userId = String(req.user._id);
+    const readerId = isAdmin ? "admin" : userId;
+
+    const doc = await Notification.findById(id);
+    if (!doc || !canSeeNotification({ doc, isAdmin, userId })) {
+      return res.status(404).json({ message: "Not found" });
+    }
+
+    const update = { $addToSet: { readBy: readerId } };
+    const isUserItemForCaller =
+      !isAdmin &&
+      String(doc.user || "") === userId &&
+      (doc.audience === "USER" || doc.audience == null);
+
+    if (isUserItemForCaller && !doc.readAt) {
+      update.$set = { readAt: new Date() };
+    }
+
+    const updated = await Notification.findByIdAndUpdate(id, update, { new: true }).lean();
+    return res.json(updated);
+  } catch (e) {
+    console.error("[notifications] open error:", e?.message);
+    res.status(500).json({ message: "Failed to open notification" });
   }
 });
 
