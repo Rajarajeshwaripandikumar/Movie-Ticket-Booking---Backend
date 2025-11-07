@@ -3,14 +3,14 @@ import { Router } from "express";
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import Theater from "../models/Theater.js";
-import Showtime from "../models/Showtime.js"; // ⬅️ needed for pricing
+import Showtime from "../models/Showtime.js";
 import { requireAuth, requireRoles } from "../middleware/auth.js";
 
 const router = Router();
-// (optional metadata if your server reads this)
+// Optional: used by your server to mount with a prefix
 router.routesPrefix = "/api/superadmin";
 
-/* utils */
+/* ------------------------------ utils ------------------------------------ */
 const normEmail = (e) => String(e || "").trim().toLowerCase();
 const isObjId = (v) => mongoose.isValidObjectId(String(v || ""));
 
@@ -188,7 +188,6 @@ router.put(
         if (!theatre)
           return res.status(404).json({ code: "THEATER_NOT_FOUND", message: "Theatre not found" });
 
-        // ensure no other admin already assigned to this theatre
         const otherAdmin = await User.findOne({
           _id: { $ne: id },
           role: "THEATRE_ADMIN",
@@ -409,7 +408,7 @@ router.delete(
 /* ========================================================================== */
 /* Update base ticket price for a showtime
    PUT /api/superadmin/showtimes/:showtimeId/pricing
-   Body: { basePrice: number } */
+   Body: { basePrice: number >= 1 } */
 router.put(
   "/showtimes/:showtimeId/pricing",
   requireAuth,
@@ -422,8 +421,8 @@ router.put(
       if (!isObjId(showtimeId)) {
         return res.status(400).json({ code: "BAD_ID", message: "Invalid showtimeId" });
       }
-      if (typeof basePrice !== "number" || basePrice < 0) {
-        return res.status(400).json({ code: "BAD_PRICE", message: "basePrice must be >= 0" });
+      if (typeof basePrice !== "number" || !Number.isFinite(basePrice) || basePrice < 1) {
+        return res.status(400).json({ code: "BAD_PRICE", message: "basePrice must be >= 1" });
       }
 
       const doc = await Showtime.findByIdAndUpdate(
