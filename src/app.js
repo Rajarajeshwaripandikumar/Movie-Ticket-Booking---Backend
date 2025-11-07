@@ -1,4 +1,3 @@
-// backend/src/app.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -34,18 +33,18 @@ import { requireAuth, requireRoles } from "./middleware/auth.js";
 
 const app = express();
 
-// ─────────────────────────────── CORE APP SETTINGS ───────────────────────────────
-app.set("trust proxy", 1); // Render / Netlify / ELB
+/* ───────────────────────────── CORE APP SETTINGS ─────────────────────────── */
+app.set("trust proxy", 1); // Render / ELB / Netlify etc.
 
-// ─────────────────────────────── SECURITY HEADERS ───────────────────────────────
+/* ───────────────────────────── SECURITY HEADERS ──────────────────────────── */
 app.use(
   helmet({
     crossOriginResourcePolicy: false,
-    contentSecurityPolicy: false, // relaxed for dev
+    contentSecurityPolicy: false, // relaxed for dev; tighten in prod if needed
   })
 );
 
-// ─────────────────────────────── CORS CONFIG ───────────────────────────────
+/* ─────────────────────────────── CORS CONFIG ─────────────────────────────── */
 const DEV_ORIGINS = [
   process.env.APP_ORIGIN || "http://localhost:5173",
   "http://127.0.0.1:5173",
@@ -82,21 +81,23 @@ app.use(
       "Idempotency-Key",
       "X-Intent",
       "X-Requested-With",
+      "x-role",
+      "X-Role",
     ],
     exposedHeaders: ["Content-Length", "Content-Type"],
     maxAge: 86400,
   })
 );
 
-// Preflight handler
+// Preflight handler (mirror the same allow list)
 app.options("*", cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
-// ─────────────────────────────── LOGGING & PARSERS ───────────────────────────────
+/* ───────────────────────────── LOGGING & PARSERS ─────────────────────────── */
 app.use(morgan("dev"));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ─────────────────────────────── STATIC FILES ───────────────────────────────
+/* ───────────────────────────── STATIC FILES ──────────────────────────────── */
 const uploadsPath = path.resolve(process.env.UPLOADS_DIR || "uploads");
 if (!fs.existsSync(uploadsPath)) fs.mkdirSync(uploadsPath, { recursive: true });
 app.use("/uploads", express.static(uploadsPath));
@@ -108,13 +109,11 @@ try {
   console.warn("[app] Cannot read uploads dir:", e.message);
 }
 
-// ─────────────────────────────── FIX DOUBLE /api/api BUG ───────────────────────────────
+/* ──────────────── FIX DOUBLE /api/api and THEAT(RE)RS ALIAS ─────────────── */
 app.use((req, _res, next) => {
   req.url = req.url.replace(/\/api\/api(\/|$)/g, "/api$1");
   next();
 });
-
-// ────────────────── NORMALIZE UK/US THEAT(RE)RS PATH ──────────────────
 app.use((req, _res, next) => {
   if (req.url.startsWith("/api/theatres")) {
     req.url = req.url.replace(/^\/api\/theatres\b/, "/api/theaters");
@@ -122,9 +121,23 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ─────────────────────────────── ROUTES ───────────────────────────────
+/* ─────────────── Notifications: force no-store to avoid 304s ────────────── */
+app.use((req, res, next) => {
+  const p = req.path || "";
+  if (
+    p === "/api/notifications/mine" ||
+    /^\/api\/notifications\/[^/]+\/read$/.test(p)
+  ) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+  }
+  next();
+});
 
-// Health check
+/* ─────────────────────────────── ROUTES ─────────────────────────────── */
+
+// Health
 app.get("/api/health", (_req, res) =>
   res.json({
     ok: true,
@@ -137,12 +150,12 @@ app.get("/api/health", (_req, res) =>
 // Uploads
 app.use("/api/upload", uploadRoutes);
 
-// Public/basic routes
+// Public/basic
 app.use("/api/auth", authRoutes);
 app.use("/api/movies", moviesRoutes);
 app.use("/api/showtimes", showtimesRoutes);
 app.use("/api/theaters", theatersRouter); // canonical
-app.use("/api/theatres", theatersRouter); // alias (same router, NOT 'theatresRouter')
+app.use("/api/theatres", theatersRouter); // alias
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
@@ -152,17 +165,17 @@ app.use("/api/orders", ordersRouter);
 // Pricing (protected for admins)
 app.use("/api/pricing", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), pricingRoutes);
 
-// Notifications
+// Notifications (REST)
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/notification-prefs", notificationPrefRoutes);
 
 // Profiles
 app.use("/api/profile", profileRoutes);
 
-// ✅ Super Admin routes (create/manage theatre admins)
+// Super Admin
 app.use("/api/superadmin", requireAuth, requireRoles("SUPER_ADMIN"), superAdminRoutes);
 
-// ✅ Admin routes (both Super Admin & Theatre Admin)
+// Admin (Super Admin & Theatre Admin)
 app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), adminRoutes);
 
 // Screens
@@ -177,7 +190,7 @@ app.use("/api/analytics/stream", (req, _res, next) => {
       const tok = String(req.query.token);
       req.headers.authorization = `Bearer ${tok}`;
       console.debug(
-        `[PREAUTH] Copied token from query -> Authorization header for ${req.originalUrl} (token preview: ${tok.slice(0, 8)}...)`
+        `[PREAUTH] Copied token from query -> Authorization for ${req.originalUrl} (preview: ${tok.slice(0, 8)}...)`
       );
     }
   } catch (e) {
@@ -186,10 +199,10 @@ app.use("/api/analytics/stream", (req, _res, next) => {
   next();
 });
 
-// ✅ Analytics routes (protected)
+// Analytics (protected)
 app.use("/api/analytics", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), analyticsRoutes);
 
-// ─────────────────────────────── 404 HANDLER ───────────────────────────────
+/* ─────────────────────────────── 404 / ERROR ────────────────────────────── */
 app.use((req, res, next) => {
   if (req.path.startsWith("/api")) {
     return res.status(404).json({ message: "Not Found", path: req.path });
@@ -197,7 +210,6 @@ app.use((req, res, next) => {
   return next();
 });
 
-// ─────────────────────────────── ERROR HANDLER ───────────────────────────────
 app.use((err, req, res, next) => {
   console.error("💥 Uncaught error:", err);
   if (res.headersSent) return next(err);
