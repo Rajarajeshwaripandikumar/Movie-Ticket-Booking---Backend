@@ -1,4 +1,4 @@
-// backend/src/routes/auth.js
+// backend/src/routes/auth.routes.js
 import express from "express";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -101,17 +101,16 @@ async function handleAdminLogin(req, res) {
       return res.status(403).json({ message: "Admins only" });
     }
 
-    const match = await user.compare(password);
+    const match = await user.compare(password); // uses your schema's compare()
     if (!match) return res.status(401).json({ message: "Incorrect password" });
 
     const token = signToken(user);
 
-    // Return both token and adminToken + top-level role for frontend compatibility
     return res.json({
       message: "Admin login successful",
       token,
-      adminToken: token, // alias key many frontends look for
-      role: user.role,   // "SUPER_ADMIN" | "ADMIN" | "THEATRE_ADMIN"
+      adminToken: token, // alias for frontends
+      role: user.role,
       user: safeUserPayload(user),
     });
   } catch (err) {
@@ -145,7 +144,7 @@ router.post("/register", async (req, res) => {
     return res.status(201).json({
       message: "Registered successfully",
       token,
-      role: user.role, // top-level role for consistency
+      role: user.role,
       user: safeUserPayload(user),
     });
   } catch (err) {
@@ -166,7 +165,7 @@ router.post("/login", async (req, res) => {
     const user = await User.findOne({ email: String(email).toLowerCase() }).select("+password");
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
-    // ⛔ Block all admin roles from using the public login
+    // ⛔ Admin roles cannot use public login
     if ([ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN].includes(user.role)) {
       return res.status(403).json({ message: "Admins must login from /admin/login" });
     }
@@ -178,7 +177,7 @@ router.post("/login", async (req, res) => {
     return res.json({
       message: "Login successful",
       token,
-      role: user.role, // ✅ add top-level role for guards
+      role: user.role,
       user: safeUserPayload(user),
     });
   } catch (err) {
@@ -190,9 +189,7 @@ router.post("/login", async (req, res) => {
 /* -------------------------------------------------------------------------- */
 /*                           ADMIN LOGIN (ADMIN-ONLY)                         */
 /* -------------------------------------------------------------------------- */
-// Keep original hyphen route
 router.post("/admin-login", handleAdminLogin);
-// Add slash alias to match frontends that call /admin/login
 router.post("/admin/login", handleAdminLogin);
 
 /* -------------------------------------------------------------------------- */
@@ -239,6 +236,63 @@ router.get("/me", async (req, res) => {
   } catch (err) {
     console.error("ME_ERROR:", err.message);
     return res.status(401).json({ message: "Invalid or expired token" });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                               PROFILE (SELF)                               */
+/* -------------------------------------------------------------------------- */
+
+// Update my profile (name/email/phone)
+router.put("/profile", requireAuthHdr, async (req, res) => {
+  try {
+    const { name, email, phone } = req.body || {};
+    if (!name && !email && !phone)
+      return res.status(400).json({ message: "Nothing to update" });
+
+    const update = {};
+    if (typeof name === "string") update.name = name.trim();
+    if (typeof phone === "string") update.phone = phone.trim();
+    if (typeof email === "string") {
+      const e = email.trim().toLowerCase();
+      const taken = await User.findOne({ email: e, _id: { $ne: req.auth.sub } });
+      if (taken) return res.status(409).json({ message: "Email already in use" });
+      update.email = e;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.auth.sub,
+      { $set: update },
+      { new: true, select: "-password" }
+    );
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    res.json({ message: "Profile updated", user: safeUserPayload(user) });
+  } catch (err) {
+    console.error("PROFILE_UPDATE_ERROR:", err);
+    res.status(500).json({ message: "Failed to update profile" });
+  }
+});
+
+// Change my password
+router.put("/profile/password", requireAuthHdr, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({ message: "Both currentPassword and newPassword required" });
+
+    const user = await User.findById(req.auth.sub).select("+password");
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const ok = await user.compare(currentPassword);
+    if (!ok) return res.status(401).json({ message: "Current password incorrect" });
+
+    user.password = newPassword; // pre-save hook hashes
+    await user.save();
+    res.json({ message: "Password updated" });
+  } catch (err) {
+    console.error("PROFILE_PASSWORD_ERROR:", err);
+    res.status(500).json({ message: "Failed to update password" });
   }
 });
 
