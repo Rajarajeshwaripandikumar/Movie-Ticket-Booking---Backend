@@ -284,6 +284,7 @@ try {
     "./routes/superadmin.routes.js",  // ✅ mount superadmin routes
     "./routes/analytics.routes.js",   // ✅ mount analytics routes at /api/analytics
     // "./routes/notifications.routes.js",
+     "./routes/admin.routes.js",
   ];
 
   for (const rpath of routers) {
