@@ -3,9 +3,11 @@ import { Router } from "express";
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import Theater from "../models/Theater.js";
+import Showtime from "../models/Showtime.js"; // ⬅️ needed for pricing
 import { requireAuth, requireRoles } from "../middleware/auth.js";
 
 const router = Router();
+// (optional metadata if your server reads this)
 router.routesPrefix = "/api/superadmin";
 
 /* utils */
@@ -16,11 +18,9 @@ const isObjId = (v) => mongoose.isValidObjectId(String(v || ""));
 /* 🎭 THEATRE ADMINS                                                           */
 /* ========================================================================== */
 
-/* -------------------------------------------------------------------------- */
-/* Create Theatre Admin                                                        */
-/* POST /api/superadmin/create-theatre-admin                                   */
-/* Body: { name, email, password, theatreId | theaterId }                      */
-/* -------------------------------------------------------------------------- */
+/* Create Theatre Admin
+   POST /api/superadmin/create-theatre-admin
+   Body: { name, email, password, theatreId | theaterId } */
 router.post(
   "/create-theatre-admin",
   requireAuth,
@@ -54,7 +54,9 @@ router.post(
       const existingAdmin = await User.findOne({
         role: "THEATRE_ADMIN",
         theatreId,
-      }).select("_id").lean();
+      })
+        .select("_id")
+        .lean();
       if (existingAdmin) {
         return res
           .status(409)
@@ -95,10 +97,8 @@ router.post(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* View All Theatre Admins                                                     */
-/* GET /api/superadmin/theatre-admins                                          */
-/* -------------------------------------------------------------------------- */
+/* View All Theatre Admins
+   GET /api/superadmin/theatre-admins */
 router.get(
   "/theatre-admins",
   requireAuth,
@@ -119,10 +119,8 @@ router.get(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Get One Theatre Admin                                                       */
-/* GET /api/superadmin/theatre-admins/:id                                      */
-/* -------------------------------------------------------------------------- */
+/* Get One Theatre Admin
+   GET /api/superadmin/theatre-admins/:id */
 router.get(
   "/theatre-admins/:id",
   requireAuth,
@@ -137,7 +135,8 @@ router.get(
         .select("name email role theatreId isActive createdAt")
         .lean();
 
-      if (!admin) return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
+      if (!admin)
+        return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
       res.json({ admin });
     } catch (err) {
       console.error("[SuperAdmin] get theatre admin error:", err);
@@ -146,11 +145,9 @@ router.get(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Update Theatre Admin                                                        */
-/* PUT /api/superadmin/theatre-admins/:id                                      */
-/* Body: { name?, email?, theatreId?, isActive? }                              */
-/* -------------------------------------------------------------------------- */
+/* Update Theatre Admin
+   PUT /api/superadmin/theatre-admins/:id
+   Body: { name?, email?, theatreId?, isActive? } */
 router.put(
   "/theatre-admins/:id",
   requireAuth,
@@ -176,7 +173,9 @@ router.put(
 
       if (typeof email === "string") {
         const e = normEmail(email);
-        const taken = await User.findOne({ email: e, _id: { $ne: id } }).select("_id").lean();
+        const taken = await User.findOne({ email: e, _id: { $ne: id } })
+          .select("_id")
+          .lean();
         if (taken) return res.status(409).json({ code: "EMAIL_TAKEN", message: "Email already in use" });
         update.email = e;
       }
@@ -186,14 +185,17 @@ router.put(
           return res.status(400).json({ code: "INVALID_THEATRE_ID", message: "Invalid theatreId" });
         }
         const theatre = await Theater.findById(theatreId).select("_id").lean();
-        if (!theatre) return res.status(404).json({ code: "THEATER_NOT_FOUND", message: "Theatre not found" });
+        if (!theatre)
+          return res.status(404).json({ code: "THEATER_NOT_FOUND", message: "Theatre not found" });
 
-        // Ensure no other admin already assigned to this theatre
+        // ensure no other admin already assigned to this theatre
         const otherAdmin = await User.findOne({
           _id: { $ne: id },
           role: "THEATRE_ADMIN",
           theatreId,
-        }).select("_id").lean();
+        })
+          .select("_id")
+          .lean();
         if (otherAdmin) {
           return res
             .status(409)
@@ -210,7 +212,8 @@ router.put(
         { new: true, select: "name email role theatreId isActive createdAt" }
       );
 
-      if (!doc) return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
+      if (!doc)
+        return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
 
       res.json({
         message: "Theatre admin updated",
@@ -234,10 +237,8 @@ router.put(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Activate/Deactivate Theatre Admin                                           */
-/* PATCH /api/superadmin/theatre-admins/:id/status { isActive: boolean }       */
-/* -------------------------------------------------------------------------- */
+/* Activate/Deactivate Theatre Admin
+   PATCH /api/superadmin/theatre-admins/:id/status { isActive: boolean } */
 router.patch(
   "/theatre-admins/:id/status",
   requireAuth,
@@ -256,7 +257,8 @@ router.patch(
         { $set: { isActive } },
         { new: true, select: "name email role theatreId isActive createdAt" }
       );
-      if (!doc) return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
+      if (!doc)
+        return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
 
       res.json({ message: "Status updated", isActive: doc.isActive });
     } catch (err) {
@@ -266,10 +268,8 @@ router.patch(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Delete Theatre Admin                                                        */
-/* DELETE /api/superadmin/theatre-admins/:id                                   */
-/* -------------------------------------------------------------------------- */
+/* Delete Theatre Admin
+   DELETE /api/superadmin/theatre-admins/:id */
 router.delete(
   "/theatre-admins/:id",
   requireAuth,
@@ -280,7 +280,8 @@ router.delete(
       if (!isObjId(id)) return res.status(400).json({ code: "BAD_ID", message: "Invalid id" });
 
       const doc = await User.findOneAndDelete({ _id: id, role: "THEATRE_ADMIN" });
-      if (!doc) return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
+      if (!doc)
+        return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
 
       res.json({ message: "Theatre admin deleted", id });
     } catch (err) {
@@ -291,13 +292,11 @@ router.delete(
 );
 
 /* ========================================================================== */
-/* 🎬 THEATERS (used by Manage Theaters page)                                  */
+/* 🎬 THEATERS (Manage Theaters page)                                          */
 /* ========================================================================== */
 
-/* -------------------------------------------------------------------------- */
-/* List Theaters                                                               */
-/* GET /api/superadmin/theaters?q=&city=                                       */
-/* -------------------------------------------------------------------------- */
+/* List Theaters
+   GET /api/superadmin/theaters?q=&city= */
 router.get(
   "/theaters",
   requireAuth,
@@ -321,11 +320,9 @@ router.get(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Create Theater                                                              */
-/* POST /api/superadmin/theaters                                               */
-/* Body: { name, city, address?, imageUrl? }                                   */
-/* -------------------------------------------------------------------------- */
+/* Create Theater
+   POST /api/superadmin/theaters
+   Body: { name, city, address?, imageUrl? } */
 router.post(
   "/theaters",
   requireAuth,
@@ -353,11 +350,9 @@ router.post(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Update Theater                                                              */
-/* PUT /api/superadmin/theaters/:id                                            */
-/* Body: { name?, city?, address?, imageUrl? }                                 */
-/* -------------------------------------------------------------------------- */
+/* Update Theater
+   PUT /api/superadmin/theaters/:id
+   Body: { name?, city?, address?, imageUrl? } */
 router.put(
   "/theaters/:id",
   requireAuth,
@@ -389,10 +384,8 @@ router.put(
   }
 );
 
-/* -------------------------------------------------------------------------- */
-/* Delete Theater                                                              */
-/* DELETE /api/superadmin/theaters/:id                                         */
-/* -------------------------------------------------------------------------- */
+/* Delete Theater
+   DELETE /api/superadmin/theaters/:id */
 router.delete(
   "/theaters/:id",
   requireAuth,
@@ -407,6 +400,43 @@ router.delete(
     } catch (err) {
       console.error("[SuperAdmin] delete theater error:", err);
       res.status(500).json({ ok: false, message: "Failed to delete theater" });
+    }
+  }
+);
+
+/* ========================================================================== */
+/* 🎫 SHOWTIME PRICING                                                         */
+/* ========================================================================== */
+/* Update base ticket price for a showtime
+   PUT /api/superadmin/showtimes/:showtimeId/pricing
+   Body: { basePrice: number } */
+router.put(
+  "/showtimes/:showtimeId/pricing",
+  requireAuth,
+  requireRoles("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { showtimeId } = req.params;
+      const { basePrice } = req.body || {};
+
+      if (!isObjId(showtimeId)) {
+        return res.status(400).json({ code: "BAD_ID", message: "Invalid showtimeId" });
+      }
+      if (typeof basePrice !== "number" || basePrice < 0) {
+        return res.status(400).json({ code: "BAD_PRICE", message: "basePrice must be >= 0" });
+      }
+
+      const doc = await Showtime.findByIdAndUpdate(
+        showtimeId,
+        { $set: { basePrice } },
+        { new: true }
+      );
+
+      if (!doc) return res.status(404).json({ code: "NOT_FOUND", message: "Showtime not found" });
+      return res.json({ message: "Pricing updated", showtime: doc });
+    } catch (err) {
+      console.error("[SuperAdmin] update pricing error:", err);
+      return res.status(500).json({ code: "INTERNAL", message: "Failed to update pricing" });
     }
   }
 );
