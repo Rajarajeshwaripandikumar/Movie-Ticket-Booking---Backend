@@ -85,6 +85,41 @@ function requireRole(...roles) {
   };
 }
 
+/* --------------------------- Shared Admin Login --------------------------- */
+async function handleAdminLogin(req, res) {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
+
+    const user = await User.findOne({ email: String(email).toLowerCase() }).select("+password");
+    if (!user) return res.status(401).json({ message: "Email not registered" });
+
+    // Only admins can login here
+    const adminRoles = [ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN];
+    if (!adminRoles.includes(user.role)) {
+      return res.status(403).json({ message: "Admins only" });
+    }
+
+    const match = await user.compare(password);
+    if (!match) return res.status(401).json({ message: "Incorrect password" });
+
+    const token = signToken(user);
+
+    // Return both token and adminToken + top-level role for frontend compatibility
+    return res.json({
+      message: "Admin login successful",
+      token,
+      adminToken: token, // alias key many frontends look for
+      role: user.role,   // "SUPER_ADMIN" | "ADMIN" | "THEATRE_ADMIN"
+      user: safeUserPayload(user),
+    });
+  } catch (err) {
+    console.error("ADMIN_LOGIN_ERROR:", err.message);
+    return res.status(500).json({ message: "Failed to login admin" });
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              USER REGISTRATION                             */
 /* -------------------------------------------------------------------------- */
@@ -110,6 +145,7 @@ router.post("/register", async (req, res) => {
     return res.status(201).json({
       message: "Registered successfully",
       token,
+      role: user.role, // top-level role for consistency
       user: safeUserPayload(user),
     });
   } catch (err) {
@@ -139,7 +175,12 @@ router.post("/login", async (req, res) => {
     if (!match) return res.status(401).json({ message: "Incorrect password" });
 
     const token = signToken(user);
-    return res.json({ message: "Login successful", token, user: safeUserPayload(user) });
+    return res.json({
+      message: "Login successful",
+      token,
+      role: user.role, // ✅ add top-level role for guards
+      user: safeUserPayload(user),
+    });
   } catch (err) {
     console.error("LOGIN_ERROR:", err.message);
     return res.status(500).json({ message: "Login failed" });
@@ -149,30 +190,10 @@ router.post("/login", async (req, res) => {
 /* -------------------------------------------------------------------------- */
 /*                           ADMIN LOGIN (ADMIN-ONLY)                         */
 /* -------------------------------------------------------------------------- */
-router.post("/admin-login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ message: "Email and password required" });
-
-    const user = await User.findOne({ email: String(email).toLowerCase() }).select("+password");
-    if (!user) return res.status(401).json({ message: "Email not registered" });
-
-    // ✅ Only admins can login here
-    if (user.role !== ROLES.SUPER_ADMIN && user.role !== ROLES.THEATRE_ADMIN && user.role !== ROLES.ADMIN) {
-      return res.status(403).json({ message: "Admins only" });
-    }
-
-    const match = await user.compare(password);
-    if (!match) return res.status(401).json({ message: "Incorrect password" });
-
-    const token = signToken(user);
-    return res.json({ message: "Admin login successful", token, user: safeUserPayload(user) });
-  } catch (err) {
-    console.error("ADMIN_LOGIN_ERROR:", err.message);
-    return res.status(500).json({ message: "Failed to login admin" });
-  }
-});
+// Keep original hyphen route
+router.post("/admin-login", handleAdminLogin);
+// Add slash alias to match frontends that call /admin/login
+router.post("/admin/login", handleAdminLogin);
 
 /* -------------------------------------------------------------------------- */
 /*                           CREATE FIRST SUPER ADMIN                         */
