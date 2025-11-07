@@ -7,9 +7,9 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 export const ROLE = {
   USER: "USER",
-  THEATRE_ADMIN: "THEATRE_ADMIN",   // canonical (UK)
+  THEATRE_ADMIN: "THEATRE_ADMIN", // canonical (UK)
   SUPER_ADMIN: "SUPER_ADMIN",
-  ADMIN: "ADMIN",                   // distinct, do NOT escalate to SUPER_ADMIN
+  ADMIN: "ADMIN",                 // distinct, do NOT escalate to SUPER_ADMIN
 };
 
 /**
@@ -77,10 +77,7 @@ export const requireAuth = (req, res, next) => {
       token = String(req.cookies.token);
     }
 
-    // 3️⃣ Query param fallback
-    //    - Always allow for analytics routes (frontend may add ?token= as a safe fallback)
-    //    - Always allow for /stream endpoints
-    //    - Allow in non-production everywhere else (dev convenience)
+    // 3️⃣ Query param fallback (safe for analytics/streams; dev convenience)
     const isAnalytics = (req.baseUrl && req.baseUrl.includes("/api/analytics"));
     const isStream = (req.path && req.path.includes("/stream"));
     if (
@@ -147,7 +144,7 @@ export const requireAuth = (req, res, next) => {
 /* -------------------------------------------------------------------------- */
 export const requireRoles = (...allowedArgs) => {
   const allowed = Array.isArray(allowedArgs[0]) ? allowedArgs[0] : allowedArgs;
-  const normalizedAllowed = allowed.map(normalizeRole);
+  const normalizedAllowed = normalizeRoleList(allowed);
 
   return (req, res, next) => {
     if (!req.user) {
@@ -167,22 +164,32 @@ export const requireRoles = (...allowedArgs) => {
 /* THEATRE_ADMIN can only manage their own theatre; SUPER_ADMIN bypasses       */
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
+  // Collect possible theatre identifiers from params/body/query (both spellings),
+  // and also accept generic `:id` used by routes like /theaters/:id[/screens]
   const targetTheatreId =
-    req.body?.theatreId ??
     req.params?.theatreId ??
-    req.query?.theatreId ??
-    req.body?.theaterId ??
     req.params?.theaterId ??
-    req.query?.theaterId;
+    req.params?.id ??                    // <- important for /theaters/:id
+    req.body?.theatreId ??
+    req.body?.theaterId ??
+    req.body?.theatre ??
+    req.body?.theater ??
+    req.query?.theatreId ??
+    req.query?.theaterId ??
+    req.query?.theatre ??
+    req.query?.theater ??
+    null;
 
-  const user = req.user;
-  const role = normalizeRole(user?.role);
+  const role = normalizeRole(req.user?.role);
 
   // SUPER_ADMIN can manage any theatre
   if (role === ROLE.SUPER_ADMIN) return next();
 
+  // If you want plain ADMIN to bypass ownership too, uncomment:
+  // if (role === ROLE.ADMIN) return next();
+
   // THEATRE_ADMIN must have a theatreId and match target
-  const myId = user?.theatreId || user?.theaterId;
+  const myId = req.user?.theatreId || req.user?.theaterId || null;
   if (
     role === ROLE.THEATRE_ADMIN &&
     myId &&
