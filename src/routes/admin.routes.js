@@ -1,4 +1,6 @@
-// backend/src/routes/admin.routes.js
+// ==============================
+// backend/src/routes/admin.routes.js (UPDATED)
+// ==============================
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
@@ -21,6 +23,9 @@ import moviesRouter from "./movies.routes.js";
 const router = Router();
 const isId = (id) => mongoose.isValidObjectId(id);
 
+// Accept both spellings everywhere
+const ADMIN_ROLES = ["SUPER_ADMIN", "THEATRE_ADMIN", "THEATER_ADMIN"];
+
 /* -------------------------------------------------------------------------- */
 /*                          DEBUG / USER PROFILE ROUTES                       */
 /* -------------------------------------------------------------------------- */
@@ -32,7 +37,7 @@ router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }))
 router.get(
   "/me",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
       const id = req.user?._id || req.user?.sub;
@@ -54,7 +59,7 @@ router.get(
 router.put(
   "/profile",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
       const id = req.user?._id || req.user?.sub;
@@ -83,7 +88,7 @@ router.put(
 router.post(
   "/change-password",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
       const { currentPassword, newPassword } = req.body || {};
@@ -112,7 +117,7 @@ router.post(
 /* -------------------------------------------------------------------------- */
 /*                              MOVIES MANAGEMENT                             */
 /* -------------------------------------------------------------------------- */
-router.use("/movies", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), moviesRouter);
+router.use("/movies", requireAuth, requireRoles(...ADMIN_ROLES), moviesRouter);
 
 /* -------------------------------------------------------------------------- */
 /*                         THEATRE ADMIN USER MANAGEMENT                      */
@@ -272,7 +277,7 @@ router.delete(
       if (!target) return res.status(404).json({ message: "User not found" });
       if (String(target._id) === String(req.user._id || req.user.sub)) {
         return res.status(400).json({ message: "You cannot delete yourself" });
-      }
+        }
       if (target.role !== "THEATRE_ADMIN") {
         return res.status(400).json({ message: "Only THEATRE_ADMIN can be deleted here" });
       }
@@ -316,15 +321,37 @@ router.post(
 router.get(
   "/theaters",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
-      const query = req.user.role === "THEATRE_ADMIN" ? { _id: req.user.theatreId } : {};
+      const query = req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN"
+        ? { _id: req.user.theatreId }
+        : {};
       const theatres = await Theater.find(query).sort({ createdAt: -1 }).lean();
       res.json(theatres);
     } catch (err) {
       console.error("[Admin] load theatres error:", err);
       res.status(500).json({ message: "Failed to load theatres", error: err.message });
+    }
+  }
+);
+
+// NEW: get single theatre by id (used by your UI)
+router.get(
+  "/theaters/:id",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  requireTheatreOwnership,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid theater id" });
+      const theatre = await Theater.findById(id).lean();
+      if (!theatre) return res.status(404).json({ message: "Theatre not found" });
+      res.json(theatre);
+    } catch (err) {
+      console.error("[Admin] get theatre error:", err);
+      res.status(500).json({ message: "Failed to load theatre", error: err.message });
     }
   }
 );
@@ -337,8 +364,8 @@ router.get(
 router.post(
   "/theaters/:id/screens",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
-  requireTheatreOwnership, // ensures THEATRE_ADMIN can only touch their theatre
+  requireRoles(...ADMIN_ROLES),
+  requireTheatreOwnership, // ensures theatre-admin can only touch their theatre
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -377,7 +404,7 @@ router.post(
 router.get(
   "/theaters/:id/screens",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   requireTheatreOwnership,
   async (req, res) => {
     try {
@@ -401,11 +428,11 @@ router.get(
 router.get(
   "/showtimes",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
       const filter = {};
-      if (req.user.role === "THEATRE_ADMIN") {
+      if (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") {
         filter.theater = req.user.theatreId;
       }
 
@@ -425,11 +452,10 @@ router.get(
 );
 
 // Create showtime (seats initialized from screen.rows/columns)
-// THEATRE_ADMIN can only create for their own theatre (via screen ownership)
 router.post(
   "/showtimes",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
       const { movie, screen: screenId, startTime, basePrice } = req.body || {};
@@ -444,7 +470,7 @@ router.post(
       if (!screen) return res.status(404).json({ message: "Screen not found" });
 
       // Ownership check for THEATRE_ADMIN
-      if (req.user.role === "THEATRE_ADMIN") {
+      if (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") {
         if (String(screen.theater) !== String(req.user.theatreId)) {
           return res.status(403).json({ message: "Forbidden" });
         }
@@ -488,7 +514,6 @@ router.post(
     } catch (err) {
       console.error("[Admin] create showtime error:", err);
       if (err?.code === 11000) {
-        // if you’ve added a unique compound index on (screen, startTime-minute)
         return res.status(409).json({ message: "Showtime already exists for this screen & minute" });
       }
       res.status(500).json({ message: "Failed to create showtime", error: err.message });
@@ -502,7 +527,7 @@ router.post(
 router.get(
   "/reports",
   requireAuth,
-  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
+  requireRoles(...ADMIN_ROLES),
   async (req, res) => {
     try {
       const { from, to } = req.query;
@@ -533,7 +558,7 @@ router.get(
         .lean();
 
       const scoped =
-        req.user.role === "THEATRE_ADMIN"
+        (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN")
           ? bookings.filter(
               b =>
                 b.showtime &&
@@ -558,3 +583,77 @@ router.get(
 );
 
 export default router;
+
+
+// ==============================
+// backend/src/middleware/auth.js (ONLY the ownership helper shown)
+// ==============================
+// Ensure this is exported from your existing auth middleware file
+export function requireTheatreOwnership(req, res, next) {
+  try {
+    // SUPER_ADMIN bypasses ownership checks
+    const role = String(req.user?.role || "");
+    if (role === "SUPER_ADMIN") return next();
+
+    const userTheatre = String(req.user?.theatreId || "");
+    const pathId = String(
+      req.params.id ||
+      req.body.theater ||
+      req.body.theatreId ||
+      req.query.theater ||
+      req.query.theatreId ||
+      ""
+    );
+
+    if (!userTheatre || !pathId) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+    if (userTheatre !== pathId) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+    next();
+  } catch (e) {
+    console.error("[Auth] requireTheatreOwnership error:", e);
+    res.status(500).json({ message: "Ownership check failed" });
+  }
+}
+
+
+// ==============================
+// backend/src/app.js (MINIMAL TWEAKS ONLY)
+// ==============================
+// 1) Reuse same corsOptions for app.use and app.options
+// 2) Optional: singular alias for /api/theatre/* → /api/theaters/*
+
+// ... keep your existing imports and setup
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    console.warn("[CORS] ❌ Blocked:", origin);
+    return cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Idempotency-Key",
+    "X-Intent",
+    "X-Requested-With",
+  ],
+  exposedHeaders: ["Content-Length", "Content-Type"],
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// Singular UK → US alias (safety net for stray frontend calls)
+app.use((req, _res, next) => {
+  if (req.url.startsWith("/api/theatre/")) {
+    req.url = req.url.replace(/^\/api\/theatre\b/, "/api/theaters");
+  }
+  next();
+});
