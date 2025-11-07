@@ -1,7 +1,6 @@
 // backend/src/routes/showtimes.routes.js
 import { Router } from "express";
 import mongoose from "mongoose";
-import jwt from "jsonwebtoken";
 import Showtime from "../models/Showtime.js";
 import Screen from "../models/Screen.js";
 import SeatLock from "../models/SeatLock.js";
@@ -11,15 +10,12 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
   requireScopedTheatre,
   assertInScopeOrThrow,
-  isSuperOrOwner,
   getTheatreId,
 } from "../middleware/scope.js";
 
 const router = Router();
 /** ✅ mount under /api/showtimes so GET /api/showtimes works */
 router.routesPrefix = "/api/showtimes";
-
-const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 /* -------------------------------------------------------------------------- */
 /* Time helpers (IST-aware)                                                   */
@@ -210,22 +206,28 @@ router.get("/", async (req, res) => {
 
 /* -------------------------------------------------------------------------- */
 /* NEW: GET /api/showtimes/my-theatre?date=YYYY-MM-DD&movieId=&screenId=      */
-/* Returns only the logged-in manager's theatre (from JWT).                   */
+/* Returns only the logged-in manager's theatre (from auth/scope/DB).         */
 /* -------------------------------------------------------------------------- */
-router.get("/my-theatre", async (req, res) => {
+router.get("/my-theatre", requireAuth, async (req, res) => {
   try {
-    const h = req.headers.authorization || "";
-    const [, token] = h.split(" ");
-    if (!token) return res.status(401).json({ message: "Missing token" });
+    // 1) Try scope helper
+    let theatreId = (typeof getTheatreId === "function" && getTheatreId(req)) || null;
 
-    let decoded;
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch {
-      return res.status(401).json({ message: "Invalid or expired token" });
+    // 2) Resolve via DB if not in scope
+    if (!theatreId) {
+      const t = await Theater.findOne({
+        $or: [
+          { owner: req.user.id },
+          { admin: req.user.id },
+          { manager: req.user.id },
+          { createdBy: req.user.id },
+        ],
+      })
+        .select("_id")
+        .lean();
+      theatreId = t?._id;
     }
 
-    const theatreId = decoded?.theatreId;
     if (!theatreId || !mongoose.isValidObjectId(String(theatreId))) {
       return res.json([]);
     }
@@ -386,7 +388,87 @@ router.get("/movies", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* GET ONE: /api/showtimes/:id -> seats + locks reconciled                    */
+/* CONVENIENCE: GET /api/showtimes/movies/:id                                 */
+/* -------------------------------------------------------------------------- */
+router.get("/movies/:id", async (req, res) => {
+  try {
+    const { city, date } = req.query;
+    const movieId = String(req.params.id);
+    if (!mongoose.isValidObjectId(movieId)) return res.status(400).json({ message: "Invalid movie id" });
+
+    const q = { movie: new mongoose.Types.ObjectId(movieId) };
+    if (city && String(city).trim()) q.city = new RegExp(`^${String(city).trim()}$`, "i");
+
+    const todayYmd = toYmdIST();
+    const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
+
+    if (!ymd) {
+      q.startTime = { $gte: nowUtc() };
+    } else if (ymd < todayYmd) {
+      return res.json([]);
+    } else if (ymd === todayYmd) {
+      const { endUtc } = istBoundsUtc(ymd);
+      q.startTime = { $gte: nowUtc(), $lt: endUtc };
+    } else {
+      const { startUtc, endUtc } = istBoundsUtc(ymd);
+      q.startTime = { $gte: startUtc, $lt: endUtc };
+    }
+
+    const docs = await Showtime.find(q)
+      .sort({ startTime: 1 })
+      .populate("movie", "title posterUrl runtime languages censorRating genres")
+      .populate("theater", "name city address")
+      .populate("screen", "name rows cols format")
+      .lean();
+
+    return res.json(docs.map(toDto));
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch movie showtimes" });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* CONVENIENCE: GET /api/showtimes/theaters/:id                               */
+/* -------------------------------------------------------------------------- */
+router.get("/theaters/:id", async (req, res) => {
+  try {
+    const { date } = req.query;
+    const theaterId = String(req.params.id);
+    if (!mongoose.isValidObjectId(theaterId)) return res.status(400).json({ message: "Invalid theater id" });
+
+    const q = { theater: new mongoose.Types.ObjectId(theaterId) };
+
+    const todayYmd = toYmdIST();
+    const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
+
+    if (!ymd) {
+      q.startTime = { $gte: nowUtc() };
+    } else if (ymd < todayYmd) {
+      return res.json([]);
+    } else if (ymd === todayYmd) {
+      const { endUtc } = istBoundsUtc(ymd);
+      q.startTime = { $gte: nowUtc(), $lt: endUtc };
+    } else {
+      const { startUtc, endUtc } = istBoundsUtc(ymd);
+      q.startTime = { $gte: startUtc, $lt: endUtc };
+    }
+
+    const docs = await Showtime.find(q)
+      .sort({ startTime: 1 })
+      .populate("movie", "title posterUrl runtime languages censorRating genres")
+      .populate("theater", "name city address")
+      .populate("screen", "name rows cols format")
+      .lean();
+
+    return res.json(docs.map(toDto));
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch theater showtimes" });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* GET ONE: /api/showtimes/:id -> seats + locks reconciled  (placed AFTER     */
+/* convenience routes so it doesn't shadow them)                              */
 /* -------------------------------------------------------------------------- */
 router.get("/:id", async (req, res) => {
   try {
@@ -412,7 +494,6 @@ router.get("/:id", async (req, res) => {
 
 /* -------------------------------------------------------------------------- */
 /* CREATE: POST /api/showtimes (scoped)                                       */
-/* Accepts aliases from frontend payload                                      */
 /* -------------------------------------------------------------------------- */
 router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
@@ -539,85 +620,6 @@ router.delete("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (re
     const code = Number(e?.status) || 500;
     console.error("❌ DELETE /showtimes/:id error:", e);
     return res.status(code).json({ message: "Failed to delete showtime", error: e.message });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/* CONVENIENCE: GET /api/showtimes/movies/:id                                 */
-/* -------------------------------------------------------------------------- */
-router.get("/movies/:id", async (req, res) => {
-  try {
-    const { city, date } = req.query;
-    const movieId = String(req.params.id);
-    if (!mongoose.isValidObjectId(movieId)) return res.status(400).json({ message: "Invalid movie id" });
-
-    const q = { movie: new mongoose.Types.ObjectId(movieId) };
-    if (city && String(city).trim()) q.city = new RegExp(`^${String(city).trim()}$`, "i");
-
-    const todayYmd = toYmdIST();
-    const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
-
-    if (!ymd) {
-      q.startTime = { $gte: nowUtc() };
-    } else if (ymd < todayYmd) {
-      return res.json([]);
-    } else if (ymd === todayYmd) {
-      const { endUtc } = istBoundsUtc(ymd);
-      q.startTime = { $gte: nowUtc(), $lt: endUtc };
-    } else {
-      const { startUtc, endUtc } = istBoundsUtc(ymd);
-      q.startTime = { $gte: startUtc, $lt: endUtc };
-    }
-
-    const docs = await Showtime.find(q)
-      .sort({ startTime: 1 })
-      .populate("movie", "title posterUrl runtime languages censorRating genres")
-      .populate("theater", "name city address")
-      .populate("screen", "name rows cols format")
-      .lean();
-
-    return res.json(docs.map(toDto));
-  } catch {
-    return res.status(500).json({ message: "Failed to fetch movie showtimes" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/* CONVENIENCE: GET /api/showtimes/theaters/:id                               */
-/* -------------------------------------------------------------------------- */
-router.get("/theaters/:id", async (req, res) => {
-  try {
-    const { date } = req.query;
-    const theaterId = String(req.params.id);
-    if (!mongoose.isValidObjectId(theaterId)) return res.status(400).json({ message: "Invalid theater id" });
-
-    const q = { theater: new mongoose.Types.ObjectId(theaterId) };
-
-    const todayYmd = toYmdIST();
-    const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
-
-    if (!ymd) {
-      q.startTime = { $gte: nowUtc() };
-    } else if (ymd < todayYmd) {
-      return res.json([]);
-    } else if (ymd === todayYmd) {
-      const { endUtc } = istBoundsUtc(ymd);
-      q.startTime = { $gte: nowUtc(), $lt: endUtc };
-    } else {
-      const { startUtc, endUtc } = istBoundsUtc(ymd);
-      q.startTime = { $gte: startUtc, $lt: endUtc };
-    }
-
-    const docs = await Showtime.find(q)
-      .sort({ startTime: 1 })
-      .populate("movie", "title posterUrl runtime languages censorRating genres")
-      .populate("theater", "name city address")
-      .populate("screen", "name rows cols format")
-      .lean();
-
-    return res.json(docs.map(toDto));
-  } catch {
-    return res.status(500).json({ message: "Failed to fetch theater showtimes" });
   }
 });
 
