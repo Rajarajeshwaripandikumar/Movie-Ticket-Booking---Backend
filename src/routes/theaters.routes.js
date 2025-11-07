@@ -1,5 +1,4 @@
-// backend/src/routes/theaterRoutes.js — FULL UPDATED (adds /admin/theaters aliases + /admin/theaters/mine)
-
+// backend/src/routes/theaters.routes.js — FULL UPDATED
 import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
@@ -18,10 +17,10 @@ import {
 
 dotenv.config();
 const router = express.Router();
+/** ✅ ensure server.js mounts this under /api/theaters (and also /api/theatres via its alias) */
+router.routesPrefix = "/api/theaters";
 
-/* -------------------------------------------------------------------------- */
-/*                        Cloudinary Configuration                            */
-/* -------------------------------------------------------------------------- */
+/* ----------------------------- Cloudinary ------------------------------ */
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -29,42 +28,25 @@ cloudinary.config({
   secure: true,
 });
 
-/* -------------------------------------------------------------------------- */
-/*                              Multer + Stream                               */
-/* -------------------------------------------------------------------------- */
+/* ----------------------------- Multer --------------------------------- */
 const memoryStorage = multer.memoryStorage();
 const fileFilter = (_, file, cb) => {
-  const ok = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"].includes(
-    file.mimetype
-  );
+  const ok = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"].includes(file.mimetype);
   ok ? cb(null, true) : cb(new Error("Only image files are allowed"));
 };
-const upload = multer({
-  storage: memoryStorage,
-  fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 },
-});
+const upload = multer({ storage: memoryStorage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
 const uploadToCloudinary = (buffer, folder = "theaters") =>
   new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       { folder, resource_type: "image", use_filename: true, unique_filename: true },
-      (err, result) => {
-        if (err) {
-          console.error("[Cloudinary] Upload failed:", err.message);
-          return reject(err);
-        }
-        resolve(result);
-      }
+      (err, result) => (err ? reject(err) : resolve(result))
     );
     streamifier.createReadStream(buffer).pipe(uploadStream);
   });
 
-/* -------------------------------------------------------------------------- */
-/*                               Utility Helpers                              */
-/* -------------------------------------------------------------------------- */
+/* ----------------------------- Utils ---------------------------------- */
 const isValidId = (id) => mongoose.isValidObjectId(id);
-
 const toArray = (input) => {
   if (!input && input !== 0) return [];
   if (Array.isArray(input)) return input.map((v) => String(v).trim()).filter(Boolean);
@@ -78,19 +60,13 @@ const toArray = (input) => {
   }
   return s.split(",").map((v) => v.trim()).filter(Boolean);
 };
+const debugLog = (...args) => process.env.NODE_ENV !== "production" && console.log(...args);
 
-const debugLog = (...args) => {
-  if (process.env.NODE_ENV !== "production") console.log(...args);
-};
+/* =========================================================================
+   THEATRE ADMIN (self-scoped)
+   ========================================================================= */
 
-/* -------------------------------------------------------------------------- */
-/*                     Theatre Admin: self-scoped (by token)                  */
-/* -------------------------------------------------------------------------- */
-
-/**
- * GET /api/theaters/me
- * Return the current manager's theatre (via req.user.theatreId)
- */
+/** GET /api/theaters/me  */
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
@@ -100,8 +76,9 @@ router.get("/me", requireAuth, async (req, res) => {
     if (!theater) return res.status(404).json({ message: "Theatre not found" });
 
     const screensCount = await Screen.countDocuments({
-      theater: new mongoose.Types.ObjectId(theatreId),
+      $or: [{ theatreId }, { theater: new mongoose.Types.ObjectId(theatreId) }],
     });
+
     return res.json({ ...theater, screensCount });
   } catch (err) {
     console.error("[Theaters] GET /me error:", err);
@@ -109,16 +86,16 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/theaters/me/screens
- * Screens for the current manager's theatre
- */
+/** GET /api/theaters/me/screens */
 router.get("/me/screens", requireAuth, async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
     if (!theatreId) return res.status(404).json({ message: "Theatre not found" });
 
-    const screens = await Screen.find({ theater: theatreId }).lean();
+    const screens = await Screen.find({
+      $or: [{ theatreId }, { theater: theatreId }],
+    }).lean();
+
     return res.json({ data: screens || [] });
   } catch (err) {
     console.error("[Theaters] GET /me/screens error:", err);
@@ -126,10 +103,7 @@ router.get("/me/screens", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/theaters/me/summary
- * Lightweight counts for dashboard cards
- */
+/** GET /api/theaters/me/summary */
 router.get("/me/summary", requireAuth, async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
@@ -137,32 +111,22 @@ router.get("/me/summary", requireAuth, async (req, res) => {
 
     const [theater, screensCount] = await Promise.all([
       Theater.findById(theatreId).select("name city updatedAt").lean(),
-      Screen.countDocuments({ theater: theatreId }),
+      Screen.countDocuments({ $or: [{ theatreId }, { theater: theatreId }] }),
     ]);
     if (!theater) return res.status(404).json({ message: "Theatre not found" });
 
-    return res.json({
-      name: theater.name,
-      city: theater.city,
-      screensCount,
-      updatedAt: theater.updatedAt,
-    });
+    return res.json({ name: theater.name, city: theater.city, screensCount, updatedAt: theater.updatedAt });
   } catch (err) {
     console.error("[Theaters] GET /me/summary error:", err);
     return res.status(500).json({ message: "Failed to load summary" });
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*                              Admin Routes                                  */
-/* -------------------------------------------------------------------------- */
+/* =========================================================================
+   ADMIN ROUTES + ALIASES
+   ========================================================================= */
 
-/**
- * GET /api/theaters/admin/list
- * Admin — full list (protected)
- * SUPER_ADMIN/OWNER: all theaters
- * THEATRE_ADMIN: only their own theater
- */
+/** GET /api/theaters/admin/list  */
 router.get("/admin/list", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const filter = isSuperOrOwner(req.user) ? {} : { _id: getTheatreId(req.user) };
@@ -174,17 +138,7 @@ router.get("/admin/list", requireAuth, requireAdmin, requireScopedTheatre, async
   }
 });
 
-/* ============================== NEW ALIASES ================================ */
-/* These match the frontend's expectations:                                   */
-/*  - GET  /api/theaters/admin/theaters             (role-aware list)         */
-/*  - GET  /api/theaters/admin/theaters/mine        (explicit mine)           */
-/*  - POST /api/theaters/admin/theaters             (create)                  */
-/*  - PUT  /api/theaters/admin/theaters/:id         (update)                  */
-/*  - PATCH /api/theaters/admin/theaters/:id/amenities (amenities only)       */
-/*  - DELETE /api/theaters/admin/theaters/:id       (delete)                  */
-/* -------------------------------------------------------------------------- */
-
-// LIST — alias of /admin/list
+/** LIST alias: GET /api/theaters/admin/theaters */
 router.get("/admin/theaters", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const filter = isSuperOrOwner(req.user) ? {} : { _id: getTheatreId(req.user) };
@@ -196,7 +150,7 @@ router.get("/admin/theaters", requireAuth, requireAdmin, requireScopedTheatre, a
   }
 });
 
-// LIST MINE — explicit
+/** LIST mine: GET /api/theaters/admin/theaters/mine */
 router.get("/admin/theaters/mine", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const myId = getTheatreId(req.user);
@@ -208,192 +162,135 @@ router.get("/admin/theaters/mine", requireAuth, requireAdmin, requireScopedTheat
   }
 });
 
-/**
- * POST /api/theaters/admin
- * Admin — create with Cloudinary image
- * THEATRE_ADMIN is blocked from creating new theaters (Option-A)
- */
-router.post(
-  "/admin",
-  requireAuth,
-  requireAdmin,
-  requireScopedTheatre,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      if (!isSuperOrOwner(req.user)) {
-        return res.status(403).json({ message: "You are not allowed to create new theaters" });
-      }
+/** POST /api/theaters/admin  */
+router.post("/admin", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
+  try {
+    if (!isSuperOrOwner(req.user)) return res.status(403).json({ message: "You are not allowed to create new theaters" });
 
-      debugLog("[TheaterCreate] raw req.body:", req.body);
-      debugLog("[TheaterCreate] req.file present:", !!req.file);
+    const payload = req.body || {};
+    payload.amenities = toArray(payload.amenities);
 
-      const payload = req.body || {};
-      payload.amenities = toArray(payload.amenities);
-
-      if (req.file) {
-        const folder = process.env.CLOUDINARY_FOLDER || "theaters";
-        const result = await uploadToCloudinary(req.file.buffer, folder);
-        payload.imageUrl = result.secure_url;
-        payload.imagePublicId = result.public_id;
-      }
-
-      if (req.user) {
-        payload.uploaderId = req.user.id || req.user._id;
-        payload.uploaderRole = req.user.role || "admin";
-      }
-
-      if (!Array.isArray(payload.amenities)) payload.amenities = [];
-
-      const created = await Theater.create(payload);
-      res.status(201).json({ ok: true, data: created });
-    } catch (err) {
-      console.error("[Theaters] POST /admin error:", err);
-      res.status(500).json({ message: "Failed to create theater", error: err.message });
+    if (req.file) {
+      const folder = process.env.CLOUDINARY_FOLDER || "theaters";
+      const result = await uploadToCloudinary(req.file.buffer, folder);
+      payload.imageUrl = result.secure_url;
+      payload.imagePublicId = result.public_id;
     }
-  }
-);
 
-// CREATE — alias of POST /admin
-router.post(
-  "/admin/theaters",
-  requireAuth,
-  requireAdmin,
-  requireScopedTheatre,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      if (!isSuperOrOwner(req.user)) {
-        return res.status(403).json({ message: "You are not allowed to create new theaters" });
-      }
-
-      const payload = req.body || {};
-      payload.amenities = toArray(payload.amenities);
-
-      if (req.file) {
-        const folder = process.env.CLOUDINARY_FOLDER || "theaters";
-        const result = await uploadToCloudinary(req.file.buffer, folder);
-        payload.imageUrl = result.secure_url;
-        payload.imagePublicId = result.public_id;
-      }
-
-      if (req.user) {
-        payload.uploaderId = req.user.id || req.user._id;
-        payload.uploaderRole = req.user.role || "admin";
-      }
-
-      if (!Array.isArray(payload.amenities)) payload.amenities = [];
-
-      const created = await Theater.create(payload);
-      res.status(201).json({ ok: true, data: created });
-    } catch (err) {
-      console.error("[Theaters] POST /admin/theaters error:", err);
-      res.status(500).json({ message: "Failed to create theater", error: err.message });
+    if (req.user) {
+      payload.uploaderId = req.user.id || req.user._id;
+      payload.uploaderRole = req.user.role || "admin";
     }
+
+    if (!Array.isArray(payload.amenities)) payload.amenities = [];
+
+    const created = await Theater.create(payload);
+    res.status(201).json({ ok: true, data: created });
+  } catch (err) {
+    console.error("[Theaters] POST /admin error:", err);
+    res.status(500).json({ message: "Failed to create theater", error: err.message });
   }
-);
+});
 
-/**
- * PUT /api/theaters/admin/:id
- * Admin — update + optional image replace
- * THEATRE_ADMIN: only their own theater
- */
-router.put(
-  "/admin/:id",
-  requireAuth,
-  requireAdmin,
-  requireScopedTheatre,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
+/** POST alias: /api/theaters/admin/theaters */
+router.post("/admin/theaters", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
+  try {
+    if (!isSuperOrOwner(req.user)) return res.status(403).json({ message: "You are not allowed to create new theaters" });
 
-      const existing = await Theater.findById(id);
-      if (!existing) return res.status(404).json({ message: "Theater not found" });
-      assertInScopeOrThrow(existing._id, req);
+    const payload = req.body || {};
+    payload.amenities = toArray(payload.amenities);
 
-      const payload = { ...existing.toObject(), ...req.body };
-      payload.amenities = toArray(payload.amenities);
-
-      if (req.file) {
-        if (existing.imagePublicId) {
-          try {
-            await cloudinary.uploader.destroy(existing.imagePublicId);
-          } catch (e) {
-            console.warn("[Cloudinary] failed to delete old image:", e.message);
-          }
-        }
-        const folder = process.env.CLOUDINARY_FOLDER || "theaters";
-        const result = await uploadToCloudinary(req.file.buffer, folder);
-        payload.imageUrl = result.secure_url;
-        payload.imagePublicId = result.public_id;
-      }
-
-      if (!Array.isArray(payload.amenities)) payload.amenities = [];
-
-      const updated = await Theater.findByIdAndUpdate(id, payload, {
-        new: true,
-        runValidators: true,
-      }).lean();
-
-      res.json({ ok: true, data: updated });
-    } catch (err) {
-      console.error("[Theaters] PUT /admin/:id error:", err);
-      const code = Number(err?.status) || 500;
-      res.status(code).json({ message: "Failed to update theater", error: err.message });
+    if (req.file) {
+      const folder = process.env.CLOUDINARY_FOLDER || "theaters";
+      const result = await uploadToCloudinary(req.file.buffer, folder);
+      payload.imageUrl = result.secure_url;
+      payload.imagePublicId = result.public_id;
     }
-  }
-);
 
-// UPDATE — alias of PUT /admin/:id
-router.put(
-  "/admin/theaters/:id",
-  requireAuth,
-  requireAdmin,
-  requireScopedTheatre,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
-
-      const existing = await Theater.findById(id);
-      if (!existing) return res.status(404).json({ message: "Theater not found" });
-      assertInScopeOrThrow(existing._id, req);
-
-      const payload = { ...existing.toObject(), ...req.body };
-      payload.amenities = toArray(payload.amenities);
-
-      if (req.file) {
-        if (existing.imagePublicId) {
-          try { await cloudinary.uploader.destroy(existing.imagePublicId); } catch (e) {
-            console.warn("[Cloudinary] failed to delete old image:", e.message);
-          }
-        }
-        const folder = process.env.CLOUDINARY_FOLDER || "theaters";
-        const result = await uploadToCloudinary(req.file.buffer, folder);
-        payload.imageUrl = result.secure_url;
-        payload.imagePublicId = result.public_id;
-      }
-
-      if (!Array.isArray(payload.amenities)) payload.amenities = [];
-
-      const updated = await Theater.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
-      res.json({ ok: true, data: updated });
-    } catch (err) {
-      console.error("[Theaters] PUT /admin/theaters/:id error:", err);
-      const code = Number(err?.status) || 500;
-      res.status(code).json({ message: "Failed to update theater", error: err.message });
+    if (req.user) {
+      payload.uploaderId = req.user.id || req.user._id;
+      payload.uploaderRole = req.user.role || "admin";
     }
-  }
-);
 
-/**
- * PATCH /api/theaters/admin/:id/amenities
- * Admin — set amenities array directly
- * THEATRE_ADMIN: only their own theater
- */
+    if (!Array.isArray(payload.amenities)) payload.amenities = [];
+
+    const created = await Theater.create(payload);
+    res.status(201).json({ ok: true, data: created });
+  } catch (err) {
+    console.error("[Theaters] POST /admin/theaters error:", err);
+    res.status(500).json({ message: "Failed to create theater", error: err.message });
+  }
+});
+
+/** PUT /api/theaters/admin/:id */
+router.put("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
+
+    const existing = await Theater.findById(id);
+    if (!existing) return res.status(404).json({ message: "Theater not found" });
+    assertInScopeOrThrow(existing._id, req);
+
+    const payload = { ...existing.toObject(), ...req.body };
+    payload.amenities = toArray(payload.amenities);
+
+    if (req.file) {
+      if (existing.imagePublicId) {
+        try { await cloudinary.uploader.destroy(existing.imagePublicId); } catch (e) { console.warn("[Cloudinary] delete old:", e.message); }
+      }
+      const folder = process.env.CLOUDINARY_FOLDER || "theaters";
+      const result = await uploadToCloudinary(req.file.buffer, folder);
+      payload.imageUrl = result.secure_url;
+      payload.imagePublicId = result.public_id;
+    }
+
+    if (!Array.isArray(payload.amenities)) payload.amenities = [];
+
+    const updated = await Theater.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+    res.json({ ok: true, data: updated });
+  } catch (err) {
+    console.error("[Theaters] PUT /admin/:id error:", err);
+    const code = Number(err?.status) || 500;
+    res.status(code).json({ message: "Failed to update theater", error: err.message });
+  }
+});
+
+/** PUT alias: /api/theaters/admin/theaters/:id */
+router.put("/admin/theaters/:id", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
+
+    const existing = await Theater.findById(id);
+    if (!existing) return res.status(404).json({ message: "Theater not found" });
+    assertInScopeOrThrow(existing._id, req);
+
+    const payload = { ...existing.toObject(), ...req.body };
+    payload.amenities = toArray(payload.amenities);
+
+    if (req.file) {
+      if (existing.imagePublicId) {
+        try { await cloudinary.uploader.destroy(existing.imagePublicId); } catch (e) { console.warn("[Cloudinary] delete old:", e.message); }
+      }
+      const folder = process.env.CLOUDINARY_FOLDER || "theaters";
+      const result = await uploadToCloudinary(req.file.buffer, folder);
+      payload.imageUrl = result.secure_url;
+      payload.imagePublicId = result.public_id;
+    }
+
+    if (!Array.isArray(payload.amenities)) payload.amenities = [];
+
+    const updated = await Theater.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
+    res.json({ ok: true, data: updated });
+  } catch (err) {
+    console.error("[Theaters] PUT /admin/theaters/:id error:", err);
+    const code = Number(err?.status) || 500;
+    res.status(code).json({ message: "Failed to update theater", error: err.message });
+  }
+});
+
+/** PATCH /api/theaters/admin/:id/amenities */
 router.patch("/admin/:id/amenities", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const { id } = req.params;
@@ -404,11 +301,7 @@ router.patch("/admin/:id/amenities", requireAuth, requireAdmin, requireScopedThe
     assertInScopeOrThrow(existing._id, req);
 
     const amenities = toArray(req.body?.amenities ?? req.body);
-    const updated = await Theater.findByIdAndUpdate(
-      id,
-      { $set: { amenities } },
-      { new: true, runValidators: true }
-    ).lean();
+    const updated = await Theater.findByIdAndUpdate(id, { $set: { amenities } }, { new: true, runValidators: true }).lean();
 
     if (!updated) return res.status(404).json({ message: "Theater not found" });
     return res.json({ ok: true, data: updated });
@@ -419,46 +312,33 @@ router.patch("/admin/:id/amenities", requireAuth, requireAdmin, requireScopedThe
   }
 });
 
-// PATCH — alias of PATCH /admin/:id/amenities
-router.patch(
-  "/admin/theaters/:id/amenities",
-  requireAuth,
-  requireAdmin,
-  requireScopedTheatre,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
+/** PATCH alias: /api/theaters/admin/theaters/:id/amenities */
+router.patch("/admin/theaters/:id/amenities", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
 
-      const existing = await Theater.findById(id).lean();
-      if (!existing) return res.status(404).json({ message: "Theater not found" });
-      assertInScopeOrThrow(existing._id, req);
+    const existing = await Theater.findById(id).lean();
+    if (!existing) return res.status(404).json({ message: "Theater not found" });
+    assertInScopeOrThrow(existing._id, req);
 
-      const amenities = toArray(req.body?.amenities ?? req.body);
-      const updated = await Theater.findByIdAndUpdate(
-        id,
-        { $set: { amenities } },
-        { new: true, runValidators: true }
-      ).lean();
+    const amenities = toArray(req.body?.amenities ?? req.body);
+    const updated = await Theater.findByIdAndUpdate(id, { $set: { amenities } }, { new: true, runValidators: true }).lean();
 
-      if (!updated) return res.status(404).json({ message: "Theater not found" });
-      return res.json({ ok: true, data: updated });
-    } catch (err) {
-      console.error("[Theaters] PATCH /admin/theaters/:id/amenities error:", err);
-      const code = Number(err?.status) || 500;
-      res.status(code).json({ message: "Failed to update amenities", error: err.message });
-    }
+    if (!updated) return res.status(404).json({ message: "Theater not found" });
+    return res.json({ ok: true, data: updated });
+  } catch (err) {
+    console.error("[Theaters] PATCH /admin/theaters/:id/amenities error:", err);
+    const code = Number(err?.status) || 500;
+    res.status(code).json({ message: "Failed to update amenities", error: err.message });
   }
-);
+});
 
-/* -------------------------------------------------------------------------- */
-/*                                   Routes (public)                          */
-/* -------------------------------------------------------------------------- */
+/* =========================================================================
+   PUBLIC
+   ========================================================================= */
 
-/**
- * GET /api/theaters
- * Public endpoint — paginated list for users
- */
+/** GET /api/theaters  */
 router.get("/", async (req, res) => {
   try {
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -467,14 +347,7 @@ router.get("/", async (req, res) => {
 
     const { q, city, page = 1, limit = 12 } = req.query;
     const filter = {};
-
-    if (q) {
-      filter.$or = [
-        { name: new RegExp(q, "i") },
-        { city: new RegExp(q, "i") },
-        { address: new RegExp(q, "i") },
-      ];
-    }
+    if (q) filter.$or = [{ name: new RegExp(q, "i") }, { city: new RegExp(q, "i") }, { address: new RegExp(q, "i") }];
     if (city && city !== "All") filter.city = city;
 
     const safeLimit = Math.min(Number(limit) || 12, 1000);
@@ -487,30 +360,18 @@ router.get("/", async (req, res) => {
       Theater.distinct("city"),
     ]);
 
-    // Attach screen counts
     const screenCounts = await Screen.aggregate([{ $group: { _id: "$theater", count: { $sum: 1 } } }]);
     const countMap = new Map(screenCounts.map((c) => [String(c._id), c.count]));
     const enriched = theaters.map((t) => ({ ...t, screensCount: countMap.get(String(t._id)) || 0 }));
 
-    res.json({
-      ok: true,
-      theaters: enriched,
-      count: totalCount,
-      cities,
-      page: safePage,
-      limit: safeLimit,
-      hasMore: skip + enriched.length < totalCount,
-    });
+    res.json({ ok: true, theaters: enriched, count: totalCount, cities, page: safePage, limit: safeLimit, hasMore: skip + enriched.length < totalCount });
   } catch (err) {
     console.error("[Theaters] GET / error:", err);
     res.status(500).json({ message: "Failed to fetch theaters" });
   }
 });
 
-/**
- * GET /api/theaters/:id
- * Single theater + screen count
- */
+/** GET /api/theaters/:id  */
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -520,8 +381,9 @@ router.get("/:id", async (req, res) => {
     if (!theater) return res.status(404).json({ message: "Theater not found" });
 
     const screensCount = await Screen.countDocuments({
-      theater: new mongoose.Types.ObjectId(id),
+      $or: [{ theatreId: id }, { theater: new mongoose.Types.ObjectId(id) }],
     });
+
     res.json({ ...theater, screensCount });
   } catch (err) {
     console.error("[Theaters] GET /:id error:", err);
@@ -529,16 +391,13 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-/**
- * GET /api/theaters/:theaterId/screens
- * List all screens for a theater
- */
+/** GET /api/theaters/:theaterId/screens  */
 router.get("/:theaterId/screens", async (req, res) => {
   try {
     const { theaterId } = req.params;
     if (!isValidId(theaterId)) return res.status(400).json({ error: "Invalid theater id" });
 
-    const screens = await Screen.find({ theater: theaterId }).lean();
+    const screens = await Screen.find({ $or: [{ theatreId: theaterId }, { theater: theaterId }] }).lean();
     res.json({ data: screens || [] });
   } catch (err) {
     console.error("[Theaters] GET /:theaterId/screens error:", err);
@@ -546,9 +405,33 @@ router.get("/:theaterId/screens", async (req, res) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*                              Delete Route                                  */
-/* -------------------------------------------------------------------------- */
+/* =========================================================================
+   EXTRA: Frontend compatibility aliases
+   ========================================================================= */
+
+/** ✅ alias for AdminShowtimes: GET /api/theatre/me  */
+router.get("/theatre/me", requireAuth, async (req, res) => {
+  // reuse handler logic
+  req.url = "/me";
+  return router.handle(req, res);
+});
+
+/** ✅ alias for AdminShowtimes: GET /api/screens/by-theatre/:id  */
+router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isValidId(id)) return res.status(400).json({ error: "Invalid theatre id" });
+    const list = await Screen.find({ $or: [{ theatreId: id }, { theater: id }] })
+      .select("_id name rows cols seats theatreId theater")
+      .lean();
+    res.json(list);
+  } catch (err) {
+    console.error("[Theaters] alias /screens/by-theatre/:id error:", err);
+    res.status(500).json({ error: "Failed to load screens" });
+  }
+});
+
+/* ----------------------------- DELETE ---------------------------------- */
 router.delete("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const { id } = req.params;
@@ -562,9 +445,7 @@ router.delete("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, asy
     if (!deleted) return res.status(404).json({ message: "Theater not found" });
 
     if (deleted.imagePublicId) {
-      try {
-        await cloudinary.uploader.destroy(deleted.imagePublicId);
-      } catch (err) {
+      try { await cloudinary.uploader.destroy(deleted.imagePublicId); } catch (err) {
         console.warn("[Cloudinary] Failed to delete theater poster:", err.message);
       }
     }
@@ -577,46 +458,37 @@ router.delete("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, asy
   }
 });
 
-// DELETE — alias of DELETE /admin/:id
-router.delete(
-  "/admin/theaters/:id",
-  requireAuth,
-  requireAdmin,
-  requireScopedTheatre,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
+/** DELETE alias: /api/theaters/admin/theaters/:id */
+router.delete("/admin/theaters/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
 
-      const existing = await Theater.findById(id);
-      if (!existing) return res.status(404).json({ message: "Theater not found" });
-      assertInScopeOrThrow(existing._id, req);
+    const existing = await Theater.findById(id);
+    if (!existing) return res.status(404).json({ message: "Theater not found" });
+    assertInScopeOrThrow(existing._id, req);
 
-      const deleted = await Theater.findByIdAndDelete(id);
-      if (!deleted) return res.status(404).json({ message: "Theater not found" });
+    const deleted = await Theater.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ message: "Theater not found" });
 
-      if (deleted.imagePublicId) {
-        try { await cloudinary.uploader.destroy(deleted.imagePublicId); } catch (err) {
-          console.warn("[Cloudinary] Failed to delete theater poster:", err.message);
-        }
+    if (deleted.imagePublicId) {
+      try { await cloudinary.uploader.destroy(deleted.imagePublicId); } catch (err) {
+        console.warn("[Cloudinary] Failed to delete theater poster:", err.message);
       }
-
-      res.json({ ok: true, message: "Deleted", id });
-    } catch (err) {
-      console.error("[Theaters] DELETE /admin/theaters/:id error:", err);
-      const code = Number(err?.status) || 500;
-      res.status(code).json({ message: "Failed to delete theater", error: err.message });
     }
-  }
-);
 
-/* -------------------------------------------------------------------------- */
-/*                              Multer Error Handler                          */
-/* -------------------------------------------------------------------------- */
+    res.json({ ok: true, message: "Deleted", id });
+  } catch (err) {
+    console.error("[Theaters] DELETE /admin/theaters/:id error:", err);
+    const code = Number(err?.status) || 500;
+    res.status(code).json({ message: "Failed to delete theater", error: err.message });
+  }
+});
+
+/* ----------------------- Multer error handler --------------------------- */
 router.use((err, _req, res, next) => {
   if (err && err.name === "MulterError") {
-    if (err.code === "LIMIT_FILE_SIZE")
-      return res.status(413).json({ message: "File too large (max 5MB)" });
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ message: "File too large (max 5MB)" });
     return res.status(400).json({ message: err.message });
   }
   next(err);
