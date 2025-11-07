@@ -60,45 +60,33 @@ function setAcaOrigin(res, origin) {
   res.setHeader("Vary", "Origin");
 }
 
-// Base CORS (echo origin)
+// Base CORS (safest: delegate origin check to the whitelist; let cors reflect headers)
 app.use(
   cors({
-    origin: true,
+    origin: (origin, cb) => {
+      // allow requests with no origin (mobile apps, curl) or whitelisted ones
+      if (!origin) return cb(null, true);
+      return cb(null, allowedOrigins.has(origin));
+    },
     credentials: false, // using Authorization header, not cookies
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Requested-With",
-      "Accept",
-      "X-Role",
-      "Origin",
-    ],
+    // NOTE: do NOT set allowedHeaders here so cors will reflect
+    // Access-Control-Request-Headers automatically (covers x-role/x-Role, etc.)
     exposedHeaders: ["Content-Length", "Content-Type"],
     optionsSuccessStatus: 204,
     maxAge: 86400,
   })
 );
 
-// Global OPTIONS so preflights never miss ACAO
-app.options("*", (req, res) => {
-  const origin = req.headers.origin;
-  setAcaOrigin(res, origin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With, Accept, X-Role, Origin"
-  );
-  return res.sendStatus(204);
-});
+// Let cors handle preflight for any path to avoid header drift
+app.options("*", cors());
 
-// Allow-list guard AFTER base cors
+// Allow-list guard AFTER base cors — still returns 403 for disallowed origins on actual requests
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (!origin) return next();
   if (allowedOrigins.has(origin)) {
     setAcaOrigin(res, origin);
-    if (req.method === "OPTIONS") return res.sendStatus(204);
     return next();
   }
   console.warn(`[CORS] blocked origin ${origin}`);
@@ -184,7 +172,8 @@ try {
 app.use("/uploads", (req, res, next) => {
   setAcaOrigin(res, req.headers.origin);
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // Allow common headers including custom x-role for preflight on uploads
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-role, X-Role");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -247,29 +236,12 @@ function sseCorsHeaders(req, res, next) {
   next();
 }
 
-app.options("/api/notifications/stream", (req, res) => {
-  const origin = req.headers.origin;
-  setAcaOrigin(res, origin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With, Accept, X-Role, Origin"
-  );
-  return res.sendStatus(204);
-});
+// Use cors() for preflight so headers always match the cors config
+app.options("/api/notifications/stream", cors());
 app.get("/api/notifications/stream", sseCorsHeaders, sse.sseHandler);
 
 // Legacy alias
-app.options("/notifications/stream", (req, res) => {
-  const origin = req.headers.origin;
-  setAcaOrigin(res, origin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With, Accept, X-Role, Origin"
-  );
-  return res.sendStatus(204);
-});
+app.options("/notifications/stream", cors());
 app.get("/notifications/stream", sseCorsHeaders, sse.sseHandler);
 
 /* ----------------------------- Notifications REST ------------------------- */
@@ -378,16 +350,8 @@ app.get("/_health", (_req, res) => {
 });
 
 /* ----------------------- Explicit login preflight (belt + suspenders) ------ */
-app.options("/api/auth/login", (req, res) => {
-  const origin = req.headers.origin;
-  setAcaOrigin(res, origin);
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With, Accept, Origin"
-  );
-  return res.sendStatus(204);
-});
+// Use cors() so requested headers (including x-role) are reflected
+app.options("/api/auth/login", cors());
 
 /* ------------------------------- 404 & errors ------------------------------ */
 app.use((req, res, next) => {
