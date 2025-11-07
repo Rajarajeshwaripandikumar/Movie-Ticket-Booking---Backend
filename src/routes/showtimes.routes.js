@@ -16,21 +16,20 @@ import {
 } from "../middleware/scope.js";
 
 const router = Router();
+/** ✅ mount under /api/showtimes so GET /api/showtimes works */
+router.routesPrefix = "/api/showtimes";
+
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 /* -------------------------------------------------------------------------- */
 /* Time helpers (IST-aware)                                                   */
 /* -------------------------------------------------------------------------- */
-
-// Build IST day bounds in UTC for a given YYYY-MM-DD string
 function istBoundsUtc(ymd) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return {};
   const start = new Date(`${ymd}T00:00:00.000+05:30`);
   const end = new Date(`${ymd}T23:59:59.999+05:30`);
   return { startUtc: start, endUtc: end };
 }
-
-// YYYY-MM-DD string for current day in IST
 function toYmdIST(d = new Date()) {
   const ist = new Date(d.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   const y = ist.getFullYear();
@@ -43,10 +42,8 @@ const nowUtc = () => new Date();
 /* -------------------------------------------------------------------------- */
 /* Misc helpers                                                               */
 /* -------------------------------------------------------------------------- */
-
 const seatKey = (r, c) => `${Number(r)}:${Number(c)}`;
 
-// District-friendly DTO
 function toDto(s) {
   const theater =
     s.theater && typeof s.theater === "object"
@@ -169,7 +166,7 @@ async function reconcileLocks(showtime) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* LIST: GET /showtimes?movieId&theaterId&screenId&city&date=YYYY-MM-DD       */
+/* LIST: GET /api/showtimes?movieId&theaterId&screenId&city&date=YYYY-MM-DD   */
 /* Hides past days; on today, hides shows already started.                    */
 /* -------------------------------------------------------------------------- */
 router.get("/", async (req, res) => {
@@ -212,9 +209,8 @@ router.get("/", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* NEW: GET /showtimes/my-theatre?date=YYYY-MM-DD&movieId=&screenId=         */
-/* Returns ONLY the logged-in manager's theatre showtimes (JWT.theatreId).    */
-/* Same date rules (IST) as other list endpoints.                             */
+/* NEW: GET /api/showtimes/my-theatre?date=YYYY-MM-DD&movieId=&screenId=      */
+/* Returns only the logged-in manager's theatre (from JWT).                   */
 /* -------------------------------------------------------------------------- */
 router.get("/my-theatre", async (req, res) => {
   try {
@@ -231,7 +227,7 @@ router.get("/my-theatre", async (req, res) => {
 
     const theatreId = decoded?.theatreId;
     if (!theatreId || !mongoose.isValidObjectId(String(theatreId))) {
-      return res.json([]); // not a theatre admin or not linked
+      return res.json([]);
     }
 
     const { movieId, screenId, date } = req.query;
@@ -246,7 +242,7 @@ router.get("/my-theatre", async (req, res) => {
     if (!ymd) {
       q.startTime = { $gte: nowUtc() };
     } else if (ymd < todayYmd) {
-      return res.json([]); // no past
+      return res.json([]);
     } else if (ymd === todayYmd) {
       const { endUtc } = istBoundsUtc(ymd);
       q.startTime = { $gte: nowUtc(), $lt: endUtc };
@@ -270,8 +266,7 @@ router.get("/my-theatre", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* AVAILABILITY: GET /showtimes/availability?movieId|theaterId|screenId&...   */
-/* Returns a dense list of IST dates between `from` and `to` (14-day window). */
+/* AVAILABILITY: GET /api/showtimes/availability                              */
 /* -------------------------------------------------------------------------- */
 router.get("/availability", async (req, res) => {
   try {
@@ -305,8 +300,7 @@ router.get("/availability", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* CITIES: GET /showtimes/cities?movieId=&date=YYYY-MM-DD                     */
-/* Works with or without movieId; future shows only.                          */
+/* CITIES: GET /api/showtimes/cities                                          */
 /* -------------------------------------------------------------------------- */
 router.get("/cities", async (req, res) => {
   try {
@@ -347,8 +341,7 @@ router.get("/cities", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* MOVIES (for dropdown): GET /showtimes/movies?city=&date=YYYY-MM-DD         */
-/* Returns distinct movies that have future shows (optionally by city/date).  */
+/* MOVIES (dropdown): GET /api/showtimes/movies                               */
 /* -------------------------------------------------------------------------- */
 router.get("/movies", async (req, res) => {
   try {
@@ -393,7 +386,7 @@ router.get("/movies", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* GET ONE: /showtimes/:id  -> seats + locks reconciled                       */
+/* GET ONE: /api/showtimes/:id -> seats + locks reconciled                    */
 /* -------------------------------------------------------------------------- */
 router.get("/:id", async (req, res) => {
   try {
@@ -418,13 +411,18 @@ router.get("/:id", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* CREATE: POST /showtimes (scoped)                                           */
-/* Auto-fill city from Theater, verify screen belongs to theater,             */
-/* minute-level uniqueness, init seats                                        */
+/* CREATE: POST /api/showtimes (scoped)                                       */
+/* Accepts aliases from frontend payload                                      */
 /* -------------------------------------------------------------------------- */
 router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
-    const { movie, theater, screen, startTime, basePrice, dynamicPricing } = req.body;
+    const movie = req.body.movie ?? req.body.movieId;
+    const theater = req.body.theater ?? req.body.theaterId ?? req.body.theatreId;
+    const screen = req.body.screen ?? req.body.screenId;
+    const startTime = req.body.startTime ?? req.body.startAt;
+    const basePrice = req.body.basePrice ?? req.body.price ?? req.body.amount;
+    const dynamicPricing = req.body.dynamicPricing;
+
     if (!movie || !theater || !screen || !startTime || basePrice == null) {
       return res.status(400).json({ message: "movie, theater, screen, startTime, basePrice are required" });
     }
@@ -436,12 +434,10 @@ router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, re
     ]);
     if (!m || !t || !s) return res.status(400).json({ message: "Invalid movie/theater/screen" });
 
-    // Screen must belong to Theater
     if (String(s.theater) !== String(t._id)) {
       return res.status(400).json({ message: "Screen does not belong to the selected theater" });
     }
 
-    // Scope: theatre admin may only create inside their theatre
     assertInScopeOrThrow(t._id, req);
 
     const when = new Date(startTime);
@@ -458,7 +454,6 @@ router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, re
       dynamicPricing: Boolean(dynamicPricing),
     });
 
-    await doc.ensureSeatsInitialized?.();
     if (!doc.seats?.length) await ensureSeatsInitialized(doc);
 
     const populated = await Showtime.findById(doc._id)
@@ -479,18 +474,15 @@ router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, re
 });
 
 /* -------------------------------------------------------------------------- */
-/* UPDATE: PATCH /showtimes/:id (scoped)                                      */
-/* Validates scope; does not allow changing theater/screen via this endpoint. */
+/* UPDATE: PATCH /api/showtimes/:id (scoped)                                  */
 /* -------------------------------------------------------------------------- */
 router.patch("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const doc = await Showtime.findById(req.params.id).populate("theater", "_id city");
     if (!doc) return res.status(404).json({ message: "Showtime not found" });
 
-    // Scope check against the show's theater
     assertInScopeOrThrow(doc.theater?._id || doc.theater, req);
 
-    // Prevent moving show across theater/screen via patch
     if (req.body.theater && String(req.body.theater) !== String(doc.theater?._id || doc.theater)) {
       return res.status(400).json({ message: "Cannot change theater via update" });
     }
@@ -498,13 +490,16 @@ router.patch("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req
       return res.status(400).json({ message: "Cannot change screen via update" });
     }
 
-    if (req.body.startTime) {
-      const d = new Date(req.body.startTime);
+    const newStart = req.body.startTime ?? req.body.startAt;
+    const newPrice = req.body.basePrice ?? req.body.price ?? req.body.amount;
+
+    if (newStart !== undefined) {
+      const d = new Date(newStart);
       if (Number.isNaN(d.getTime())) return res.status(400).json({ message: "Invalid startTime" });
       d.setSeconds(0, 0);
       doc.startTime = d;
     }
-    if (req.body.basePrice != null) doc.basePrice = Number(req.body.basePrice);
+    if (newPrice != null) doc.basePrice = Number(newPrice);
     if (typeof req.body.dynamicPricing === "boolean") doc.dynamicPricing = req.body.dynamicPricing;
 
     await doc.save();
@@ -527,8 +522,28 @@ router.patch("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req
 });
 
 /* -------------------------------------------------------------------------- */
-/* CONVENIENCE: GET /showtimes/movies/:id?city&date=YYYY-MM-DD                */
-/* Same "no past" rule as list.                                               */
+/* DELETE: DELETE /api/showtimes/:id (scoped)                                 */
+/* -------------------------------------------------------------------------- */
+router.delete("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+  try {
+    const doc = await Showtime.findById(req.params.id).populate("theater", "_id");
+    if (!doc) return res.status(404).json({ message: "Showtime not found" });
+
+    assertInScopeOrThrow(doc.theater?._id || doc.theater, req);
+
+    await Showtime.findByIdAndDelete(doc._id);
+    await SeatLock.deleteMany({ showtime: doc._id, status: { $in: ["HELD", "PENDING"] } });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    const code = Number(e?.status) || 500;
+    console.error("❌ DELETE /showtimes/:id error:", e);
+    return res.status(code).json({ message: "Failed to delete showtime", error: e.message });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* CONVENIENCE: GET /api/showtimes/movies/:id                                 */
 /* -------------------------------------------------------------------------- */
 router.get("/movies/:id", async (req, res) => {
   try {
@@ -568,8 +583,7 @@ router.get("/movies/:id", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* CONVENIENCE: GET /showtimes/theaters/:id?date=YYYY-MM-DD                   */
-/* Same "no past" rule as list.                                               */
+/* CONVENIENCE: GET /api/showtimes/theaters/:id                               */
 /* -------------------------------------------------------------------------- */
 router.get("/theaters/:id", async (req, res) => {
   try {
