@@ -11,6 +11,9 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 dotenv.config();
 const router = express.Router();
 
+/* ✅ Tell server.js to mount this router at /api/movies */
+router.routesPrefix = "/api/movies";
+
 /* --------------------------- Cloudinary config --------------------------- */
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -55,86 +58,54 @@ function uploadBufferToCloudinary(buffer, folder = "movies") {
 
 /**
  * Normalize a request body field into an array.
- * - If value is an Array of primitives => array of trimmed strings
- * - If value is an Array of objects => return as-is (preserve object shape)
- * - If value is a JSON string representing an array (of primitives or objects) => parsed and normalized
- * - If value is a comma-separated string => split into trimmed strings
- * - If null/undefined/empty => []
  */
 function normalizeArrayField(value) {
   if (value == null) return [];
-
-  // If already an array, inspect its elements
   if (Array.isArray(value)) {
     if (value.length === 0) return [];
-    // If array contains objects (cast objects), preserve them (but parse JSON strings inside)
     if (typeof value[0] === "object" && value[0] !== null) {
       return value.map((v) => {
-        // if any array entry is a stringified JSON, try to parse
         if (typeof v === "string") {
           try {
             return JSON.parse(v);
-          } catch (e) {
+          } catch {
             return v;
           }
         }
         return v;
       });
     }
-    // otherwise convert primitives to trimmed strings
     return value.map((s) => String(s).trim()).filter(Boolean);
   }
-
-  // If a string, try JSON parse first
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) return [];
-
-    // try parsing JSON
     try {
       const parsed = JSON.parse(trimmed);
       if (Array.isArray(parsed)) {
-        // if parsed array contains objects, return as-is
-        if (parsed.length > 0 && typeof parsed[0] === "object" && parsed[0] !== null) {
-          return parsed;
-        }
-        // otherwise return trimmed primitives as strings
+        if (parsed.length > 0 && typeof parsed[0] === "object" && parsed[0] !== null) return parsed;
         return parsed.map((s) => String(s).trim()).filter(Boolean);
       }
-    } catch (e) {
-      // not JSON — fallthrough to comma-split
-    }
-
-    // comma-separated fallback
+    } catch {}
     return trimmed.split(",").map((s) => s.trim()).filter(Boolean);
   }
-
-  // If it's an object (single object) — return as single-element array
   if (typeof value === "object") return [value];
-
-  // fallback scalar => single-string array
   return [String(value).trim()].filter(Boolean);
 }
 
 /* --------------------- Defensive sanitizers for cast/crew ----------------- */
 function sanitizeCastArray(inputArr) {
   if (!Array.isArray(inputArr)) return [];
-
   return inputArr
     .map((entry) => {
       if (!entry && entry !== 0) return null;
-
-      if (typeof entry === "string") {
-        return { name: entry.trim(), character: "" };
-      }
-
+      if (typeof entry === "string") return { name: entry.trim(), character: "" };
       if (Array.isArray(entry)) {
         const names = entry
           .map((x) => (typeof x === "string" ? x : x?.name || x?.actorName || JSON.stringify(x)))
           .filter(Boolean);
         return { name: names.join(", "), character: "" };
       }
-
       if (typeof entry === "object") {
         const name =
           entry.name ||
@@ -145,7 +116,6 @@ function sanitizeCastArray(inputArr) {
         const character = entry.character ?? entry.role ?? "";
         return { name: String(name || "").trim(), character: String(character || "").trim() };
       }
-
       return { name: String(entry), character: "" };
     })
     .filter((x) => x && (String(x.name).trim().length > 0 || String(x.character).trim().length > 0));
@@ -153,7 +123,6 @@ function sanitizeCastArray(inputArr) {
 
 function sanitizeCrewArray(inputArr) {
   if (!Array.isArray(inputArr)) return [];
-
   return inputArr
     .map((entry) => {
       if (!entry && entry !== 0) return null;
@@ -173,10 +142,9 @@ function sanitizeCrewArray(inputArr) {
 }
 
 /* ----------------------------- Public API -------------------------------- */
-
 /**
  * GET /api/movies
- * public — paginated, optional search
+ * public — paginated, optional search and status filter
  */
 router.get("/", async (req, res) => {
   try {
@@ -184,23 +152,16 @@ router.get("/", async (req, res) => {
     res.set("Pragma", "no-cache");
     res.set("Expires", "0");
 
-    const { q, genre, page = 1, limit = 20, onlyInTheaters } = req.query;
+    const { q, genre, page = 1, limit = 20, onlyInTheaters, status } = req.query;
     const filter = {};
 
     if (q) {
       const rx = new RegExp(String(q), "i");
-      // search title, director, cast, crew, genres, languages
-      filter.$or = [
-        { title: rx },
-        { director: rx },
-        { cast: rx },
-        { crew: rx },
-        { genres: rx },
-        { languages: rx },
-      ];
+      filter.$or = [{ title: rx }, { director: rx }, { cast: rx }, { crew: rx }, { genres: rx }, { languages: rx }];
     }
     if (genre) filter.genres = genre;
     if (onlyInTheaters === "true" || onlyInTheaters === true) filter.inTheaters = true;
+    if (status) filter.status = status;
 
     const safeLimit = Math.min(Number(limit) || 20, 1000);
     const safePage = Math.max(Number(page) || 1, 1);
@@ -252,7 +213,7 @@ const adminRouter = express.Router();
  * GET /api/movies/admin/list
  * admin — returns all movies (protected)
  */
-adminRouter.get("/list", async (req, res) => {
+adminRouter.get("/list", async (_req, res) => {
   try {
     const movies = await Movie.find().sort({ createdAt: -1 }).lean();
     res.json({ ok: true, data: movies });
@@ -270,16 +231,12 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
   try {
     const payload = req.body || {};
 
-    // Normalize array-like fields: genres, cast, crew, languages
     const genres = normalizeArrayField(payload.genres);
     const cast = normalizeArrayField(payload.cast);
     const crew = normalizeArrayField(payload.crew);
     let languages = normalizeArrayField(payload.languages);
-
-    // sensible default if languages not provided
     if (!languages || languages.length === 0) languages = ["English"];
 
-    // map other scalar fields safely
     const doc = {
       title: payload.title ?? "",
       description: payload.description ?? payload.synopsis ?? "",
@@ -327,42 +284,25 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
 /**
  * PUT /api/movies/admin/:id
  * update movie, optional poster replace
- *
- * This handler normalizes incoming cast/crew data into predictable plain objects,
- * runs validation, and returns clearer validation errors when possible.
  */
 adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
 
-    // Debug log
     console.log(`[Movies][Admin] PUT start id=${id} user=${req.user?.id || "anon"}`);
 
     const existing = await Movie.findById(id);
-    if (!existing) {
-      console.warn(`[Movies][Admin] PUT movie not found id=${id}`);
-      return res.status(404).json({ ok: false, message: "Movie not found" });
-    }
+    if (!existing) return res.status(404).json({ ok: false, message: "Movie not found" });
 
     const body = req.body || {};
-    console.log("[Movies][Admin] incoming body keys:", Object.keys(body));
-
-    // Normalize arrays (if present). If not present, keep existing values.
     const genres = body.genres ? normalizeArrayField(body.genres) : existing.genres || [];
     const rawCast = body.cast ? normalizeArrayField(body.cast) : existing.cast || [];
     const rawCrew = body.crew ? normalizeArrayField(body.crew) : existing.crew || [];
     const languages = body.languages ? normalizeArrayField(body.languages) : existing.languages || ["English"];
 
-    console.log("[Movies][Admin] normalized: genresLen=", genres.length, "rawCastSample=", JSON.stringify(rawCast?.slice(0,3)));
-    console.log("[Movies][Admin] normalized: rawCrewSample=", JSON.stringify(rawCrew?.slice(0,3)), "languages=", languages);
-
-    // Sanitize cast/crew into predictable plain object shapes
     const cast = sanitizeCastArray(rawCast);
     const crew = sanitizeCrewArray(rawCrew);
-
-    console.log("[Movies][Admin] sanitized cast sample:", JSON.stringify(cast?.slice(0,3)));
-    console.log("[Movies][Admin] sanitized crew sample:", JSON.stringify(crew?.slice(0,3)));
 
     const payload = {
       title: body.title ?? existing.title,
@@ -402,21 +342,12 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       payload.uploaderRole = req.user.role || "admin";
     }
 
-    console.log("[Movies][Admin] update payload preview:", {
-      title: payload.title,
-      genresCount: (payload.genres || []).length,
-      castCount: (payload.cast || []).length,
-      crewCount: (payload.crew || []).length,
-      posterUrlPreview: payload.posterUrl ? String(payload.posterUrl).slice(0, 80) : null,
-    });
-
-    // Attempt update with validation; capture validation errors for clearer logs
     let updated;
     try {
       updated = await Movie.findByIdAndUpdate(id, payload, { new: true, runValidators: true }).lean();
     } catch (validationErr) {
       console.error("[Movies][Admin] Validation error on update:", validationErr);
-      if (validationErr && validationErr.errors) {
+      if (validationErr?.errors) {
         const details = Object.keys(validationErr.errors).map((k) => ({
           path: k,
           message: validationErr.errors[k].message,
@@ -426,7 +357,6 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       return res.status(500).json({ ok: false, message: "Failed to update movie", error: String(validationErr) });
     }
 
-    // best-effort delete old poster if changed
     if (updated && oldPosterRef && oldPosterRef !== (updated.posterPublicId || updated.posterUrl)) {
       try {
         if (typeof oldPosterRef === "string" && oldPosterRef.length) {
