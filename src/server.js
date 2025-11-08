@@ -12,43 +12,71 @@ import sse from "./socket/sse.js";
 import app from "./app.js";
 
 /* ------------------------- Startup route audit (log) ------------------------ */
-// Prefix-aware audit so you know if essentials are mounted
-function getAllRoutes(appInstance) {
+/**
+ * Express doesn't expose full mount paths for nested routers easily.
+ * To keep the audit useful (and avoid false negatives), we:
+ *   1) collect every concrete route path we can see,
+ *   2) also collect every top-level mount prefix,
+ *   3) allow alias checks (e.g., "/api/screens" is satisfied if we see
+ *      a mount at "/api" AND any child route that starts with "/screens").
+ */
+
+function getAllConcretePaths(appInstance) {
   const out = [];
+  const visit = (stack, prefix = "") => {
+    if (!Array.isArray(stack)) return;
+    for (const layer of stack) {
+      // concrete route
+      if (layer?.route?.path) {
+        const p = prefix + layer.route.path;
+        out.push(p);
+        continue;
+      }
+      // nested router
+      if (layer?.name === "router" && layer?.handle?.stack) {
+        // best effort to extract a readable mount from regexp (Express internals)
+        let mount = "";
+        try {
+          // This grabs the static prefix when possible (e.g., "/api", "/api/auth")
+          if (layer?.regexp && layer.regexp.fast_slash !== true) {
+            const src = layer.regexp.toString(); // e.g., /^\/api(?:\/(?=$))?$/i
+            const match = src.match(/^\/\^\(\\\/\)\?\(\?:\\\/\)\?\.\*$/) ? null : src.match(/^\/\^\\\/([^\\\^$?]*)/);
+            if (match && match[1]) {
+              mount = "/" + match[1].replace(/\\\//g, "/");
+            }
+          }
+        } catch {}
+        visit(layer.handle.stack, prefix + (mount || ""));
+      }
+    }
+  };
+  visit(appInstance?._router?.stack || [], "");
+  return out;
+}
+
+function getTopLevelMounts(appInstance) {
+  const out = new Set();
   const stack = appInstance?._router?.stack || [];
   for (const layer of stack) {
-    if (layer.route?.path) {
-      out.push(layer.route.path);
-      continue;
-    }
-    if (layer?.name === "router" && layer?.handle?.stack) {
-      for (const r of layer.handle.stack) {
-        if (r?.route?.path) out.push(r.route.path);
-      }
+    if (layer?.name === "router") {
+      // Try to reconstruct a readable mount string from the layer regexp
+      let mount = "";
+      try {
+        if (layer?.regexp && layer.regexp.fast_slash !== true) {
+          const src = layer.regexp.toString(); // /^\/api(?:\/(?=$))?$/i  OR /^\/uploads\/?(?=\/|$)/i
+          const m = src.match(/^\/\^\\\/(.+?)(?:\\\/\?\(\?=\\\/\|\$\))?\$\//) || src.match(/^\/\^\\\/(.+?)\\\/\?\(\?=\\\/\|\$\)\/i/);
+          if (m && m[1]) mount = "/" + m[1].replace(/\\\//g, "/");
+        }
+      } catch {}
+      // Fallback: if we couldn't parse, push empty to avoid losing the layer
+      out.add(mount || "");
     }
   }
   return out;
 }
 
-function routePrefixExists(appInstance, prefix) {
-  try {
-    const stack = appInstance?._router?.stack || [];
-    for (const layer of stack) {
-      if (layer?.route?.path && String(layer.route.path).startsWith(prefix)) return true;
-      if (layer?.name === "router" && layer?.handle?.stack) {
-        for (const r of layer.handle.stack) {
-          if (r?.route?.path && String(r.route.path).startsWith(prefix)) return true;
-        }
-      }
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 function auditRoutes(appInstance, { failOnMissing = false } = {}) {
-  const mustHavePrefixes = [
+  const mustHave = [
     "/api/health",
     "/api/auth",
     "/api/movies",
@@ -59,7 +87,7 @@ function auditRoutes(appInstance, { failOnMissing = false } = {}) {
     "/api/bookings",
     "/api/payments",
     "/api/orders",
-    "/api/screens",
+    "/api/screens",          // ← satisfied by: mount "/api" + any child starting with "/screens"
     "/api/pricing",
     "/api/profile",
     "/api/notifications",
@@ -70,14 +98,36 @@ function auditRoutes(appInstance, { failOnMissing = false } = {}) {
     "/uploads",
   ];
 
-  const routes = getAllRoutes(appInstance);
-  console.log(`🧭 Route audit: discovered ~${routes.length} concrete route paths`);
+  // alias rules: a required prefix is OK if ANY of these checks passes
+  const aliasChecks = {
+    "/api/screens": (concretePaths, mounts) => {
+      // If there's a top-level "/api" mount AND we see any concrete path that begins with "/screens"
+      // (because screens.routes.js defines "/screens/*" inside a router mounted at "/api")
+      const hasApiMount = mounts.has("/api");
+      const hasScreensChildren = concretePaths.some((p) => p.startsWith("/api/screens") || p.startsWith("/screens"));
+      return hasApiMount && hasScreensChildren;
+    },
+  };
+
+  const concrete = getAllConcretePaths(appInstance);
+  const mounts = getTopLevelMounts(appInstance);
+
+  console.log(`🧭 Route audit: found ~${concrete.length} concrete routes, ${mounts.size} top-level mounts`);
   let missing = 0;
-  for (const p of mustHavePrefixes) {
-    const ok = routePrefixExists(appInstance, p);
-    console.log(`${ok ? "✅" : "❌"} ${p}`);
+
+  for (const reqPrefix of mustHave) {
+    let ok =
+      concrete.some((p) => p.startsWith(reqPrefix)) ||
+      mounts.has(reqPrefix);
+
+    if (!ok && aliasChecks[reqPrefix]) {
+      ok = aliasChecks[reqPrefix](concrete, mounts);
+    }
+
+    console.log(`${ok ? "✅" : "❌"} ${reqPrefix}`);
     if (!ok) missing++;
   }
+
   if (missing > 0) {
     const msg = `Route audit: ${missing} required prefix(es) missing. Check imports/mounts in app.js`;
     if (failOnMissing) {
