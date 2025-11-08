@@ -1,4 +1,3 @@
-// backend/src/routes/upload.routes.js
 /**
  * Safer Upload routes — memory/disk safe, Cloudinary streaming, robust uploads dir handling
  *
@@ -31,8 +30,9 @@ const PUBLIC_UPLOADS = String(process.env.PUBLIC_UPLOADS || "false").toLowerCase
 const DEBUG_UPLOAD = String(process.env.DEBUG_UPLOAD || "false").toLowerCase() === "true";
 
 /* ------------------------------- UPLOADS DIR ----------------------------- */
-// Prefer explicit env var; in production use /tmp/uploads to avoid writing into repo
-const DEFAULT_UPLOADS_DIR = process.env.NODE_ENV === "production" ? "/tmp/uploads" : "uploads";
+// Prefer /tmp on Render by default (project dir is read-only there)
+const isRender = !!process.env.RENDER;
+const DEFAULT_UPLOADS_DIR = isRender ? "/tmp/uploads" : "uploads";
 const UPLOADS_DIR = process.env.UPLOADS_DIR || DEFAULT_UPLOADS_DIR;
 const TEMP_DIR = path.resolve(process.cwd(), UPLOADS_DIR);
 
@@ -49,15 +49,11 @@ try {
         console.log(`[upload] Created uploads dir after renaming file: ${TEMP_DIR}`);
       } catch (e) {
         console.error(`[upload] Failed to rename file at uploads path (${TEMP_DIR}):`, e?.message || e);
-        // attempt to create unique dir instead
         const alt = `${TEMP_DIR}-${Date.now()}`;
         fs.mkdirSync(alt, { recursive: true });
         console.warn(`[upload] Created alternate uploads dir: ${alt}`);
       }
-    } else if (stat.isDirectory()) {
-      // ok
-    } else {
-      // unknown type; attempt to create dir
+    } else if (!stat.isDirectory()) {
       fs.mkdirSync(TEMP_DIR, { recursive: true });
     }
   } else {
@@ -98,7 +94,9 @@ if (USE_MEMORY_UPLOAD) storage = multer.memoryStorage();
 
 const fileFilter = (_req, file, cb) => {
   if (!ALLOWED_MIMES.has(file.mimetype)) {
-    return cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only JPG, PNG, WEBP or GIF allowed"));
+    const err = new Error("Only JPG, PNG, WEBP or GIF allowed");
+    err.status = 415;
+    return cb(err);
   }
   cb(null, true);
 };
@@ -137,7 +135,7 @@ function extractPublicId(urlOrId) {
       return null;
     }
     return s;
-  } catch (e) {
+  } catch (_e) {
     return null;
   }
 }
@@ -152,20 +150,20 @@ async function uploadBufferToCloudinary(buffer, options = {}) {
   });
 }
 
-/* ------------------------------- Routes --------------------------------- */
+const sanitizeFolder = (v) =>
+  String(v || "").replace(/[^a-zA-Z0-9/_-]/g, "").replace(/(^\/+|\/+$)/g, "") || "uploads";
 
 // convenience helper to set small CORS header for responses from this router (not a replacement for server-level CORS)
 function maybeSetCorsHeader(res, req) {
-  if (process.env.CORS_ORIGIN) {
-    // prefer request origin if allowed
-    const origin = req.headers.origin;
-    if (origin && String(process.env.CORS_ORIGIN).split(",").map(s => s.trim()).includes(origin)) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-    } else {
-      res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN);
-    }
-  }
+  if (!process.env.CORS_ORIGIN) return;
+  res.setHeader("Vary", "Origin");
+  const allowList = String(process.env.CORS_ORIGIN).split(",").map(s => s.trim());
+  const origin = req.headers.origin;
+  if (origin && allowList.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+  else res.setHeader("Access-Control-Allow-Origin", allowList[0]);
 }
+
+/* ------------------------------- Routes --------------------------------- */
 
 // health
 router.get("/ping", (_req, res) => {
@@ -173,8 +171,18 @@ router.get("/ping", (_req, res) => {
   return res.json({ ok: true, where: "upload.routes.js (safer)", timestamp: new Date().toISOString() });
 });
 
+// quick mode introspection
+router.get("/mode", (_req, res) => {
+  res.json({
+    ok: true,
+    useMemory: USE_MEMORY_UPLOAD,
+    uploadsDir: TEMP_DIR,
+    cloud: !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET),
+  });
+});
+
 function authWrapper(middlewares) {
-  if (PUBLIC_UPLOADS) return (req, res, next) => next();
+  if (PUBLIC_UPLOADS) return (_req, _res, next) => next();
   return middlewares;
 }
 
@@ -187,9 +195,14 @@ router.post("/", authWrapper([requireAuth, requireAdmin]), (req, res) => {
   upload.single("image")(req, res, async (err) => {
     maybeSetCorsHeader(res, req);
 
+    const toMB = (n) => (n / (1024 * 1024)).toFixed(1);
+
     if (err) {
       if (err.code === "LIMIT_FILE_SIZE") {
-        return res.status(413).json({ ok: false, error: `Max file size is ${MAX_FILE_SIZE_BYTES} bytes` });
+        return res.status(413).json({ ok: false, error: `Max file size is ${toMB(MAX_FILE_SIZE_BYTES)} MB` });
+      }
+      if (err.status === 415) {
+        return res.status(415).json({ ok: false, error: err.message });
       }
       if (err instanceof multer.MulterError) {
         return res.status(400).json({ ok: false, error: err.message || "Upload failed" });
@@ -199,7 +212,9 @@ router.post("/", authWrapper([requireAuth, requireAdmin]), (req, res) => {
 
     if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded (field: image)" });
 
-    const requestedFolder = (req.body && req.body.folder) || req.query?.folder || process.env.CLOUDINARY_FOLDER || "uploads";
+    const requestedFolder = sanitizeFolder(
+      (req.body && req.body.folder) || req.query?.folder || process.env.CLOUDINARY_FOLDER || "uploads"
+    );
     const hasCloudinaryCreds = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
 
     try {
@@ -246,12 +261,15 @@ router.post("/", authWrapper([requireAuth, requireAdmin]), (req, res) => {
         mimetype: req.file.mimetype,
       };
 
+      res.setHeader("Location", result.secure_url);
       if (DEBUG_UPLOAD) payload.raw = result;
       return res.status(201).json(payload);
     } catch (cloudErr) {
       console.error("[upload] upload error:", cloudErr);
       if (req.file && req.file.path) safeUnlink(req.file.path);
-      return res.status(cloudErr?.http_code || 500).json({ ok: false, error: "Cloud upload failed", details: cloudErr?.message });
+      return res
+        .status(cloudErr?.http_code || 500)
+        .json({ ok: false, error: "Cloud upload failed", details: cloudErr?.message });
     }
   });
 });
@@ -261,8 +279,13 @@ router.post("/", authWrapper([requireAuth, requireAdmin]), (req, res) => {
 router.post("/multiple", authWrapper([requireAuth, requireAdmin]), (req, res) => {
   upload.array("images", 6)(req, res, async (err) => {
     maybeSetCorsHeader(res, req);
+
+    const toMB = (n) => (n / (1024 * 1024)).toFixed(1);
+
     if (err) {
-      if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ ok: false, error: `Max file size is ${MAX_FILE_SIZE_BYTES} bytes per file` });
+      if (err.code === "LIMIT_FILE_SIZE")
+        return res.status(413).json({ ok: false, error: `Max file size is ${toMB(MAX_FILE_SIZE_BYTES)} MB per file` });
+      if (err.status === 415) return res.status(415).json({ ok: false, error: err.message });
       if (err instanceof multer.MulterError) return res.status(400).json({ ok: false, error: err.message || "Upload failed" });
       return res.status(400).json({ ok: false, error: err?.message || "Upload failed" });
     }
@@ -270,7 +293,9 @@ router.post("/multiple", authWrapper([requireAuth, requireAdmin]), (req, res) =>
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ ok: false, error: "No files uploaded (field: images[])" });
 
-    const requestedFolder = (req.body && req.body.folder) || req.query?.folder || process.env.CLOUDINARY_FOLDER || "uploads";
+    const requestedFolder = sanitizeFolder(
+      (req.body && req.body.folder) || req.query?.folder || process.env.CLOUDINARY_FOLDER || "uploads"
+    );
     const out = [];
 
     for (const f of files) {
@@ -307,11 +332,21 @@ router.delete("/:id", authWrapper([requireAuth, requireAdmin]), async (req, res)
     const { id } = req.params;
     const publicId = extractPublicId(id) || id;
     if (!publicId) return res.status(400).json({ ok: false, error: "Invalid id/url" });
-    const hasCloudinaryCreds = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
-    if (!hasCloudinaryCreds) return res.status(400).json({ ok: false, error: "Cloudinary credentials not configured" });
-    const result = await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
-    if (result.result === "not found") return res.status(404).json({ ok: false, message: "Image not found", result });
-    return res.json({ ok: true, message: "Deleted", result });
+
+    const hasCloud = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+
+    if (hasCloud) {
+      const result = await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
+      if (result.result === "not found") return res.status(404).json({ ok: false, message: "Image not found", result });
+      return res.json({ ok: true, message: "Deleted", result });
+    }
+
+    // local fallback
+    const basename = publicId.split("/").pop();
+    const localPath = path.join(TEMP_DIR, basename);
+    if (!fs.existsSync(localPath)) return res.status(404).json({ ok: false, message: "Image not found locally" });
+    safeUnlink(localPath);
+    return res.json({ ok: true, message: "Deleted (local)", file: basename });
   } catch (e) {
     console.error("[upload] delete error:", e);
     return res.status(500).json({ ok: false, error: "Failed to delete image", details: e?.message });
@@ -321,11 +356,13 @@ router.delete("/:id", authWrapper([requireAuth, requireAdmin]), async (req, res)
 /* -------------------------- Multer Error Handler ------------------------- */
 router.use((err, _req, res, next) => {
   if (process.env.CORS_ORIGIN) res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN);
+  const toMB = (n) => (n / (1024 * 1024)).toFixed(1);
+
   if (err && err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({ ok: false, error: `Max file size is ${MAX_FILE_SIZE_BYTES} bytes` });
+    return res.status(413).json({ ok: false, error: `Max file size is ${toMB(MAX_FILE_SIZE_BYTES)} MB` });
   }
-  if (err && err.name === "MulterError") {
-    return res.status(400).json({ ok: false, error: err.message });
+  if (err && (err.name === "MulterError" || err.status === 415)) {
+    return res.status(err.status || 400).json({ ok: false, error: err.message });
   }
   return next(err);
 });
