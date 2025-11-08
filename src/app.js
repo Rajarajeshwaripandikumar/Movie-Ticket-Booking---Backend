@@ -178,8 +178,15 @@ app.use("/api/superadmin", requireAuth, requireRoles("SUPER_ADMIN"), superAdminR
 // Admin (Super Admin & Theatre Admin)
 app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), adminRoutes);
 
-// Screens
-app.use("/api/screens", screensRoutes);
+/**
+ * ⬇️ IMPORTANT: Mount screensRoutes at `/api` (NOT `/api/screens`)
+ * The router defines paths beginning with `/admin/theaters/...` and `/theaters/...`
+ * so mounting here produces:
+ *   /api/admin/theaters/:theaterId/screens
+ *   /api/theaters/:theaterId/screens
+ *   /api/screens/by-theatre/:id  (kept inside router for compatibility)
+ */
+app.use("/api", screensRoutes);
 
 /* -------------------------------------------------------------------------- */
 /* 🎯 SSE STREAM TOKEN FIX FOR ANALYTICS                                      */
