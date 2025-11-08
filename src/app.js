@@ -8,6 +8,9 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 
+// ─────────────────────────────── MODELS ───────────────────────────────
+import Theater from "./models/Theater.js";
+
 // ─────────────────────────────── ROUTES ───────────────────────────────
 import authRoutes from "./routes/auth.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
@@ -137,6 +140,9 @@ app.use((req, res, next) => {
 
 /* ─────────────────────────────── ROUTES ─────────────────────────────── */
 
+// Friendly root to avoid 404 noise
+app.get("/", (_req, res) => res.send("✅ Movie Ticket Booking API is running"));
+
 // Health
 app.get("/api/health", (_req, res) =>
   res.json({
@@ -175,8 +181,32 @@ app.use("/api/profile", profileRoutes);
 // Super Admin
 app.use("/api/superadmin", requireAuth, requireRoles("SUPER_ADMIN"), superAdminRoutes);
 
-// Admin (Super Admin & Theatre Admin)
-app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), adminRoutes);
+/**
+ * Minimal list endpoint used by AdminScreens.jsx:
+ *   GET /api/admin/theaters
+ * SUPER_ADMIN → all theaters
+ * THEATRE_ADMIN / ADMIN → only their theater (via JWT theatreId/theaterId)
+ */
+app.get(
+  "/api/admin/theaters",
+  requireAuth,
+  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
+  async (req, res) => {
+    try {
+      const role = String(req.user?.role || "").toUpperCase();
+      const myId = req.user?.theatreId || req.user?.theaterId;
+      const filter = role === "SUPER_ADMIN" ? {} : (myId ? { _id: myId } : { _id: null });
+      const list = await Theater.find(filter).sort({ createdAt: -1 }).lean();
+      res.json(list);
+    } catch (e) {
+      console.error("[/api/admin/theaters] error:", e);
+      res.status(500).json({ message: "Failed to load theaters" });
+    }
+  }
+);
+
+// Admin (Super Admin, Theatre Admin, and plain Admin)
+app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"), adminRoutes);
 
 /**
  * ⬇️ IMPORTANT: Mount screensRoutes at `/api` (NOT `/api/screens`)
@@ -184,7 +214,7 @@ app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"),
  * so mounting here produces:
  *   /api/admin/theaters/:theaterId/screens
  *   /api/theaters/:theaterId/screens
- *   /api/screens/by-theatre/:id  (kept inside router for compatibility)
+ *   /api/screens/by-theatre/:id  (compat alias inside router)
  */
 app.use("/api", screensRoutes);
 
