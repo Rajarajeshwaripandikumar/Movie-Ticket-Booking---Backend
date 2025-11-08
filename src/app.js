@@ -1,3 +1,4 @@
+// backend/src/app.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -47,7 +48,7 @@ app.use(
   })
 );
 
-/* ─────────────────────────────── CORS CONFIG ─────────────────────────────── */
+/* ─────────────────────────────── CORS CONFIG (UPDATED) ─────────────────────────────── */
 const DEV_ORIGINS = [
   process.env.APP_ORIGIN || "http://localhost:5173",
   "http://127.0.0.1:5173",
@@ -58,23 +59,64 @@ const DEV_ORIGINS = [
 
 const PROD_ORIGINS = [
   "https://movieticketbooking-rajy.netlify.app",
+  // usually not required to allow your own backend as an Origin,
+  // but harmless to keep:
   "https://movie-ticket-booking-backend-o1m2.onrender.com",
   ...(process.env.APP_ORIGINS_PROD
     ? process.env.APP_ORIGINS_PROD.split(",").map((s) => s.trim()).filter(Boolean)
     : []),
 ];
 
-// De-dup
 const ALLOWED_ORIGINS = Array.from(new Set([...DEV_ORIGINS, ...PROD_ORIGINS]));
 console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // non-browser / health checks / server-to-server
+  try {
+    const u = new URL(origin);
+    const norm = `${u.protocol}//${u.host}`; // strip trailing slash
+    return ALLOWED_ORIGINS.includes(norm);
+  } catch {
+    return false;
+  }
+}
+
+// Always vary by Origin so caches don't mix CORS responses
+app.use((req, res, next) => {
+  res.setHeader("Vary", "Origin");
+  next();
+});
+
+// Strong manual preflight that mirrors the Origin and allowed headers/methods
+app.use((req, res, next) => {
+  if (req.method !== "OPTIONS") return next();
+
+  const origin = req.headers.origin || "";
+  if (!isAllowedOrigin(origin)) {
+    return res.sendStatus(403);
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Idempotency-Key, X-Intent, X-Requested-With, x-role, X-Role, Accept"
+  );
+  res.setHeader("Access-Control-Max-Age", "600"); // 10 minutes
+  return res.sendStatus(204);
+});
+
+// CORS for actual requests (must be BEFORE routes)
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    origin(origin, cb) {
+      if (isAllowedOrigin(origin)) return cb(null, true);
       console.warn("[CORS] ❌ Blocked:", origin);
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
+      return cb(new Error("Not allowed by CORS"));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
@@ -86,14 +128,12 @@ app.use(
       "X-Requested-With",
       "x-role",
       "X-Role",
+      "Accept",
     ],
-    exposedHeaders: ["Content-Length", "Content-Type"],
-    maxAge: 86400,
+    exposedHeaders: ["Content-Length", "Content-Type", "ETag"],
+    maxAge: 600,
   })
 );
-
-// Preflight handler (mirror the same allow list)
-app.options("*", cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
 /* ───────────────────────────── LOGGING & PARSERS ─────────────────────────── */
 app.use(morgan("dev"));
