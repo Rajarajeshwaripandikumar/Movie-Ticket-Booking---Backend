@@ -64,8 +64,8 @@ const PROD_ORIGINS = [
     : []),
 ];
 
-const ALLOWED_ORIGINS = [...DEV_ORIGINS, ...PROD_ORIGINS];
-
+// De-dup
+const ALLOWED_ORIGINS = Array.from(new Set([...DEV_ORIGINS, ...PROD_ORIGINS]));
 console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
 
 app.use(
@@ -77,7 +77,7 @@ app.use(
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -101,15 +101,29 @@ app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 /* ───────────────────────────── STATIC FILES ──────────────────────────────── */
-const uploadsPath = path.resolve(process.env.UPLOADS_DIR || "uploads");
-if (!fs.existsSync(uploadsPath)) fs.mkdirSync(uploadsPath, { recursive: true });
-app.use("/uploads", express.static(uploadsPath));
+// Use /tmp on Render by default (project dir is read-only there)
+const isRender = !!process.env.RENDER;
+const uploadsPath = path.resolve(
+  process.env.UPLOADS_DIR || (isRender ? "/tmp/uploads" : "uploads")
+);
 
-console.log("[app] Serving static uploads from:", uploadsPath);
 try {
-  console.log("[app] Found files:", fs.readdirSync(uploadsPath));
+  fs.mkdirSync(uploadsPath, { recursive: true });
+  const stat = fs.lstatSync(uploadsPath);
+  if (!stat.isDirectory()) throw new Error(`Not a directory: ${uploadsPath}`);
+
+  app.use(
+    "/uploads",
+    express.static(uploadsPath, { maxAge: "1d", etag: true, fallthrough: true })
+  );
+  console.log("[app] Serving static uploads from:", uploadsPath);
+  try {
+    console.log("[app] Found files:", fs.readdirSync(uploadsPath));
+  } catch (e) {
+    console.warn("[app] Cannot read uploads dir:", e.message);
+  }
 } catch (e) {
-  console.warn("[app] Cannot read uploads dir:", e.message);
+  console.warn("[app] Skipping static /uploads mount:", e.message);
 }
 
 /* ──────────────── FIX DOUBLE /api/api and THEAT(RE)RS ALIAS ─────────────── */
@@ -165,7 +179,11 @@ app.use("/api/theatres", theatersRouter); // alias
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
-app.use("/_debug", debugMailRoutes);
+
+if (process.env.NODE_ENV !== "production") {
+  app.use("/_debug", debugMailRoutes);
+}
+
 app.use("/api/orders", ordersRouter);
 
 // Pricing (protected for admins)
