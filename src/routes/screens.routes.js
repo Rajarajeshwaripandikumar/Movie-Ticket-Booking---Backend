@@ -8,12 +8,12 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { requireScopedTheatre, assertInScopeOrThrow } from "../middleware/scope.js";
 
 const router = Router();
-/** ✅ ensure server auto-mounts under /api */
+/** ✅ ensure server auto-mounts under /api (app.use("/api", screensRoutes)) */
 router.routesPrefix = "/api";
 
 // For multipart/form-data without files (just fields). JSON also works via express.json earlier.
 const parseFields = multer().none();
-const isId = (id) => mongoose.isValidObjectId(id);
+const isId = (id) => mongoose.isValidObjectId(String(id || ""));
 
 /* ----------------------------------------------------------------------------
  * ADMIN (scoped): /api/admin/theaters/:theaterId/screens[/:screenId]
@@ -34,7 +34,12 @@ router.get(
       // Scope: theatre admin must only access own theatre
       assertInScopeOrThrow(theaterId, req);
 
-      const screens = await Screen.find({ theater: theaterId }).sort({ name: 1 }).lean();
+      const screens = await Screen.find({
+        $or: [{ theater: theaterId }, { theatreId: theaterId }],
+      })
+        .sort({ name: 1 })
+        .lean();
+
       return res.json({ ok: true, data: screens });
     } catch (err) {
       console.error("[Screens] GET list error:", err);
@@ -60,22 +65,22 @@ router.post(
       if (!theater) return res.status(404).json({ ok: false, message: "Theater not found" });
 
       // Accept rows/cols; also tolerate legacy "columns" but store as cols
-      const { name, rows, cols, columns } = req.body;
+      const { name, rows, cols, columns } = req.body || {};
       const nRows = Number(rows);
       const nCols = Number(cols ?? columns);
 
       if (!name || !nRows || !nCols) {
         return res.status(400).json({ ok: false, message: "name, rows, and cols are required" });
       }
-      if (nRows <= 0 || nCols <= 0) {
+      if (!Number.isFinite(nRows) || !Number.isFinite(nCols) || nRows <= 0 || nCols <= 0) {
         return res.status(400).json({ ok: false, message: "rows and cols must be positive" });
       }
 
       const created = await Screen.create({
         name: String(name).trim(),
         rows: nRows,
-        cols: nCols, // ✅ canonical
-        theater: theaterId,
+        cols: nCols,            // ✅ canonical
+        theater: theaterId,     // ✅ canonical
       });
 
       return res.status(201).json({ ok: true, data: created });
@@ -102,7 +107,11 @@ router.get(
 
       assertInScopeOrThrow(theaterId, req);
 
-      const screen = await Screen.findOne({ _id: screenId, theater: theaterId }).lean();
+      const screen = await Screen.findOne({
+        _id: screenId,
+        $or: [{ theater: theaterId }, { theatreId: theaterId }],
+      }).lean();
+
       if (!screen) return res.status(404).json({ ok: false, message: "Screen not found" });
 
       return res.json({ ok: true, data: screen });
@@ -144,7 +153,7 @@ router.patch(
       }
 
       const updated = await Screen.findOneAndUpdate(
-        { _id: screenId, theater: theaterId },
+        { _id: screenId, $or: [{ theater: theaterId }, { theatreId: theaterId }] },
         { $set: update },
         { new: true, runValidators: true }
       ).lean();
@@ -174,7 +183,11 @@ router.delete(
 
       assertInScopeOrThrow(theaterId, req);
 
-      const deleted = await Screen.findOneAndDelete({ _id: screenId, theater: theaterId });
+      const deleted = await Screen.findOneAndDelete({
+        _id: screenId,
+        $or: [{ theater: theaterId }, { theatreId: theaterId }],
+      });
+
       if (!deleted) return res.status(404).json({ ok: false, message: "Screen not found" });
 
       return res.json({ ok: true });
@@ -195,7 +208,12 @@ router.get("/theaters/:theaterId/screens", async (req, res) => {
     const { theaterId } = req.params;
     if (!isId(theaterId)) return res.status(400).json({ ok: false, message: "Invalid theaterId" });
 
-    const screens = await Screen.find({ theater: theaterId }).sort({ name: 1 }).lean();
+    const screens = await Screen.find({
+      $or: [{ theater: theaterId }, { theatreId: theaterId }],
+    })
+      .sort({ name: 1 })
+      .lean();
+
     return res.json({ ok: true, data: screens });
   } catch (err) {
     console.error("[Screens] public list error:", err);
