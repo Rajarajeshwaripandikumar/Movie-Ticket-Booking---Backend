@@ -8,7 +8,7 @@ export const ROLE = {
   SUPER_ADMIN: "SUPER_ADMIN",
 };
 
-// ✅ FIXED
+// accepted enum values (we accept the American spelling, but normalize it)
 const ROLE_ENUM_ACCEPTED = [
   ROLE.USER,
   ROLE.THEATRE_ADMIN,
@@ -35,7 +35,7 @@ const userSchema = new mongoose.Schema(
       get: (v) => v,
     },
 
-    // ✅ YOUR REF NAME IS NOW CORRECT
+    // canonical stored field (British spelling) — keep as source-of-truth
     theatreId: { type: mongoose.Schema.Types.ObjectId, ref: "Theater", default: null },
 
     password: { type: String, required: true, select: false },
@@ -58,14 +58,44 @@ const userSchema = new mongoose.Schema(
     toJSON: {
       virtuals: true,
       transform: (_doc, ret) => {
+        // remove sensitive/internal fields
         delete ret.password;
         delete ret.__v;
+
+        // ensure both variants are present in JSON output for compatibility
+        ret.theatreId = ret.theatreId ?? ret.theaterId ?? null;
+        ret.theaterId = ret.theaterId ?? ret.theatreId ?? null;
+
         return ret;
       },
     },
-    toObject: { virtuals: true },
+    toObject: {
+      virtuals: true,
+      transform: (_doc, ret) => {
+        delete ret.password;
+        delete ret.__v;
+        ret.theatreId = ret.theatreId ?? ret.theaterId ?? null;
+        ret.theaterId = ret.theaterId ?? ret.theatreId ?? null;
+        return ret;
+      },
+    },
   }
 );
+
+/* ------------------------------ Virtuals & helpers ----------------------------- */
+
+// provide a theaterId alias (american spelling) that reads/writes the same underlying value
+userSchema.virtual("theaterId")
+  .get(function () {
+    return this.theatreId ?? this.theaterId ?? null;
+  })
+  .set(function (val) {
+    // set both to keep older clients and new code working
+    this.theatreId = val;
+    this.theaterId = val;
+  });
+
+/* ------------------------------- Password hooks -------------------------------- */
 
 userSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
@@ -88,5 +118,6 @@ userSchema.methods.compare = async function (enteredPassword) {
   return bcrypt.compare(enteredPassword, this.password);
 };
 
+/* ------------------------------- Export model ---------------------------------- */
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 export default User;
