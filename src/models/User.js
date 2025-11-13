@@ -1,3 +1,4 @@
+// backend/src/models/User.js
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 
@@ -82,18 +83,48 @@ const userSchema = new mongoose.Schema(
   }
 );
 
-/* ------------------------------ Virtuals & helpers ----------------------------- */
+/* ------------------------------ Virtuals & helpers (FIXED) ----------------------------- */
 
-// provide a theaterId alias (american spelling) that reads/writes the same underlying value
-userSchema.virtual("theaterId")
-  .get(function () {
-    return this.theatreId ?? this.theaterId ?? null;
-  })
-  .set(function (val) {
-    // set both to keep older clients and new code working
-    this.theatreId = val;
-    this.theaterId = val;
-  });
+// Safe alias virtuals for theatreId / theaterId.
+// Read/write directly from _doc to avoid invoking other virtual getters.
+
+userSchema.virtual("theaterId").get(function () {
+  try {
+    const raw = this._doc || {};
+    return raw.theatreId ?? raw.theaterId ?? null;
+  } catch {
+    return null;
+  }
+}).set(function (val) {
+  try {
+    // write canonical field and mirror onto _doc to keep in-memory shape
+    // Prefer setting canonical 'theatreId' on the document so Mongoose persistence works.
+    if (typeof this.set === "function") this.set("theatreId", val);
+    if (!this._doc) this._doc = {};
+    this._doc.theatreId = val;
+    this._doc.theaterId = val;
+  } catch (e) {
+    // noop
+  }
+});
+
+userSchema.virtual("theatreId").get(function () {
+  try {
+    const raw = this._doc || {};
+    return raw.theatreId ?? raw.theaterId ?? null;
+  } catch {
+    return null;
+  }
+}).set(function (val) {
+  try {
+    if (typeof this.set === "function") this.set("theatreId", val);
+    if (!this._doc) this._doc = {};
+    this._doc.theatreId = val;
+    this._doc.theaterId = val;
+  } catch (e) {
+    // noop
+  }
+});
 
 /* ------------------------------- Password hooks -------------------------------- */
 
@@ -115,6 +146,8 @@ userSchema.pre("findOneAndUpdate", async function (next) {
 });
 
 userSchema.methods.compare = async function (enteredPassword) {
+  // Be defensive: when this method is called on a lean object it won't exist;
+  // callers that used .lean() should use bcrypt.compare directly.
   return bcrypt.compare(enteredPassword, this.password);
 };
 
