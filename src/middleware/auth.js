@@ -1,7 +1,10 @@
 // backend/src/middleware/auth.js
 import jwt from "jsonwebtoken";
+import dotenv from "dotenv";
+dotenv.config();
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
+const AUTH_TRUST_TOKEN = (process.env.AUTH_TRUST_TOKEN || "false").toLowerCase() === "true";
 
 /* --------------------------------- Role utils -------------------------------- */
 
@@ -9,23 +12,16 @@ export const ROLE = {
   USER: "USER",
   THEATRE_ADMIN: "THEATRE_ADMIN", // canonical (UK)
   SUPER_ADMIN: "SUPER_ADMIN",
-  ADMIN: "ADMIN",                 // distinct, do NOT escalate to SUPER_ADMIN
+  ADMIN: "ADMIN", // distinct, do NOT escalate to SUPER_ADMIN
 };
 
-/**
- * Normalize a single role string to canonical values:
- * USER | THEATRE_ADMIN | ADMIN | SUPER_ADMIN
- * Accepts common aliases; never escalates ADMIN -> SUPER_ADMIN.
- */
 function normalizeRole(raw) {
   if (raw === undefined || raw === null) return ROLE.USER;
   try {
     const v = String(raw).trim().toUpperCase().replace(/\s+/g, "_");
 
-    // Common aliases without privilege escalation
     if (v === "SUPERUSER" || v === "SUPER-ADMIN") return ROLE.SUPER_ADMIN;
 
-    // Theatre admin aliases (US/UK + manager variants)
     if (
       v === "THEATER_ADMIN" ||
       v === "THEATER-MANAGER" ||
@@ -37,10 +33,8 @@ function normalizeRole(raw) {
       return ROLE.THEATRE_ADMIN;
     }
 
-    // Keep ADMIN as ADMIN (no escalation)
     if (v === "ADMIN") return ROLE.ADMIN;
 
-    // Exact known keys or fallback to given value
     if (v in ROLE) return ROLE[v];
     return v;
   } catch {
@@ -55,101 +49,125 @@ function normalizeRoleList(xs) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Helper: load authoritative user from DB (deferred import to avoid cycles)  */
+/* -------------------------------------------------------------------------- */
+async function loadUserFromDb(userId) {
+  try {
+    const User = (await import("../models/User.js")).default;
+    if (!userId) return null;
+    const u = await User.findById(userId).select("+password").lean();
+    return u || null;
+  } catch (err) {
+    console.warn("[Auth] loadUserFromDb failed:", err && err.message);
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* 🧩 Middleware: Verify JWT and attach user info                              */
 /* -------------------------------------------------------------------------- */
-export const requireAuth = (req, res, next) => {
-  // ✅ Never block CORS preflight (lets the browser proceed to the real request)
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+export const requireAuth = (opts = {}) => {
+  // support using requireAuth() or requireAuth({ forceFresh: true })
+  const { forceFresh = false } = typeof opts === "object" ? opts : {};
 
-  try {
-    let token = null;
-
-    // 1️⃣ Authorization header (Bearer)
-    const authHeader = req.headers.authorization;
-    if (authHeader && typeof authHeader === "string" && /^Bearer\s+/i.test(authHeader)) {
-      token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  return async (req, res, next) => {
+    // Never block CORS preflight
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(204);
     }
 
-    // 2️⃣ Cookie fallback (only relevant if you actually set cookies)
-    if (!token && req.cookies?.token) {
-      token = String(req.cookies.token);
+    try {
+      let token = null;
+
+      // 1) Authorization header
+      const authHeader = req.headers.authorization;
+      if (authHeader && typeof authHeader === "string" && /^Bearer\s+/i.test(authHeader)) {
+        token = authHeader.replace(/^Bearer\s+/i, "").trim();
+      }
+
+      // 2) Cookie fallback
+      if (!token && req.cookies?.token) {
+        token = String(req.cookies.token);
+      }
+
+      // 3) Query fallback (development/analytics convenience)
+      const isAnalytics = (req.baseUrl && req.baseUrl.includes("/api/analytics"));
+      const isStream = (req.path && req.path.includes("/stream"));
+      if (
+        !token &&
+        req.query?.token &&
+        (isAnalytics || isStream || process.env.NODE_ENV !== "production")
+      ) {
+        token = String(req.query.token);
+      }
+
+      if (!token) {
+        return res.status(401).json({ message: "Missing Authorization token" });
+      }
+
+      // Verify token
+      let decoded;
+      try {
+        decoded = jwt.verify(token, JWT_SECRET);
+      } catch (err) {
+        console.error("[Auth] token verify failed:", err && (err.message || err));
+        return res.status(401).json({ message: "Invalid or expired token" });
+      }
+
+      const userId = String(
+        decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId ?? decoded.user?.id ?? ""
+      );
+      if (!userId) {
+        return res.status(401).json({ message: "Token missing subject (sub/id)" });
+      }
+
+      // Prefer authoritative DB values unless explicitly trusting token
+      let dbUser = null;
+      if (!AUTH_TRUST_TOKEN || forceFresh) {
+        dbUser = await loadUserFromDb(userId);
+      }
+
+      // raw role & theatre from token
+      const rawRoleFromToken =
+        decoded.role ?? (Array.isArray(decoded.roles) ? decoded.roles[0] : null) ?? (decoded.isAdmin ? "ADMIN" : null);
+
+      const theatreFromToken =
+        decoded.theatreId ?? decoded.theatre?.id ?? decoded.theaterId ?? decoded.theater?.id ?? null;
+
+      // derive final role and theatreId (DB wins if present)
+      const finalRole = normalizeRole(dbUser?.role ?? rawRoleFromToken ?? "USER");
+      const finalTheatreId = dbUser?.theatreId ?? dbUser?.theaterId ?? theatreFromToken ?? null;
+
+      req.user = {
+        _id: userId,
+        id: userId,
+        email: dbUser?.email ?? decoded.email ?? null,
+        name: dbUser?.name ?? decoded.name ?? decoded.fullName ?? null,
+        role: finalRole, // canonical role value
+        theatreId: finalTheatreId ? String(finalTheatreId) : null,
+        theaterId: finalTheatreId ? String(finalTheatreId) : null,
+        // include a quiet flag to indicate whether values were loaded from DB
+        _fromDb: !!dbUser,
+      };
+
+      res.locals.userId = userId;
+      next();
+    } catch (err) {
+      console.error("[Auth] requireAuth error:", err && (err.message || err));
+      return res.status(401).json({ message: "Unauthorized" });
     }
-
-    // 3️⃣ Query param fallback (safe for analytics/streams; dev convenience)
-    const isAnalytics = (req.baseUrl && req.baseUrl.includes("/api/analytics"));
-    const isStream = (req.path && req.path.includes("/stream"));
-    if (
-      !token &&
-      req.query?.token &&
-      (isAnalytics || isStream || process.env.NODE_ENV !== "production")
-    ) {
-      token = String(req.query.token);
-    }
-
-    if (!token) {
-      return res.status(401).json({ message: "Missing Authorization token" });
-    }
-
-    // 🔐 Verify and decode
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    const userId = String(
-      decoded.sub ?? decoded.id ?? decoded._id ?? decoded.userId ?? decoded.user?.id ?? ""
-    );
-    if (!userId) {
-      return res.status(401).json({ message: "Token missing subject (sub/id)" });
-    }
-
-    // Derive a single canonical role
-    const rawRole =
-      decoded.role ??
-      (Array.isArray(decoded.roles) ? decoded.roles[0] : null) ??
-      (decoded.isAdmin ? "ADMIN" : "USER");
-
-    const role = normalizeRole(rawRole);
-
-    // accept both theatreId/theaterId from token, but expose both on req.user
-    const theatreId =
-      decoded.theatreId ??
-      decoded.theatre?.id ??
-      decoded.theaterId ??
-      decoded.theater?.id ??
-      null;
-
-    req.user = {
-      _id: userId,
-      id: userId,
-      email: decoded.email || null,
-      name: decoded.name || decoded.fullName || null,
-      role,                                      // USER | THEATRE_ADMIN | ADMIN | SUPER_ADMIN
-      theatreId: theatreId ? String(theatreId) : null,
-      theaterId: theatreId ? String(theatreId) : null,
-    };
-
-    // convenient local
-    res.locals.userId = userId;
-
-    next();
-  } catch (err) {
-    console.error("[Auth] Invalid token:", err && (err.message || err));
-    return res.status(401).json({ message: "Invalid or expired token" });
-  }
+  };
 };
 
 /* -------------------------------------------------------------------------- */
 /* 🛡️ Middleware: Require specific roles                                       */
-/* Accepts either multiple args or a single array                              */
 /* -------------------------------------------------------------------------- */
 export const requireRoles = (...allowedArgs) => {
   const allowed = Array.isArray(allowedArgs[0]) ? allowedArgs[0] : allowedArgs;
   const normalizedAllowed = normalizeRoleList(allowed);
 
   return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({ message: "Unauthorized (no user)" });
-    }
+    if (!req.user) return res.status(401).json({ message: "Unauthorized (no user)" });
     const have = normalizeRole(req.user.role);
     if (!normalizedAllowed.includes(have)) {
       console.warn("[Auth] Access denied for role:", have, "allowed:", normalizedAllowed);
@@ -161,15 +179,12 @@ export const requireRoles = (...allowedArgs) => {
 
 /* -------------------------------------------------------------------------- */
 /* 🎭 Middleware: Require theatre ownership                                    */
-/* THEATRE_ADMIN can only manage their own theatre; SUPER_ADMIN bypasses       */
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
-  // Collect possible theatre identifiers from params/body/query (both spellings),
-  // and also accept generic `:id` used by routes like /theaters/:id[/screens]
   const targetTheatreId =
     req.params?.theatreId ??
     req.params?.theaterId ??
-    req.params?.id ??                    // <- important for /theaters/:id
+    req.params?.id ??
     req.body?.theatreId ??
     req.body?.theaterId ??
     req.body?.theatre ??
@@ -182,13 +197,9 @@ export const requireTheatreOwnership = (req, res, next) => {
 
   const role = normalizeRole(req.user?.role);
 
-  // SUPER_ADMIN can manage any theatre
   if (role === ROLE.SUPER_ADMIN) return next();
 
-  // If you want plain ADMIN to bypass ownership too, uncomment:
-  // if (role === ROLE.ADMIN) return next();
-
-  // THEATRE_ADMIN must have a theatreId and match target
+  // THEATRE_ADMIN must match their theatreId
   const myId = req.user?.theatreId || req.user?.theaterId || null;
   if (
     role === ROLE.THEATRE_ADMIN &&
@@ -203,12 +214,8 @@ export const requireTheatreOwnership = (req, res, next) => {
 };
 
 /* -------------------------------------------------------------------------- */
-/* Backwards-compatible aliases and convenience guards                         */
+/* Convenience guards                                                          */
 /* -------------------------------------------------------------------------- */
-
-// Any admin flavour (SUPER_ADMIN or THEATRE_ADMIN) + plain ADMIN
 export const requireAdmin = requireRoles(ROLE.SUPER_ADMIN, ROLE.THEATRE_ADMIN, ROLE.ADMIN);
-
-// Explicit guards
 export const requireSuperAdmin = requireRoles(ROLE.SUPER_ADMIN);
 export const requireTheatreAdmin = requireRoles(ROLE.THEATRE_ADMIN);
