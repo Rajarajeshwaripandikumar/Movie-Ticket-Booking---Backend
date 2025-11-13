@@ -36,7 +36,7 @@ const userSchema = new mongoose.Schema(
       get: (v) => v,
     },
 
-    // canonical stored field (British spelling) — keep as source-of-truth
+    // canonical stored field (British spelling) — keep as the real schema path
     theatreId: { type: mongoose.Schema.Types.ObjectId, ref: "Theater", default: null },
 
     password: { type: String, required: true, select: false },
@@ -64,6 +64,7 @@ const userSchema = new mongoose.Schema(
         delete ret.__v;
 
         // ensure both variants are present in JSON output for compatibility
+        // prefer canonical theatreId (real path), but expose both keys
         ret.theatreId = ret.theatreId ?? ret.theaterId ?? null;
         ret.theaterId = ret.theaterId ?? ret.theatreId ?? null;
 
@@ -85,11 +86,12 @@ const userSchema = new mongoose.Schema(
 
 /* ------------------------------ Virtuals & helpers (FIXED) ----------------------------- */
 
-// Safe alias virtuals for theatreId / theaterId.
-// Read/write directly from _doc to avoid invoking other virtual getters.
+// Only create the alias virtual "theaterId" (american spelling).
+// DO NOT create a virtual called "theatreId" because that's a real path in the schema.
 
 userSchema.virtual("theaterId").get(function () {
   try {
+    // read underlying raw fields only (avoid invoking other virtuals)
     const raw = this._doc || {};
     return raw.theatreId ?? raw.theaterId ?? null;
   } catch {
@@ -98,25 +100,6 @@ userSchema.virtual("theaterId").get(function () {
 }).set(function (val) {
   try {
     // write canonical field and mirror onto _doc to keep in-memory shape
-    // Prefer setting canonical 'theatreId' on the document so Mongoose persistence works.
-    if (typeof this.set === "function") this.set("theatreId", val);
-    if (!this._doc) this._doc = {};
-    this._doc.theatreId = val;
-    this._doc.theaterId = val;
-  } catch (e) {
-    // noop
-  }
-});
-
-userSchema.virtual("theatreId").get(function () {
-  try {
-    const raw = this._doc || {};
-    return raw.theatreId ?? raw.theaterId ?? null;
-  } catch {
-    return null;
-  }
-}).set(function (val) {
-  try {
     if (typeof this.set === "function") this.set("theatreId", val);
     if (!this._doc) this._doc = {};
     this._doc.theatreId = val;
@@ -146,8 +129,8 @@ userSchema.pre("findOneAndUpdate", async function (next) {
 });
 
 userSchema.methods.compare = async function (enteredPassword) {
-  // Be defensive: when this method is called on a lean object it won't exist;
-  // callers that used .lean() should use bcrypt.compare directly.
+  // Defensive: if called on a lean object this method won't exist; callers who used .lean()
+  // should instead call bcrypt.compare directly against the hash.
   return bcrypt.compare(enteredPassword, this.password);
 };
 
