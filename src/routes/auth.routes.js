@@ -112,11 +112,16 @@ async function handleAdminLogin(req, res) {
 
     if (!email || !password) return res.status(400).json({ message: "Email and password required" });
 
-    // read hashed password field and role as lean object for speed
-    const user = await User.findOne({ email }).select("+password").lean(false);
+    // fetch plain object with password hash to avoid running virtual getters
+    const user = await User.findOne({ email }).select("+password").lean();
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
     const userRole = normalizeRole(user.role);
+
+    // debug log in non-prod to aid troubleshooting
+    if (process.env.NODE_ENV !== "production") {
+      console.debug("[ADMIN_LOGIN] attempt:", { email, role: userRole });
+    }
 
     // Only admins allowed here
     const adminRoles = [ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN];
@@ -124,14 +129,8 @@ async function handleAdminLogin(req, res) {
       return res.status(403).json({ message: "Admins only" });
     }
 
-    // compare password safely — if user was returned by .lean(false) it's still a Document with methods
-    let match = false;
-    if (typeof user.compare === "function") {
-      match = await user.compare(password);
-    } else {
-      // fallback: use bcrypt compare with the selected password hash
-      match = await bcrypt.compare(password, user.password || "");
-    }
+    // Compare using bcrypt directly against the stored hash (user is a POJO)
+    const match = await bcrypt.compare(password, user.password || "");
     if (!match) return res.status(401).json({ message: "Incorrect password" });
 
     // sign token using canonical role (keep original stored role but normalized in token)
@@ -195,7 +194,8 @@ router.post("/login", async (req, res) => {
     const password = req.body?.password;
     if (!email || !password) return res.status(400).json({ message: "Email and password required" });
 
-    const user = await User.findOne({ email }).select("+password");
+    // use lean to avoid virtuals being evaluated during auth; compare with bcrypt
+    const user = await User.findOne({ email }).select("+password").lean();
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
     const userRole = normalizeRole(user.role);
@@ -203,7 +203,7 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({ message: "Admins must login from /admin/login" });
     }
 
-    const match = await user.compare(password);
+    const match = await bcrypt.compare(password, user.password || "");
     if (!match) return res.status(401).json({ message: "Incorrect password" });
 
     const token = signToken(user);
