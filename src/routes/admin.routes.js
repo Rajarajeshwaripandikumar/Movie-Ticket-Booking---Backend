@@ -1,3 +1,4 @@
+// routes/admin.routes.js — FULL MERGED (drop-in) with aliases and resilient endpoints
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
@@ -16,10 +17,37 @@ import Booking from "../models/Booking.js";
 import moviesRouter from "./movies.routes.js";
 
 const router = Router();
-router.routesPrefix = "/api/admin";              // ✅ ensure mounted at /api/admin
+router.routesPrefix = "/api/admin"; // ensure mounted at /api/admin
 const isId = (id) => mongoose.isValidObjectId(id);
 
 const ADMIN_ROLES = ["SUPER_ADMIN", "THEATRE_ADMIN", "THEATER_ADMIN"];
+
+/* ------------------------- Helper: unified theatre list ------------------------- */
+async function handleListTheatres(req, res) {
+  try {
+    const wantAll = String(req.query.all || "").toLowerCase() === "true";
+
+    // SUPER_ADMIN gets everything (and can request all with ?all=true)
+    if (req.user.role === "SUPER_ADMIN") {
+      const all = await Theater.find({}).sort({ createdAt: -1 }).lean();
+      return res.json(all);
+    }
+
+    // Theatre admin -> return only their theatre (as array for frontend compatibility)
+    const theatreId = req.user.theatreId;
+    if (!theatreId || !isId(theatreId)) {
+      return res
+        .status(422)
+        .json({ message: "This admin is not linked to any theatre (missing theatreId)" });
+    }
+
+    const own = await Theater.find({ _id: theatreId }).lean();
+    return res.json(own);
+  } catch (err) {
+    console.error("handleListTheatres error:", err);
+    res.status(500).json({ message: "Failed to load theatres" });
+  }
+}
 
 /* ------------------------- DEBUG / USER PROFILE -------------------------- */
 router.get("/debug/me", requireAuth, (req, res) => res.json({ user: req.user }));
@@ -41,7 +69,24 @@ router.get("/me", requireAuth, requireRoles(...ADMIN_ROLES), async (req, res) =>
 });
 
 /* ------------------------------ MOVIES CRUD ------------------------------ */
+/* mount canonical movies router (keeps existing behavior) */
 router.use("/movies", requireAuth, requireRoles(...ADMIN_ROLES), moviesRouter);
+
+/* ---- MOVIES ALIASES (make frontend candidate endpoints work) ---- */
+const movieAliases = [
+  "/movies/admin",
+  "/movies/admin/list",
+  "/movies/list",
+  "/movies/mine",
+  "/api/movies/admin",
+  "/api/movies/admin/list",
+  "/api/movies/list",
+];
+
+for (const alias of movieAliases) {
+  // mount moviesRouter on each alias path with same middlewares
+  router.use(alias, requireAuth, requireRoles(...ADMIN_ROLES), moviesRouter);
+}
 
 /* --------------------------- THEATRE ADMINS CRUD ------------------------- */
 router.get(
@@ -68,7 +113,8 @@ router.get(
           createdAt: a.createdAt,
         }))
       );
-    } catch {
+    } catch (e) {
+      console.error("theatre-admins error:", e);
       res.status(500).json({ message: "Failed to load theatre admins" });
     }
   }
@@ -114,7 +160,8 @@ router.post(
           : null,
         createdAt: doc.createdAt,
       });
-    } catch {
+    } catch (e) {
+      console.error("create theatre-admin error:", e);
       res.status(500).json({ message: "Failed to create theatre admin" });
     }
   }
@@ -136,46 +183,39 @@ router.post(
 
       const theatre = await Theater.create({ name: name.trim(), city: city.trim(), address: address?.trim() });
       res.status(201).json(theatre);
-    } catch {
+    } catch (err) {
+      console.error("create theater error:", err);
       res.status(500).json({ message: "Failed to create theatre" });
     }
   }
 );
 
 // List theatres (role-aware) + supports ?all=true
+// Keep original route for backward compatibility
 router.get(
   "/theaters",
   requireAuth,
   requireRoles(...ADMIN_ROLES),
-  async (req, res) => {
-    try {
-      const wantAll = String(req.query.all || "").toLowerCase() === "true";
-
-      if (req.user.role === "SUPER_ADMIN" && wantAll) {
-        const all = await Theater.find({}).sort({ createdAt: -1 }).lean();
-        return res.json(all);
-      }
-
-      if (req.user.role === "SUPER_ADMIN") {
-        const all = await Theater.find({}).sort({ createdAt: -1 }).lean();
-        return res.json(all);
-      }
-
-      // THEATRE/THEATER ADMIN
-      const theatreId = req.user.theatreId;
-      if (!theatreId || !isId(theatreId)) {
-        return res
-          .status(422)
-          .json({ message: "This admin is not linked to any theatre (missing theatreId)" });
-      }
-
-      const own = await Theater.find({ _id: theatreId }).sort({ createdAt: -1 }).lean();
-      return res.json(own);
-    } catch {
-      res.status(500).json({ message: "Failed to load theatres" });
-    }
-  }
+  handleListTheatres
 );
+
+/* ---- THEATRES ALIASES (for frontend trying multiple spellings/paths) ---- */
+const theatreAliases = [
+  "/theatres",
+  "/theater",
+  "/theatres/admin/theatres",
+  "/theaters/admin/theaters",
+  "/theaters/admin/list",
+  "/theatres/admin/list",
+  "/api/theaters/admin/theaters",
+  "/api/theatres/admin/theatres",
+  "/theatres/mine",
+  "/theaters/mine",
+];
+
+for (const alias of theatreAliases) {
+  router.get(alias, requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+}
 
 // Distinct options for dropdowns
 router.get(
@@ -195,7 +235,8 @@ router.get(
       ]);
 
       res.json({ names, cities, addresses });
-    } catch {
+    } catch (err) {
+      console.error("theaters/options error:", err);
       res.status(500).json({ message: "Failed to load theatre options" });
     }
   }
@@ -212,7 +253,8 @@ router.get(
       const theatre = await Theater.findById(req.params.id).lean();
       if (!theatre) return res.status(404).json({ message: "Theatre not found" });
       res.json(theatre);
-    } catch {
+    } catch (err) {
+      console.error("get theater by id error:", err);
       res.status(500).json({ message: "Failed to load theatre" });
     }
   }
@@ -225,19 +267,24 @@ router.post(
   requireRoles(...ADMIN_ROLES),
   requireTheatreOwnership,
   async (req, res) => {
-    const { name, rows, cols, columns } = req.body;
-    const R = Number(rows);
-    const C = Number(cols ?? columns);
-    if (!name || !R || !C) return res.status(400).json({ message: "Invalid input" });
+    try {
+      const { name, rows, cols, columns } = req.body;
+      const R = Number(rows);
+      const C = Number(cols ?? columns);
+      if (!name || !R || !C) return res.status(400).json({ message: "Invalid input" });
 
-    const screen = await Screen.create({
-      theater: req.params.id,
-      name: String(name).trim(),
-      rows: R,
-      columns: C,
-    });
+      const screen = await Screen.create({
+        theater: req.params.id,
+        name: String(name).trim(),
+        rows: R,
+        columns: C,
+      });
 
-    res.status(201).json(screen);
+      res.status(201).json(screen);
+    } catch (err) {
+      console.error("create screen error:", err);
+      res.status(500).json({ message: "Failed to create screen" });
+    }
   }
 );
 
@@ -247,9 +294,42 @@ router.get(
   requireRoles(...ADMIN_ROLES),
   requireTheatreOwnership,
   async (req, res) => {
-    res.json(await Screen.find({ theater: req.params.id }).sort({ createdAt: -1 }).lean());
+    try {
+      const items = await Screen.find({ theater: req.params.id }).sort({ createdAt: -1 }).lean();
+      res.json(items);
+    } catch (err) {
+      console.error("list screens error:", err);
+      res.status(500).json({ message: "Failed to load screens" });
+    }
   }
 );
+
+/* ---- SCREEN ALIASES (frontend expectations) ---- */
+const screenAliases = [
+  "/screens/by-theatre/:id",
+  "/api/screens/by-theatre/:id",
+  "/theatres/:id/screens",
+  "/theaters/:id/screen",
+];
+
+for (const alias of screenAliases) {
+  router.get(
+    alias,
+    requireAuth,
+    requireRoles(...ADMIN_ROLES),
+    requireTheatreOwnership,
+    async (req, res) => {
+      try {
+        const id = req.params.id;
+        const items = await Screen.find({ theater: id }).lean();
+        res.json(items);
+      } catch (err) {
+        console.error("screen alias error:", err);
+        res.status(500).json({ message: "Failed to load screens" });
+      }
+    }
+  );
+}
 
 /* ---------------------------- SHOWTIMES / REPORTS ------------------------ */
 router.get(
@@ -257,11 +337,37 @@ router.get(
   requireAuth,
   requireRoles(...ADMIN_ROLES),
   async (req, res) => {
-    const filter = {};
-    if (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") {
-      filter.theater = req.user.theatreId;
+    try {
+      const filter = {};
+      if (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") {
+        filter.theater = req.user.theatreId;
+      }
+      const shows = await Showtime.find(filter).populate("movie theater screen").lean();
+      res.json(shows);
+    } catch (err) {
+      console.error("list showtimes error:", err);
+      res.status(500).json({ message: "Failed to load showtimes" });
     }
-    res.json(await Showtime.find(filter).populate("movie theater screen").lean());
+  }
+);
+
+/* ---- showtimes/my-theatre alias (frontend uses this) ---- */
+router.get(
+  "/showtimes/my-theatre",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  async (req, res) => {
+    try {
+      const theatreId = req.user.theatreId;
+      if (!theatreId) return res.json([]);
+      const shows = await Showtime.find({ theater: theatreId })
+        .populate("movie theater screen")
+        .lean();
+      res.json(shows);
+    } catch (err) {
+      console.error("showtimes/my-theatre error:", err);
+      res.status(500).json({ message: "Failed to load showtimes" });
+    }
   }
 );
 
@@ -286,10 +392,64 @@ router.get(
 
       const revenue = filtered.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
       res.json({ count: filtered.length, revenue, bookings: filtered });
-    } catch {
+    } catch (err) {
+      console.error("reports error:", err);
       res.status(500).json({ message: "Failed to generate report" });
     }
   }
 );
 
+/* ---------------------------- NOTIFICATIONS (alias) ----------------------- */
+/* frontend expects /notifications/mine (nav polls it) — resolve dynamically */
+router.get(
+  "/notifications/mine",
+  requireAuth,
+  async (req, res) => {
+    try {
+      let NotificationModel = null;
+      if (mongoose.modelNames().includes("Notification")) {
+        NotificationModel = mongoose.model("Notification");
+      }
+
+      if (!NotificationModel) {
+        // no notification model present — return empty safe shape
+        return res.json({ unread: 0, notifications: [] });
+      }
+
+      const notifs = await NotificationModel.find({ user: req.user._id }).sort({ createdAt: -1 }).lean();
+      const unread = notifs.filter(n => !n.readAt).length;
+      return res.json({ unread, notifications: notifs });
+    } catch (err) {
+      console.error("notifications/mine error:", err);
+      return res.json({ unread: 0, notifications: [] });
+    }
+  }
+);
+
+/* ---------------------------- Backwards-compatible aliases ----------------- */
+/* Some frontends try many variants — return handled responses where possible */
+
+/* Generic alias mapping for theatre-list & movies already added above.
+   For convenience, also expose /admin/theaters and /admin/theatres to same handlers. */
+
+router.get("/admin/theaters", requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+router.get("/admin/theatres", requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+
+/* Also accept /theatres/admin/theatres and similar (ensures frontend tries succeed) */
+router.get("/theatres/admin/theatres", requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+router.get("/theaters/admin/theaters", requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+
+/* If you prefer to expose plain /theaters (public) for quick testing, we can return all for super-admins
+   and a 403 for others. Keep as-is or adjust to your security model. */
+router.get("/theaters/public", async (req, res) => {
+  try {
+    const all = await Theater.find({}).lean();
+    res.json(all);
+  } catch (err) {
+    console.error("theaters/public error:", err);
+    res.status(500).json({ message: "Failed to load theatres" });
+  }
+});
+
+/* ---------------------------- Export router ------------------------------- */
 export default router;
