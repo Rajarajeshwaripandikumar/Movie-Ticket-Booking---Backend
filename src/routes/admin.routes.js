@@ -451,5 +451,298 @@ router.get("/theaters/public", async (req, res) => {
   }
 });
 
+/* ---------------------------- SHOWTIME CRUD & SEATS ------------------------ */
+/**
+ * Routes added:
+ *  POST   /showtimes
+ *  PUT    /showtimes/:id
+ *  DELETE /showtimes/:id
+ *  GET    /screens/:id/showtimes      (admin + aliases)
+ *  GET    /showtimes/:id/seats
+ *
+ * Notes:
+ * - Seats are stored inline on the Showtime document as `seats: [{ row, col, status }]`
+ * - If rows/cols are not provided on create, we fall back to the referenced Screen's rows/columns.
+ * - THEATRE_ADMIN users are restricted to operate on showtimes/screens for their theatre only.
+ */
+
+function generateSeats(rows, cols, existingSeats = []) {
+  const seats = [];
+  // map existing BOOKED seats for preservation when resizing
+  const bookedSet = new Set(
+    (existingSeats || [])
+      .filter((s) => s && s.status === "BOOKED")
+      .map((s) => `${s.row}:${s.col}`)
+  );
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const key = `${r}:${c}`;
+      seats.push({
+        row: r,
+        col: c,
+        status: bookedSet.has(key) ? "BOOKED" : "AVAILABLE",
+      });
+    }
+  }
+  return seats;
+}
+
+router.post(
+  "/showtimes",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  async (req, res) => {
+    try {
+      const payload = req.body || {};
+
+      // Accept either screenId or screen
+      const screenId = payload.screenId || payload.screen || payload.screen_id;
+      if (!screenId || !isId(screenId)) {
+        return res.status(400).json({ message: "screenId required" });
+      }
+
+      // load screen to derive theatre/rows/cols if needed
+      const screen = await Screen.findById(screenId).lean();
+      if (!screen) return res.status(404).json({ message: "Screen not found" });
+
+      // Ownership: theatre-admin may only create for their own theatre
+      if (
+        (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") &&
+        String(req.user.theatreId) !== String(screen.theater)
+      ) {
+        return res.status(403).json({ message: "Not allowed to create showtime for this theatre" });
+      }
+
+      const rows = Number(payload.rows ?? payload.R ?? screen.rows ?? 8);
+      const cols = Number(payload.cols ?? payload.columns ?? screen.columns ?? 12);
+
+      const showtimeDoc = {
+        movie: payload.movie || payload.movieId || payload.movieId ?? null,
+        movieTitle: payload.movieTitle || payload.movie_title || payload.movieName || null,
+        theater: payload.theater || payload.theatre || screen.theater,
+        screen: screen._id,
+        screenId: screen._id,
+        startsAt: payload.startsAt ? new Date(payload.startsAt) : payload.startsAt,
+        price: payload.price ?? 0,
+        rows,
+        cols,
+        seats: Array.isArray(payload.seats) ? payload.seats : generateSeats(rows, cols, payload.seats),
+        meta: payload.meta ?? {},
+      };
+
+      const created = await Showtime.create(showtimeDoc);
+
+      const ret = await Showtime.findById(created._id)
+        .populate("movie theater screen")
+        .lean();
+
+      res.status(201).json(ret);
+    } catch (err) {
+      console.error("create showtime error:", err);
+      res.status(500).json({ message: "Failed to create showtime" });
+    }
+  }
+);
+
+router.put(
+  "/showtimes/:id",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid showtime id" });
+
+      const existing = await Showtime.findById(id);
+      if (!existing) return res.status(404).json({ message: "Showtime not found" });
+
+      // Ownership enforcement for theatre admins
+      if (
+        (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") &&
+        String(req.user.theatreId) !== String(existing.theater)
+      ) {
+        return res.status(403).json({ message: "Not allowed to edit this showtime" });
+      }
+
+      const body = req.body || {};
+
+      // determine new rows/cols if provided (or fall back to existing)
+      const newRows = body.rows !== undefined ? Number(body.rows) : existing.rows;
+      const newCols = body.cols !== undefined ? Number(body.cols) : existing.cols;
+
+      // If seats were sent explicitly, use them. Otherwise, if grid size changed, regenerate preserving BOOKED seats.
+      let newSeats = null;
+      if (Array.isArray(body.seats)) {
+        newSeats = body.seats;
+      } else if (newRows !== existing.rows || newCols !== existing.cols) {
+        // preserve BOOKED seats where within bounds
+        newSeats = generateSeats(newRows, newCols, existing.seats || []);
+      } else {
+        // leave as-is (no change)
+        newSeats = existing.seats;
+      }
+
+      // build update object
+      const update = {
+        movie: body.movie ?? existing.movie,
+        movieTitle: body.movieTitle ?? existing.movieTitle,
+        startsAt: body.startsAt ? new Date(body.startsAt) : existing.startsAt,
+        price: body.price !== undefined ? body.price : existing.price,
+        rows: newRows,
+        cols: newCols,
+        seats: newSeats,
+        updatedAt: new Date(),
+      };
+
+      // If screen is being changed, validate screen and theatre ownership
+      if (body.screenId || body.screen) {
+        const sId = body.screenId || body.screen;
+        if (!isId(sId)) return res.status(400).json({ message: "Invalid screen id" });
+        const screen = await Screen.findById(sId).lean();
+        if (!screen) return res.status(404).json({ message: "Screen not found" });
+        // ensure theatre-admin cannot assign to another theatre
+        if (
+          (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") &&
+          String(req.user.theatreId) !== String(screen.theater)
+        ) {
+          return res.status(403).json({ message: "Not allowed to assign showtime to that screen" });
+        }
+
+        update.screen = screen._id;
+        update.theater = screen.theater;
+      }
+
+      await Showtime.findByIdAndUpdate(id, update, { new: true });
+
+      const ret = await Showtime.findById(id).populate("movie theater screen").lean();
+      res.json(ret);
+    } catch (err) {
+      console.error("update showtime error:", err);
+      res.status(500).json({ message: "Failed to update showtime" });
+    }
+  }
+);
+
+router.delete(
+  "/showtimes/:id",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid showtime id" });
+
+      const existing = await Showtime.findById(id).lean();
+      if (!existing) return res.status(404).json({ message: "Showtime not found" });
+
+      if (
+        (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") &&
+        String(req.user.theatreId) !== String(existing.theater)
+      ) {
+        return res.status(403).json({ message: "Not allowed to delete this showtime" });
+      }
+
+      await Showtime.findByIdAndDelete(id);
+      res.json({ message: "Deleted" });
+    } catch (err) {
+      console.error("delete showtime error:", err);
+      res.status(500).json({ message: "Failed to delete showtime" });
+    }
+  }
+);
+
+/* ------------------- List showtimes by screen (admin-facing) --------------- */
+router.get(
+  "/screens/:id/showtimes",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  requireTheatreOwnership,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid screen id" });
+
+      const items = await Showtime.find({ screen: id }).populate("movie theater screen").sort({ startsAt: 1 }).lean();
+      res.json(items);
+    } catch (err) {
+      console.error("screens/:id/showtimes error:", err);
+      res.status(500).json({ message: "Failed to load showtimes for screen" });
+    }
+  }
+);
+
+/* ---- Backwards-compatible aliases for screen showtimes ---- */
+const showtimeScreenAliases = [
+  "/screens/:id/showtimes",
+  "/api/screens/:id/showtimes",
+  "/theatres/:id/showtimes",
+  "/theaters/:id/showtimes",
+  "/admin/screens/:id/showtimes",
+];
+
+for (const alias of showtimeScreenAliases) {
+  router.get(
+    alias,
+    requireAuth,
+    requireRoles(...ADMIN_ROLES),
+    requireTheatreOwnership,
+    async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!isId(id)) return res.status(400).json({ message: "Invalid screen id" });
+        const items = await Showtime.find({ screen: id }).populate("movie theater screen").lean();
+        res.json(items);
+      } catch (err) {
+        console.error("showtime alias error:", err);
+        res.status(500).json({ message: "Failed to load showtimes" });
+      }
+    }
+  );
+}
+
+/* -------------------------- Seats endpoint ------------------------------- */
+router.get(
+  "/showtimes/:id/seats",
+  requireAuth,
+  requireRoles(...ADMIN_ROLES),
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!isId(id)) return res.status(400).json({ message: "Invalid showtime id" });
+
+      const st = await Showtime.findById(id).lean();
+      if (!st) return res.status(404).json({ message: "Showtime not found" });
+
+      // theatre-admin protection: only allow if admin owns the theatre
+      if (
+        (req.user.role === "THEATRE_ADMIN" || req.user.role === "THEATER_ADMIN") &&
+        String(req.user.theatreId) !== String(st.theater)
+      ) {
+        return res.status(403).json({ message: "Not allowed to view seats for this showtime" });
+      }
+
+      const rows = st.rows || st.R || 8;
+      const cols = st.cols || st.columns || 12;
+
+      const seats = Array.isArray(st.seats) && st.seats.length
+        ? st.seats
+        : generateSeats(rows, cols, []);
+
+      return res.json({ id: st._id, rows, cols, seats });
+    } catch (err) {
+      console.error("showtime seats error:", err);
+      res.status(500).json({ message: "Failed to load seats" });
+    }
+  }
+);
+
+/* ---------------------------- Backwards-compatible aliases ----------------- */
+/* Some frontends try many variants — return handled responses where possible */
+/* (redundant aliases above already cover many cases; keep these for extra resilience) */
+
+router.get("/admin/theaters", requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+router.get("/admin/theatres", requireAuth, requireRoles(...ADMIN_ROLES), handleListTheatres);
+
 /* ---------------------------- Export router ------------------------------- */
 export default router;
