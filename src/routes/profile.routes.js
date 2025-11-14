@@ -1,3 +1,4 @@
+// backend/src/routes/profile.routes.js
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import User from "../models/User.js";
@@ -43,11 +44,23 @@ const updateProfile = async (req, res) => {
     const uid = req.user?._id || req.user?.id || req.user?.sub;
     if (!uid) return res.status(401).json({ message: "Unauthorized" });
 
-    const { name, phone, preferences } = req.body || {};
+    const { name, phone, preferences, email } = req.body || {};
     const updates = {};
     if (typeof name === "string") updates.name = name.trim();
     if (typeof phone === "string") updates.phone = phone.trim();
     if (preferences && typeof preferences === "object") updates.preferences = preferences;
+
+    if (typeof email === "string") {
+      const e = email.trim().toLowerCase();
+      // make sure email isn't used by someone else
+      const exists = await User.findOne({ email: e, _id: { $ne: uid } }).lean();
+      if (exists) return res.status(409).json({ message: "Email already in use" });
+      updates.email = e;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "Nothing to update" });
+    }
 
     const updatedUser = await User.findByIdAndUpdate(
       uid,
@@ -67,7 +80,7 @@ const updateProfile = async (req, res) => {
 /*                             Profile CRUD routes                            */
 /* -------------------------------------------------------------------------- */
 
-// ✅ Support both `/api/profile` and `/api/profile/me`
+// Support both `/api/profile` and `/api/profile/me`
 router.get("/", getProfile);
 router.get("/me", getProfile);
 
@@ -78,7 +91,7 @@ router.put("/me", updateProfile);
 /*                             Booking management                             */
 /* -------------------------------------------------------------------------- */
 
-// ✅ POST /api/profile/bookings → append booking history
+// POST /api/profile/bookings → append booking history
 router.post("/bookings", async (req, res) => {
   try {
     const uid = req.user?._id || req.user?.id || req.user?.sub;
@@ -97,11 +110,18 @@ router.post("/bookings", async (req, res) => {
       bookedAt: booking.bookedAt ? new Date(booking.bookedAt) : new Date(),
     };
 
-    await User.findByIdAndUpdate(uid, { $push: { bookings: normalized } });
+    const updated = await User.findByIdAndUpdate(
+      uid,
+      { $push: { bookings: normalized } },
+      { new: true, select: "bookings" }
+    ).lean();
+
+    if (!updated) return res.status(404).json({ message: "User not found" });
 
     res.status(201).json({
       message: "Added to booking history",
       booking: normalized,
+      bookings: updated.bookings || [],
     });
   } catch (err) {
     console.error("[Profile] POST /bookings error:", err);
@@ -109,7 +129,7 @@ router.post("/bookings", async (req, res) => {
   }
 });
 
-// ✅ GET /api/profile/bookings → return user bookings
+// GET /api/profile/bookings → return user bookings
 router.get("/bookings", async (req, res) => {
   try {
     const uid = req.user?._id || req.user?.id || req.user?.sub;
@@ -129,7 +149,7 @@ router.get("/bookings", async (req, res) => {
 /*                          Change password (secured)                         */
 /* -------------------------------------------------------------------------- */
 
-// ✅ POST /api/profile/change-password
+// POST /api/profile/change-password
 router.post("/change-password", async (req, res) => {
   try {
     const uid = req.user?._id || req.user?.id || req.user?.sub;
@@ -165,4 +185,9 @@ router.post("/change-password", async (req, res) => {
   }
 });
 
+/* -------------------------------------------------------------------------- */
+/*                            Module metadata                                  */
+/* -------------------------------------------------------------------------- */
+
+router.routesPrefix = "/api/profile";
 export default router;
