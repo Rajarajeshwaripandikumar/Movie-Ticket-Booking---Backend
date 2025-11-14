@@ -44,10 +44,7 @@ function normalizeCastInput(inputArr) {
       }
       if (typeof entry === "object") {
         const name =
-          entry.name ??
-          entry.actorName ??
-          (entry.actor && (entry.actor.name || entry.actor.fullName)) ??
-          "";
+          entry.name ?? entry.actorName ?? (entry.actor && (entry.actor.name || entry.actor.fullName)) ?? "";
         const character = entry.character ?? entry.role ?? "";
         const cleanName = typeof name === "string" ? name.trim() : String(name);
         return cleanName ? { name: cleanName, character: String(character ?? "").trim() } : null;
@@ -91,11 +88,21 @@ const SubPerson = new Schema(
 
 const MovieSchema = new Schema(
   {
-    title: { type: String, required: true, trim: true },
-    description: { type: String, default: "" },
+    title: { type: String, required: true, trim: true, maxlength: 300 },
+    description: { type: String, default: "", maxlength: 5000 },
 
     // support both singular & plural naming used across front/back
-    genres: { type: [String], default: [] },
+    genres: {
+      type: [String],
+      default: [],
+      set: function (v) {
+        if (!v) return [];
+        if (typeof v === "string") return v.split(",").map((s) => s.trim()).filter(Boolean);
+        if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
+        return [];
+      },
+      validate: [(v) => v.length <= 20, "Too many genres"],
+    },
     genre: { type: String, default: "" }, // legacy single-field
 
     releasedAt: { type: Date },
@@ -119,6 +126,7 @@ const MovieSchema = new Schema(
           return [];
         }
       },
+      validate: [(v) => v.length <= 200, "Too many cast members"],
     },
 
     crew: {
@@ -131,6 +139,7 @@ const MovieSchema = new Schema(
           return [];
         }
       },
+      validate: [(v) => v.length <= 200, "Too many crew members"],
     },
 
     director: { type: String, default: "" },
@@ -149,23 +158,55 @@ const MovieSchema = new Schema(
   { timestamps: true }
 );
 
-// Text indexes — include cast/crew names so search works over them
-MovieSchema.index({
-  title: "text",
-  description: "text",
-  "cast.name": "text",
-  director: "text",
-  "crew.name": "text",
+// Weighted text index — title heavier than other fields for search scoring.
+// If you modify this on production with a large collection, recreate index via Atlas or mongo shell.
+MovieSchema.index(
+  {
+    title: "text",
+    description: "text",
+    "cast.name": "text",
+    director: "text",
+    "crew.name": "text",
+  },
+  { weights: { title: 8, "cast.name": 4, director: 3, description: 1 } }
+);
+
+// Virtual for absolute poster URL (helpful for frontends)
+MovieSchema.virtual("posterAbsolute").get(function () {
+  if (!this.posterUrl) return "";
+  const src = String(this.posterUrl).replace(/\\/g, "/");
+  if (/^https?:\/\//i.test(src)) return src;
+  const base = process.env.APP_PUBLIC_BASE || process.env.BACKEND_PUBLIC_BASE || `http://localhost:${process.env.PORT || 8080}`;
+  return `${base.replace(/\/$/, "")}${src.startsWith("/") ? "" : "/"}${src}`;
 });
 
-// Optional: a toObject/toJSON transform to keep output tidy
+// Optional: a toObject/toJSON transform to keep output tidy and provide legacy aliases
 MovieSchema.set("toObject", { virtuals: true });
-MovieSchema.set("toJSON", { virtuals: true, transform(doc, ret) {
-  // ensure older fields are available for legacy clients
-  if (!ret.durationMins && ret.runtimeMinutes) ret.durationMins = ret.runtimeMinutes;
-  if (!ret.releaseDate && ret.releasedAt) ret.releaseDate = ret.releasedAt;
-  return ret;
-}});
+MovieSchema.set("toJSON", {
+  virtuals: true,
+  transform(doc, ret) {
+    // ensure older fields are available for legacy clients
+    if (!ret.durationMins && ret.runtimeMinutes) ret.durationMins = ret.runtimeMinutes;
+    if (!ret.releaseDate && ret.releasedAt) ret.releaseDate = ret.releasedAt;
+    if (!ret.poster && ret.posterUrl) ret.poster = ret.posterUrl;
+    // include posterAbsolute for convenience
+    if (!ret.posterAbsolute && ret.posterUrl) {
+      try {
+        const src = String(ret.posterUrl).replace(/\\/g, "/");
+        if (/^https?:\/\//i.test(src)) {
+          ret.posterAbsolute = src;
+        } else {
+          const base = process.env.APP_PUBLIC_BASE || process.env.BACKEND_PUBLIC_BASE || `http://localhost:${process.env.PORT || 8080}`;
+          ret.posterAbsolute = `${base.replace(/\/$/, "")}${src.startsWith("/") ? "" : "/"}${src}`;
+        }
+      } catch {
+        ret.posterAbsolute = ret.posterUrl;
+      }
+    }
+    return ret;
+  },
+});
 
-const Movie = mongoose.model("Movie", MovieSchema);
+// Prevent OverwriteModelError in watch/dev environments
+const Movie = mongoose.models.Movie || mongoose.model("Movie", MovieSchema);
 export default Movie;
