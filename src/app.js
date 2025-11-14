@@ -57,10 +57,14 @@ const DEV_ORIGINS = [
     : []),
 ];
 
+// IMPORTANT: include the exact Netlify origin(s) you use here.
+// Added multiple variants to avoid tiny-typo mismatches (rajy/rajv, hyphen variants).
 const PROD_ORIGINS = [
   "https://movieticketbooking-rajy.netlify.app",
-  // usually not required to allow your own backend as an Origin,
-  // but harmless to keep:
+  "https://movie-ticketbooking-rajy.netlify.app",
+  "https://movieticketbooking-rajv.netlify.app",
+  "https://movie-ticketbooking-rajv.netlify.app",
+  // backend origin (harmless to include)
   "https://movie-ticket-booking-backend-o1m2.onrender.com",
   ...(process.env.APP_ORIGINS_PROD
     ? process.env.APP_ORIGINS_PROD.split(",").map((s) => s.trim()).filter(Boolean)
@@ -70,15 +74,24 @@ const PROD_ORIGINS = [
 const ALLOWED_ORIGINS = Array.from(new Set([...DEV_ORIGINS, ...PROD_ORIGINS]));
 console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
 
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // non-browser / health checks / server-to-server
+/* Normalization helpers for origins to avoid false-negative mismatches */
+function normalizeOrigin(origin) {
+  if (!origin) return "";
   try {
     const u = new URL(origin);
-    const norm = `${u.protocol}//${u.host}`; // strip trailing slash
-    return ALLOWED_ORIGINS.includes(norm);
+    return `${u.protocol}//${u.host}`.toLowerCase();
   } catch {
-    return false;
+    return String(origin).toLowerCase();
   }
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // non-browser / health checks / server-to-server
+  const norm = normalizeOrigin(origin);
+  if (!global._normAllowedOrigins) {
+    global._normAllowedOrigins = new Set(ALLOWED_ORIGINS.map((o) => normalizeOrigin(o)));
+  }
+  return global._normAllowedOrigins.has(norm);
 }
 
 // Always vary by Origin so caches don't mix CORS responses
@@ -93,6 +106,7 @@ app.use((req, res, next) => {
 
   const origin = req.headers.origin || "";
   if (!isAllowedOrigin(origin)) {
+    console.warn("[CORS] ❌ Preflight blocked:", origin);
     return res.sendStatus(403);
   }
 
@@ -139,6 +153,14 @@ app.use(
 app.use(morgan("dev"));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
+
+/* --- Diagnostic middleware (temporary, helpful while debugging CORS/auth) --- */
+app.use((req, res, next) => {
+  const origin = req.headers.origin || "<no-origin>";
+  const auth = req.headers.authorization ? "[has Authorization]" : "[no Authorization]";
+  console.debug(`[DIAG] origin=${origin} method=${req.method} path=${req.path} ${auth}`);
+  next();
+});
 
 /* ───────────────────────────── STATIC FILES ──────────────────────────────── */
 // Use /tmp on Render by default (project dir is read-only there)
