@@ -296,25 +296,49 @@ router.post("/notify", (req, res) => {
 });
 
 /* --------------- REST: list / counts / mark read (readBy-aware) --------------- */
+/* Robust, defensive listMine: avoids hanging when DB is slow and guarantees a response */
 async function listMine(req, res) {
+  const start = Date.now();
   try {
+    // Defensive: ensure we have an authenticated user object (requireAuth should set it)
+    if (!req.user) {
+      console.warn("[notifications] listMine: no req.user (requireAuth may have failed)");
+      return res.status(401).json({ items: [], message: "Unauthorized" });
+    }
+
     const isAdmin = isAdminRole(req.user);
     const userId = String(req.user._id);
     const readerId = isAdmin ? "admin" : userId;
     const { unread, limit = 50 } = req.query;
 
+    // Build query
     const q = { $or: visibilityOr({ isAdmin, userId, includeAll: true }) };
     if (String(unread) === "1") Object.assign(q, unreadCond(readerId));
 
-    const items = await Notification.find(q)
+    // Defensive DB fetch: don't let a stuck DB call hang the HTTP request
+    const FETCH_TIMEOUT_MS = 3_000; // 3s - adjust if needed
+    const fetchPromise = Notification.find(q)
       .sort({ createdAt: -1 })
       .limit(Math.min(Number(limit) || 50, 100))
       .lean();
 
-    res.json(items);
+    const items = await Promise.race([
+      fetchPromise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("fetch timeout")), FETCH_TIMEOUT_MS)),
+    ]);
+
+    // If we got here, respond normally
+    const delta = Date.now() - start;
+    console.log(`[notifications] listMine: returned ${Array.isArray(items) ? items.length : 0} items in ${delta}ms for user=${userId} admin=${isAdmin}`);
+    return res.json(items);
   } catch (e) {
-    console.error("[notifications] list error:", e?.message);
-    res.status(500).json({ message: "Failed to load notifications" });
+    // Distinguish timeout vs DB error
+    if (String(e?.message || "").toLowerCase().includes("timeout")) {
+      console.error("[notifications] listMine error: DB fetch timeout", e?.message || e);
+      return res.status(503).json({ items: [], message: "Service temporarily unavailable (fetch timeout)" });
+    }
+    console.error("[notifications] list error:", e?.message || e);
+    return res.status(500).json({ items: [], message: "Failed to load notifications" });
   }
 }
 
