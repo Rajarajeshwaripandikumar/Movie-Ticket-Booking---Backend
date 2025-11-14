@@ -31,20 +31,28 @@ async function createAdmin(req, res) {
         .status(400)
         .json({ code: "BAD_REQUEST", message: "name, email, password, theatreId required" });
     }
+
     if (!isObjId(theatreId)) {
       return res.status(400).json({ code: "INVALID_THEATRE_ID", message: "Invalid theatreId" });
     }
 
+    if (password.length < 8) {
+      return res.status(400).json({ code: "WEAK_PASSWORD", message: "Password must be >= 8 characters" });
+    }
+
+    // ensure email uniqueness
     const existingByEmail = await User.findOne({ email }).select("_id").lean();
     if (existingByEmail) {
       return res.status(409).json({ code: "EMAIL_TAKEN", message: "Email already exists" });
     }
 
+    // validate theatre exists
     const theatre = await Theater.findById(theatreId).select("_id name city").lean();
     if (!theatre) {
       return res.status(404).json({ code: "THEATER_NOT_FOUND", message: "Theatre not found" });
     }
 
+    // ensure theatre doesn't already have a theatre-admin
     const existingAdmin = await User.findOne({
       role: "THEATRE_ADMIN",
       theatreId,
@@ -57,16 +65,19 @@ async function createAdmin(req, res) {
         .json({ code: "THEATER_ALREADY_HAS_ADMIN", message: "Theatre already has an admin" });
     }
 
+    // create user (User.pre('save') will hash password)
     const newAdmin = await User.create({
       name,
       email,
-      password, // hashed in User model pre('save')
+      password,
       role: "THEATRE_ADMIN",
       theatreId,
       isActive: true,
     });
 
+    // respond with safe shape
     return res.status(201).json({
+      ok: true,
       message: "Theatre admin created successfully",
       admin: {
         id: newAdmin._id,
@@ -98,7 +109,7 @@ async function listAdmins(_req, res) {
       .sort({ createdAt: -1, _id: -1 })
       .lean();
 
-    return res.json({ data: admins });
+    return res.json({ ok: true, data: admins });
   } catch (err) {
     console.error("[SuperAdmin] list theatre admins error:", err);
     return res.status(500).json({ code: "INTERNAL", message: "Failed to load theatre admins" });
@@ -117,7 +128,7 @@ async function getAdmin(req, res) {
 
     if (!admin)
       return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
-    res.json({ admin });
+    return res.json({ ok: true, admin });
   } catch (err) {
     console.error("[SuperAdmin] get theatre admin error:", err);
     res.status(500).json({ code: "INTERNAL", message: "Failed to load theatre admin" });
@@ -181,12 +192,13 @@ async function updateAdmin(req, res) {
       { _id: id, role: "THEATRE_ADMIN" },
       { $set: update },
       { new: true, select: "name email role theatreId isActive createdAt" }
-    );
+    ).lean();
 
     if (!doc)
       return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
 
-    res.json({
+    return res.json({
+      ok: true,
       message: "Theatre admin updated",
       admin: {
         id: doc._id,
@@ -220,11 +232,11 @@ async function updateAdminStatus(req, res) {
       { _id: id, role: "THEATRE_ADMIN" },
       { $set: { isActive } },
       { new: true, select: "name email role theatreId isActive createdAt" }
-    );
+    ).lean();
     if (!doc)
       return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
 
-    res.json({ message: "Status updated", isActive: doc.isActive });
+    return res.json({ ok: true, message: "Status updated", isActive: doc.isActive });
   } catch (err) {
     console.error("[SuperAdmin] status theatre admin error:", err);
     res.status(500).json({ code: "INTERNAL", message: "Failed to update status" });
@@ -236,11 +248,11 @@ async function deleteAdmin(req, res) {
     const { id } = req.params;
     if (!isObjId(id)) return res.status(400).json({ code: "BAD_ID", message: "Invalid id" });
 
-    const doc = await User.findOneAndDelete({ _id: id, role: "THEATRE_ADMIN" });
+    const doc = await User.findOneAndDelete({ _id: id, role: "THEATRE_ADMIN" }).lean();
     if (!doc)
       return res.status(404).json({ code: "NOT_FOUND", message: "Theatre admin not found" });
 
-    res.json({ message: "Theatre admin deleted", id });
+    return res.json({ ok: true, message: "Theatre admin deleted", id });
   } catch (err) {
     console.error("[SuperAdmin] delete theatre admin error:", err);
     res.status(500).json({ code: "INTERNAL", message: "Failed to delete theatre admin" });
@@ -320,10 +332,10 @@ router.get(
       }
 
       const theaters = await Theater.find(filter).sort({ createdAt: -1 }).lean();
-      res.json({ ok: true, theaters });
+      return res.json({ ok: true, theaters });
     } catch (err) {
       console.error("[SuperAdmin] list theaters error:", err);
-      res.status(500).json({ ok: false, message: "Failed to load theaters" });
+      return res.status(500).json({ ok: false, message: "Failed to load theaters" });
     }
   }
 );
@@ -347,13 +359,13 @@ router.post(
         address: String(address || ""),
         imageUrl: String(imageUrl || ""),
       });
-      res.status(201).json({ ok: true, theater: doc });
+      return res.status(201).json({ ok: true, theater: doc });
     } catch (err) {
       console.error("[SuperAdmin] create theater error:", err);
       if (err?.name === "ValidationError") {
         return res.status(400).json({ ok: false, message: err.message });
       }
-      res.status(500).json({ ok: false, message: "Failed to create theater" });
+      return res.status(500).json({ ok: false, message: "Failed to create theater" });
     }
   }
 );
@@ -381,13 +393,13 @@ router.put(
         return res.status(400).json({ ok: false, message: "Nothing to update" });
       }
 
-      const doc = await Theater.findByIdAndUpdate(id, { $set: set }, { new: true });
+      const doc = await Theater.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
       if (!doc) return res.status(404).json({ ok: false, message: "not found" });
 
-      res.json({ ok: true, theater: doc });
+      return res.json({ ok: true, theater: doc });
     } catch (err) {
       console.error("[SuperAdmin] update theater error:", err);
-      res.status(500).json({ ok: false, message: "Failed to update theater" });
+      return res.status(500).json({ ok: false, message: "Failed to update theater" });
     }
   }
 );
@@ -402,12 +414,12 @@ router.delete(
     try {
       const { id } = req.params;
       if (!isObjId(id)) return res.status(400).json({ ok: false, message: "bad id" });
-      const del = await Theater.findByIdAndDelete(id);
+      const del = await Theater.findByIdAndDelete(id).lean();
       if (!del) return res.status(404).json({ ok: false, message: "not found" });
-      res.json({ ok: true, id });
+      return res.json({ ok: true, id });
     } catch (err) {
       console.error("[SuperAdmin] delete theater error:", err);
-      res.status(500).json({ ok: false, message: "Failed to delete theater" });
+      return res.status(500).json({ ok: false, message: "Failed to delete theater" });
     }
   }
 );
@@ -438,10 +450,10 @@ router.put(
         showtimeId,
         { $set: { basePrice } },
         { new: true }
-      );
+      ).lean();
 
       if (!doc) return res.status(404).json({ code: "NOT_FOUND", message: "Showtime not found" });
-      return res.json({ message: "Pricing updated", showtime: doc });
+      return res.json({ ok: true, message: "Pricing updated", showtime: doc });
     } catch (err) {
       console.error("[SuperAdmin] update pricing error:", err);
       return res.status(500).json({ code: "INTERNAL", message: "Failed to update pricing" });
