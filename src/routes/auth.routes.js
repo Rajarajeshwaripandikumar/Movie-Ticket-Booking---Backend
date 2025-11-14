@@ -20,7 +20,6 @@ const TOKEN_SIZE_BYTES = 32;
 const RESET_EXPIRES_MS =
   Number(process.env.RESET_TOKEN_EXPIRES_MINUTES || 60) * 60 * 1000;
 
-/* canonical roles */
 const ROLES = {
   USER: "USER",
   ADMIN: "ADMIN",
@@ -29,13 +28,14 @@ const ROLES = {
 };
 
 /* -------------------------------------------------------------------------- */
-/*                                   HELPERS                                  */
+/*                                HELPERS                                     */
 /* -------------------------------------------------------------------------- */
 
 function normalizeRole(r) {
   if (!r) return null;
-  const v = String(r).trim().toUpperCase().replace(/\s+/g, "_");
-  if (v === "THEATER_ADMIN" || v === "THEATER_OWNER") return ROLES.THEATRE_ADMIN;
+  const v = String(r).trim().toUpperCase();
+  if (v === "THEATER_ADMIN") return ROLES.THEATRE_ADMIN;
+  if (v === "THEATEROWNER") return ROLES.THEATRE_ADMIN;
   if (v === "SUPERADMIN" || v === "SUPER-ADMIN") return ROLES.SUPER_ADMIN;
   if (v === "ADMIN") return ROLES.ADMIN;
   if (v === "USER") return ROLES.USER;
@@ -43,34 +43,36 @@ function normalizeRole(r) {
 }
 
 function signToken(user) {
-  // ensure sub is string for reliable decoding
   return jwt.sign(
     {
       sub: String(user._id),
       email: user.email,
-      role: user.role,
-      theatreId: user.theatreId ?? null,
+      role: normalizeRole(user.role),
+      theatreId: user.theatreId ?? user.theaterId ?? null,
     },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES }
   );
 }
 
-function safeUserPayload(userDoc) {
-  if (!userDoc) return null;
-  // if it's a mongoose doc, convert to POJO; if already POJO, copy fields
-  const u = userDoc.toObject ? userDoc.toObject() : userDoc;
+function safeUserPayload(doc) {
+  if (!doc) return null;
+  const u = doc.toObject ? doc.toObject() : doc;
   return {
     id: String(u._id),
     email: u.email,
     name: u.name || "",
     phone: u.phone || "",
-    role: normalizeRole(u.role) || ROLES.USER,
+    role: normalizeRole(u.role),
     theatreId: u.theatreId ?? u.theaterId ?? null,
     preferences:
-      u.preferences ?? { language: "en", notifications: { email: true, sms: false } },
+      u.preferences || {
+        language: "en",
+        notifications: { email: true, sms: false },
+      },
     bookings: Array.isArray(u.bookings) ? u.bookings : [],
     createdAt: u.createdAt,
+    updatedAt: u.updatedAt,
   };
 }
 
@@ -78,16 +80,17 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-/* Lightweight header-based auth for WRITE endpoints in this router */
+/* -------------------------------------------------------------------------- */
+/*                             HEADER AUTH HELPERS                             */
+/* -------------------------------------------------------------------------- */
 function requireAuthHdr(req, res, next) {
   try {
-    const header = String(req.headers.authorization || "");
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : header;
+    const raw = String(req.headers.authorization || "");
+    const token = raw.startsWith("Bearer ") ? raw.slice(7).trim() : raw;
     if (!token) return res.status(401).json({ message: "Missing token" });
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.auth = decoded;
-    next();
-  } catch (err) {
+    req.auth = jwt.verify(token, JWT_SECRET);
+    return next();
+  } catch {
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 }
@@ -96,179 +99,163 @@ function requireRoleHdr(...roles) {
   return (req, res, next) => {
     const role = normalizeRole(req.auth?.role);
     if (!role) return res.status(401).json({ message: "Unauthorized" });
-    const ok = roles.map(normalizeRole).includes(role);
-    if (!ok) return res.status(403).json({ message: "Forbidden" });
+    if (!roles.map(normalizeRole).includes(role))
+      return res.status(403).json({ message: "Forbidden" });
     next();
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/*                              ADMIN LOGIN HELPERS                            */
+/*                             ADMIN LOGIN HANDLER                             */
 /* -------------------------------------------------------------------------- */
 async function handleAdminLogin(req, res) {
   try {
-    const email = String((req.body?.email || "").toLowerCase()).trim();
-    const password = req.body?.password;
+    const email = String((req.body.email || "").toLowerCase());
+    const password = req.body.password;
 
-    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
 
-    // fetch plain object with password hash to avoid running virtual getters
     const user = await User.findOne({ email }).select("+password").lean();
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
-    const userRole = normalizeRole(user.role);
-
-    // debug log in non-prod to aid troubleshooting
-    if (process.env.NODE_ENV !== "production") {
-      console.debug("[ADMIN_LOGIN] attempt:", { email, role: userRole });
-    }
-
-    // Only admins allowed here
+    const norm = normalizeRole(user.role);
     const adminRoles = [ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN];
-    if (!adminRoles.includes(userRole)) {
+    if (!adminRoles.includes(norm))
       return res.status(403).json({ message: "Admins only" });
-    }
 
-    // Compare using bcrypt directly against the stored hash (user is a POJO)
-    const match = await bcrypt.compare(password, user.password || "");
-    if (!match) return res.status(401).json({ message: "Incorrect password" });
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(401).json({ message: "Incorrect password" });
 
-    // sign token using canonical role (keep original stored role but normalized in token)
-    const token = signToken({ _id: user._id, email: user.email, role: userRole, theatreId: user.theatreId });
+    const token = signToken(user);
 
     return res.json({
       message: "Admin login successful",
       token,
       adminToken: token,
-      role: userRole,
+      role: norm,
       user: safeUserPayload(user),
     });
   } catch (err) {
-    console.error("ADMIN_LOGIN_ERROR:", err && err.stack ? err.stack : err);
+    console.error("ADMIN_LOGIN_ERROR:", err);
     return res.status(500).json({ message: "Failed to login admin" });
   }
 }
 
 /* -------------------------------------------------------------------------- */
-/*                              REGISTER / LOGIN                               */
+/*                             USER REGISTER & LOGIN                           */
 /* -------------------------------------------------------------------------- */
+
 router.post("/register", async (req, res) => {
   try {
-    const email = String((req.body?.email || "").toLowerCase()).trim();
-    const password = req.body?.password;
-    const name = req.body?.name || "";
-    const phone = req.body?.phone || "";
+    const email = String((req.body.email || "").toLowerCase());
+    const password = req.body.password;
+    const name = req.body.name || "";
+    const phone = req.body.phone || "";
 
-    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
 
-    const existing = await User.findOne({ email }).lean();
-    if (existing) return res.status(409).json({ message: "Email already registered" });
+    const exists = await User.findOne({ email }).lean();
+    if (exists)
+      return res.status(409).json({ message: "Email already registered" });
 
-    const user = new User({
-      email,
-      name,
-      phone,
-      role: ROLES.USER,
-      password, // pre-save hook will hash
-    });
-
+    const user = new User({ email, name, phone, password, role: ROLES.USER });
     await user.save();
 
     const token = signToken(user);
     return res.status(201).json({
       message: "Registered successfully",
       token,
-      role: normalizeRole(user.role),
+      role: ROLES.USER,
       user: safeUserPayload(user),
     });
   } catch (err) {
-    console.error("REGISTER_ERROR:", err && err.stack ? err.stack : err);
+    console.error("REGISTER_ERROR:", err);
     return res.status(500).json({ message: "Failed to register" });
   }
 });
 
-/* Public login for normal users (explicitly rejects admin roles) */
 router.post("/login", async (req, res) => {
   try {
-    const email = String((req.body?.email || "").toLowerCase()).trim();
-    const password = req.body?.password;
-    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+    const email = String((req.body.email || "").toLowerCase());
+    const password = req.body.password;
 
-    // use lean to avoid virtuals being evaluated during auth; compare with bcrypt
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
+
     const user = await User.findOne({ email }).select("+password").lean();
     if (!user) return res.status(401).json({ message: "Email not registered" });
 
-    const userRole = normalizeRole(user.role);
-    if ([ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN].includes(userRole)) {
-      return res.status(403).json({ message: "Admins must login from /admin/login" });
+    const norm = normalizeRole(user.role);
+    if ([ROLES.SUPER_ADMIN, ROLES.THEATRE_ADMIN, ROLES.ADMIN].includes(norm)) {
+      return res.status(403).json({
+        message: "Admins must login via /admin/login",
+      });
     }
 
-    const match = await bcrypt.compare(password, user.password || "");
-    if (!match) return res.status(401).json({ message: "Incorrect password" });
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(401).json({ message: "Incorrect password" });
 
     const token = signToken(user);
     return res.json({
       message: "Login successful",
       token,
-      role: normalizeRole(user.role),
+      role: ROLES.USER,
       user: safeUserPayload(user),
     });
   } catch (err) {
-    console.error("LOGIN_ERROR:", err && err.stack ? err.stack : err);
+    console.error("LOGIN_ERROR:", err);
     return res.status(500).json({ message: "Login failed" });
   }
 });
 
-/* Admin login endpoints */
+/* -------------------------------------------------------------------------- */
+/*                                ADMIN LOGIN                                 */
+/* -------------------------------------------------------------------------- */
+
 router.post("/admin-login", handleAdminLogin);
 router.post("/admin/login", handleAdminLogin);
 
 /* -------------------------------------------------------------------------- */
-/*                   CREATE FIRST SUPER ADMIN (transactional)                 */
+/*                       CREATE FIRST SUPER ADMIN                              */
 /* -------------------------------------------------------------------------- */
+
 router.post("/create-superadmin", async (req, res) => {
   const session = await mongoose.startSession();
   try {
-    const email = String((req.body?.email || "").toLowerCase()).trim();
-    const password = req.body?.password;
-    const name = req.body?.name || "";
+    const email = String((req.body.email || "").toLowerCase());
+    const password = req.body.password;
+    const name = req.body.name || "";
 
-    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password required" });
 
     let created = null;
+
     await session.withTransaction(async () => {
-      const exists = await User.findOne({ role: ROLES.SUPER_ADMIN }).session(session).lean();
-      if (exists) {
-        // abort transaction by throwing a special error we catch below
-        throw new Error("SUPER_ADMIN_EXISTS");
-      }
+      const exists = await User.findOne({ role: ROLES.SUPER_ADMIN })
+        .session(session)
+        .lean();
+      if (exists) throw new Error("SUPER_ADMIN_EXISTS");
 
       const hashed = await bcrypt.hash(password, 10);
-      created = await User.create(
-        [
-          {
-            email,
-            password: hashed,
-            name,
-            role: ROLES.SUPER_ADMIN,
-          },
-        ],
+      const arr = await User.create(
+        [{ email, password: hashed, name, role: ROLES.SUPER_ADMIN }],
         { session }
       );
-      // created is an array returned by create when array provided
-      created = Array.isArray(created) ? created[0] : created;
+      created = arr[0];
     });
 
-    if (!created) {
-      return res.status(500).json({ message: "Failed to create super admin" });
-    }
-
-    return res.json({ message: "Super Admin created successfully", superAdmin: safeUserPayload(created) });
+    return res.json({
+      message: "Super Admin created successfully",
+      superAdmin: safeUserPayload(created),
+    });
   } catch (err) {
     if (String(err.message) === "SUPER_ADMIN_EXISTS") {
       return res.status(409).json({ message: "Super Admin already exists" });
     }
-    console.error("CREATE_SUPERADMIN_ERROR:", err && err.stack ? err.stack : err);
+    console.error("CREATE_SUPERADMIN_ERROR:", err);
     return res.status(500).json({ message: "Failed to create super admin" });
   } finally {
     session.endSession();
@@ -278,52 +265,70 @@ router.post("/create-superadmin", async (req, res) => {
 /* -------------------------------------------------------------------------- */
 /*                                     ME                                     */
 /* -------------------------------------------------------------------------- */
+
 router.get("/me", async (req, res) => {
   try {
-    const header = String(req.headers.authorization || "");
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : header;
+    const raw = String(req.headers.authorization || "");
+    const token = raw.startsWith("Bearer ") ? raw.slice(7).trim() : raw;
     if (!token) return res.status(401).json({ message: "Missing token" });
+
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.sub).lean();
+
     if (!user) return res.status(404).json({ message: "User not found" });
+
     return res.json({ user: safeUserPayload(user) });
   } catch (err) {
-    console.error("ME_ERROR:", err && err.stack ? err.stack : err);
+    console.error("ME_ERROR:", err);
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 });
 
 /* -------------------------------------------------------------------------- */
-/*                               PROFILE (SELF)                                */
+/*                               PROFILE UPDATE                                */
 /* -------------------------------------------------------------------------- */
+
 router.put("/profile", requireAuthHdr, async (req, res) => {
   try {
-    const { name, email, phone } = req.body || {};
-    if (!name && !email && !phone) return res.status(400).json({ message: "Nothing to update" });
-
+    const { name, email, phone } = req.body;
     const update = {};
+
     if (typeof name === "string") update.name = name.trim();
     if (typeof phone === "string") update.phone = phone.trim();
+
     if (typeof email === "string") {
       const e = email.trim().toLowerCase();
-      const taken = await User.findOne({ email: e, _id: { $ne: req.auth.sub } }).lean();
-      if (taken) return res.status(409).json({ message: "Email already in use" });
+      const conflict = await User.findOne({
+        email: e,
+        _id: { $ne: req.auth.sub },
+      }).lean();
+      if (conflict)
+        return res.status(409).json({ message: "Email already in use" });
       update.email = e;
     }
 
-    const user = await User.findByIdAndUpdate(req.auth.sub, { $set: update }, { new: true, select: "-password" }).lean();
+    const user = await User.findByIdAndUpdate(
+      req.auth.sub,
+      { $set: update },
+      { new: true, select: "-password" }
+    ).lean();
+
     if (!user) return res.status(404).json({ message: "User not found" });
+
     return res.json({ message: "Profile updated", user: safeUserPayload(user) });
   } catch (err) {
-    console.error("PROFILE_UPDATE_ERROR:", err && err.stack ? err.stack : err);
+    console.error("PROFILE_UPDATE_ERROR:", err);
     return res.status(500).json({ message: "Failed to update profile" });
   }
 });
 
 router.put("/profile/password", requireAuthHdr, async (req, res) => {
   try {
-    const { currentPassword, newPassword } = req.body || {};
-    if (!currentPassword || !newPassword) return res.status(400).json({ message: "Both currentPassword and newPassword required" });
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword)
+      return res
+        .status(400)
+        .json({ message: "currentPassword and newPassword required" });
 
     const user = await User.findById(req.auth.sub).select("+password");
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -331,60 +336,69 @@ router.put("/profile/password", requireAuthHdr, async (req, res) => {
     const ok = await user.compare(currentPassword);
     if (!ok) return res.status(401).json({ message: "Current password incorrect" });
 
-    user.password = newPassword;
+    user.password = newPassword; // pre-save hook will hash
     await user.save();
+
     return res.json({ message: "Password updated" });
   } catch (err) {
-    console.error("PROFILE_PASSWORD_ERROR:", err && err.stack ? err.stack : err);
+    console.error("PROFILE_PASSWORD_ERROR:", err);
     return res.status(500).json({ message: "Failed to update password" });
   }
 });
 
 /* -------------------------------------------------------------------------- */
-/*                        CHANGE PASSWORD (token auth)                         */
+/*                              TOKEN PASSWORD CHANGE                          */
 /* -------------------------------------------------------------------------- */
+
 router.post("/change-password", async (req, res) => {
   try {
-    const header = String(req.headers.authorization || "");
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : header;
+    const raw = String(req.headers.authorization || "");
+    const token = raw.startsWith("Bearer ") ? raw.slice(7).trim() : raw;
     if (!token) return res.status(401).json({ message: "Missing token" });
+
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.sub).select("+password");
     if (!user) return res.status(404).json({ message: "User not found" });
 
     const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword) return res.status(400).json({ message: "Both current and new passwords required" });
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({
+        message: "Both currentPassword and newPassword required",
+      });
 
-    const match = await user.compare(currentPassword);
-    if (!match) return res.status(400).json({ message: "Current password incorrect" });
+    const ok = await user.compare(currentPassword);
+    if (!ok) return res.status(400).json({ message: "Current password incorrect" });
 
     user.password = newPassword;
     await user.save();
+
     return res.json({ message: "Password changed successfully" });
   } catch (err) {
-    console.error("CHANGE_PASSWORD_ERROR:", err && err.stack ? err.stack : err);
+    console.error("CHANGE_PASSWORD_ERROR:", err);
     return res.status(500).json({ message: "Failed to change password" });
   }
 });
 
 /* -------------------------------------------------------------------------- */
-/*                        PASSWORD RESET (Email Flow)                         */
+/*                             PASSWORD RESET FLOW                             */
 /* -------------------------------------------------------------------------- */
+
 router.post("/forgot-password", async (req, res) => {
   try {
-    const email = String((req.body?.email || "").toLowerCase()).trim();
+    const email = String((req.body.email || "").toLowerCase());
     if (!email) return res.status(400).json({ message: "Email required." });
 
-    const genericMsg = "If that email exists, you'll receive reset instructions.";
+    const generic = "If the email exists, you'll receive a reset link.";
+
     const user = await User.findOne({ email }).select("+resetPasswordToken resetPasswordExpires");
-    if (!user) return res.json({ message: genericMsg });
+    if (!user) return res.json({ message: generic });
 
     const token = crypto.randomBytes(TOKEN_SIZE_BYTES).toString("hex");
-    const hashedToken = hashToken(token);
-    const expires = Date.now() + RESET_EXPIRES_MS;
+    const hashed = hashToken(token);
+    const expires = new Date(Date.now() + RESET_EXPIRES_MS);
 
-    user.resetPasswordToken = hashedToken;
-    user.resetPasswordExpires = new Date(expires);
+    user.resetPasswordToken = hashed;
+    user.resetPasswordExpires = expires;
     await user.save();
 
     const { resetFrontendUrl } = mailer.createResetUrl({
@@ -393,22 +407,20 @@ router.post("/forgot-password", async (req, res) => {
       email,
     });
 
-    const html = mailer.resetPasswordTemplate({
-      name: user.name || user.email,
-      resetUrl: resetFrontendUrl,
-      expiresMinutes: Math.round(RESET_EXPIRES_MS / 60000),
-    });
-
     await mailer.sendEmail({
       to: email,
       subject: "Reset your password",
-      html,
-      text: `Reset your password: ${resetFrontendUrl}`,
+      html: mailer.resetPasswordTemplate({
+        name: user.name || email,
+        resetUrl: resetFrontendUrl,
+        expiresMinutes: RESET_EXPIRES_MS / 60000,
+      }),
+      text: `Reset link: ${resetFrontendUrl}`,
     });
 
-    return res.json({ message: genericMsg });
+    return res.json({ message: generic });
   } catch (err) {
-    console.error("FORGOT_PASSWORD_ERROR:", err && err.stack ? err.stack : err);
+    console.error("FORGOT_PASSWORD_ERROR:", err);
     return res.status(500).json({ message: "Failed to send reset email." });
   }
 });
@@ -416,18 +428,21 @@ router.post("/forgot-password", async (req, res) => {
 router.post("/reset-password", async (req, res) => {
   try {
     const token = req.body?.token;
-    const email = String((req.body?.email || "").toLowerCase()).trim();
+    const email = String((req.body.email || "").toLowerCase());
     const newPassword = req.body?.newPassword || req.body?.password;
-    if (!token || !newPassword) return res.status(400).json({ message: "Token and new password required." });
 
-    const hashedToken = hashToken(String(token));
+    if (!token || !newPassword)
+      return res.status(400).json({ message: "Token and new password required." });
+
+    const hashed = hashToken(token);
     const user = await User.findOne({
       email,
-      resetPasswordToken: hashedToken,
+      resetPasswordToken: hashed,
       resetPasswordExpires: { $gt: Date.now() },
     }).select("+password");
 
-    if (!user) return res.status(400).json({ message: "Invalid or expired token." });
+    if (!user)
+      return res.status(400).json({ message: "Invalid or expired token." });
 
     user.password = newPassword;
     user.resetPasswordToken = undefined;
@@ -436,21 +451,21 @@ router.post("/reset-password", async (req, res) => {
 
     await mailer.sendEmail({
       to: user.email,
-      subject: "Your password has been changed",
-      html: `<p>Your password for <b>${user.email}</b> was updated.</p>`,
-      text: `Your password for ${user.email} was updated.`,
+      subject: "Password updated",
+      html: `<p>Your password for <b>${user.email}</b> was changed.</p>`,
     });
 
-    return res.json({ message: "Password reset successful. You can now log in." });
+    return res.json({ message: "Password reset successful." });
   } catch (err) {
-    console.error("RESET_PASSWORD_ERROR:", err && err.stack ? err.stack : err);
+    console.error("RESET_PASSWORD_ERROR:", err);
     return res.status(500).json({ message: "Failed to reset password." });
   }
 });
 
 /* -------------------------------------------------------------------------- */
-/*                        TOKEN VERIFY & ADMIN MANAGEMENT                      */
+/*                             TOKEN VERIFY & ADMIN CREATION                   */
 /* -------------------------------------------------------------------------- */
+
 router.get("/verify", requireAuthHdr, (req, res) => {
   return res.json({ ok: true, token: req.auth });
 });
@@ -461,48 +476,49 @@ router.post(
   requireRoleHdr(ROLES.SUPER_ADMIN),
   async (req, res) => {
     try {
-      const email = String((req.body?.email || "").toLowerCase()).trim();
-      const password = req.body?.password;
-      const name = req.body?.name || "";
-      const role = normalizeRole(req.body?.role);
-      const theatreId = req.body?.theatreId;
+      const { email, password, name, role, theatreId } = req.body;
+      const emailNorm = String((email || "").toLowerCase());
 
-      if (!email || !password || !role) {
-        return res.status(400).json({ message: "email, password and role are required" });
-      }
-      if (![ROLES.ADMIN, ROLES.THEATRE_ADMIN].includes(role)) {
+      if (!emailNorm || !password || !role)
+        return res.status(400).json({ message: "email, password, role required" });
+
+      const norm = normalizeRole(role);
+      if (![ROLES.ADMIN, ROLES.THEATRE_ADMIN].includes(norm))
         return res.status(400).json({ message: "role must be ADMIN or THEATRE_ADMIN" });
-      }
 
-      const exists = await User.findOne({ email }).lean();
+      const exists = await User.findOne({ email: emailNorm }).lean();
       if (exists) return res.status(409).json({ message: "Email already registered" });
 
       let theatreRef = null;
-      if (role === ROLES.THEATRE_ADMIN && theatreId) {
-        if (!mongoose.Types.ObjectId.isValid(theatreId)) {
+      if (norm === ROLES.THEATRE_ADMIN) {
+        if (!mongoose.Types.ObjectId.isValid(theatreId))
           return res.status(400).json({ message: "Invalid theatreId" });
-        }
-        const t = await Theater.findById(theatreId).select("_id").lean();
-        if (!t) return res.status(400).json({ message: "Invalid theatreId" });
-        theatreRef = t._id;
+        const th = await Theater.findById(theatreId).lean();
+        if (!th) return res.status(400).json({ message: "Invalid theatreId" });
+        theatreRef = th._id;
       }
 
       const hashed = await bcrypt.hash(password, 10);
-      const admin = await User.create({
-        email,
+      const adminUser = await User.create({
+        email: emailNorm,
         password: hashed,
         name: name || "",
-        role,
-        theatreId: theatreRef || null,
+        role: norm,
+        theatreId: theatreRef,
       });
 
-      return res.status(201).json({ ok: true, user: safeUserPayload(admin) });
+      return res.status(201).json({
+        ok: true,
+        user: safeUserPayload(adminUser),
+      });
     } catch (err) {
-      console.error("ADMIN_CREATE_ERROR:", err && err.stack ? err.stack : err);
+      console.error("ADMIN_CREATE_ERROR:", err);
       return res.status(500).json({ message: "Failed to create admin" });
     }
   }
 );
+
+/* -------------------------------------------------------------------------- */
 
 router.routesPrefix = "/api/auth";
 export default router;
