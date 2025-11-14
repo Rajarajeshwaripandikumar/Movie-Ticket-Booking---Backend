@@ -6,6 +6,9 @@ dotenv.config();
 const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 const AUTH_TRUST_TOKEN = (process.env.AUTH_TRUST_TOKEN || "false").toLowerCase() === "true";
 
+// timeout for DB fetch (ms)
+const FETCH_USER_TIMEOUT_MS = Number(process.env.AUTH_USER_FETCH_TIMEOUT_MS || 1500);
+
 /* --------------------------------- Role utils -------------------------------- */
 
 export const ROLE = {
@@ -50,15 +53,27 @@ function normalizeRoleList(xs) {
 
 /* -------------------------------------------------------------------------- */
 /* Helper: load authoritative user from DB (deferred import to avoid cycles)  */
+/* with a short timeout to avoid hanging requests                             */
 /* -------------------------------------------------------------------------- */
-async function loadUserFromDb(userId) {
+async function loadUserFromDbWithTimeout(userId) {
+  if (!userId) return null;
   try {
+    // deferred import to avoid cycles
     const User = (await import("../models/User.js")).default;
-    if (!userId) return null;
-    const u = await User.findById(userId).select("+password").lean();
-    return u || null;
+    const p = User.findById(userId).select("+password").lean();
+    const t = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("user-fetch-timeout")), Math.max(200, FETCH_USER_TIMEOUT_MS))
+    );
+    try {
+      const result = await Promise.race([p, t]);
+      return result || null;
+    } catch (e) {
+      // timeout or DB error — return null so we fall back to token claims
+      console.warn("[Auth] loadUserFromDbWithTimeout fallback:", e?.message || e);
+      return null;
+    }
   } catch (err) {
-    console.warn("[Auth] loadUserFromDb failed:", err && err.message);
+    console.warn("[Auth] loadUserFromDbWithTimeout import failed:", err?.message || err);
     return null;
   }
 }
@@ -71,8 +86,9 @@ export const requireAuth = (opts = {}) => {
   const { forceFresh = false } = typeof opts === "object" ? opts : {};
 
   return async (req, res, next) => {
-    // Never block CORS preflight
+    // Never block CORS preflight — let OPTIONS through
     if (req.method === "OPTIONS") {
+      // Minimal early return for preflight to avoid auth blocking
       return res.sendStatus(204);
     }
 
@@ -124,7 +140,7 @@ export const requireAuth = (opts = {}) => {
       // Prefer authoritative DB values unless explicitly trusting token
       let dbUser = null;
       if (!AUTH_TRUST_TOKEN || forceFresh) {
-        dbUser = await loadUserFromDb(userId);
+        dbUser = await loadUserFromDbWithTimeout(userId);
       }
 
       // raw role & theatre from token
@@ -148,6 +164,8 @@ export const requireAuth = (opts = {}) => {
         theaterId: finalTheatreId ? String(finalTheatreId) : null,
         // include a quiet flag to indicate whether values were loaded from DB
         _fromDb: !!dbUser,
+        // attach raw token claims to help debugging if needed
+        _claims: process.env.NODE_ENV !== "production" ? decoded : undefined,
       };
 
       res.locals.userId = userId;
