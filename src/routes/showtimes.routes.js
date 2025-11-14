@@ -14,7 +14,7 @@ import {
 } from "../middleware/scope.js";
 
 const router = Router();
-/** ✅ mount under /api/showtimes so GET /api/showtimes works */
+/** mount under /api/showtimes so GET /api/showtimes works */
 router.routesPrefix = "/api/showtimes";
 
 /* -------------------------------------------------------------------------- */
@@ -39,6 +39,17 @@ const nowUtc = () => new Date();
 /* Misc helpers                                                               */
 /* -------------------------------------------------------------------------- */
 const seatKey = (r, c) => `${Number(r)}:${Number(c)}`;
+
+const isId = (id) => mongoose.isValidObjectId(String(id || ""));
+
+function safeObjectId(id) {
+  if (!id) return null;
+  try {
+    return mongoose.Types.ObjectId(String(id));
+  } catch {
+    return null;
+  }
+}
 
 function toDto(s) {
   const theater =
@@ -124,6 +135,7 @@ async function ensureSeatsInitialized(showtime) {
 async function reconcileLocks(showtime) {
   const now = new Date();
 
+  // Remove expired held locks (we store SeatLock docs separately)
   await SeatLock.deleteMany({
     showtime: showtime._id,
     status: "HELD",
@@ -170,9 +182,9 @@ router.get("/", async (req, res) => {
     const { movieId, theaterId, screenId, city, date } = req.query;
 
     const q = {};
-    if (movieId && mongoose.isValidObjectId(String(movieId))) q.movie = new mongoose.Types.ObjectId(String(movieId));
-    if (theaterId && mongoose.isValidObjectId(String(theaterId))) q.theater = new mongoose.Types.ObjectId(String(theaterId));
-    if (screenId && mongoose.isValidObjectId(String(screenId))) q.screen = new mongoose.Types.ObjectId(String(screenId));
+    if (movieId && isId(movieId)) q.movie = safeObjectId(movieId);
+    if (theaterId && isId(theaterId)) q.theater = safeObjectId(theaterId);
+    if (screenId && isId(screenId)) q.screen = safeObjectId(screenId);
     if (city && String(city).trim()) q.city = new RegExp(`^${String(city).trim()}$`, "i");
 
     const todayYmd = toYmdIST();
@@ -228,15 +240,15 @@ router.get("/my-theatre", requireAuth, async (req, res) => {
       theatreId = t?._id;
     }
 
-    if (!theatreId || !mongoose.isValidObjectId(String(theatreId))) {
+    if (!theatreId || !isId(theatreId)) {
       return res.json([]);
     }
 
     const { movieId, screenId, date } = req.query;
 
-    const q = { theater: new mongoose.Types.ObjectId(String(theatreId)) };
-    if (movieId && mongoose.isValidObjectId(String(movieId))) q.movie = new mongoose.Types.ObjectId(String(movieId));
-    if (screenId && mongoose.isValidObjectId(String(screenId))) q.screen = new mongoose.Types.ObjectId(String(screenId));
+    const q = { theater: safeObjectId(theatreId) };
+    if (movieId && isId(movieId)) q.movie = safeObjectId(movieId);
+    if (screenId && isId(screenId)) q.screen = safeObjectId(screenId);
 
     const todayYmd = toYmdIST();
     const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
@@ -309,8 +321,8 @@ router.get("/cities", async (req, res) => {
     const { movieId, date } = req.query;
 
     const q = {};
-    if (movieId && mongoose.isValidObjectId(String(movieId))) {
-      q.movie = new mongoose.Types.ObjectId(String(movieId));
+    if (movieId && isId(movieId)) {
+      q.movie = safeObjectId(movieId);
     }
 
     const todayYmd = toYmdIST();
@@ -394,9 +406,9 @@ router.get("/movies/:id", async (req, res) => {
   try {
     const { city, date } = req.query;
     const movieId = String(req.params.id);
-    if (!mongoose.isValidObjectId(movieId)) return res.status(400).json({ message: "Invalid movie id" });
+    if (!isId(movieId)) return res.status(400).json({ message: "Invalid movie id" });
 
-    const q = { movie: new mongoose.Types.ObjectId(movieId) };
+    const q = { movie: safeObjectId(movieId) };
     if (city && String(city).trim()) q.city = new RegExp(`^${String(city).trim()}$`, "i");
 
     const todayYmd = toYmdIST();
@@ -422,7 +434,8 @@ router.get("/movies/:id", async (req, res) => {
       .lean();
 
     return res.json(docs.map(toDto));
-  } catch {
+  } catch (err) {
+    console.error("❌ GET /showtimes/movies/:id error:", err);
     return res.status(500).json({ message: "Failed to fetch movie showtimes" });
   }
 });
@@ -434,9 +447,9 @@ router.get("/theaters/:id", async (req, res) => {
   try {
     const { date } = req.query;
     const theaterId = String(req.params.id);
-    if (!mongoose.isValidObjectId(theaterId)) return res.status(400).json({ message: "Invalid theater id" });
+    if (!isId(theaterId)) return res.status(400).json({ message: "Invalid theater id" });
 
-    const q = { theater: new mongoose.Types.ObjectId(theaterId) };
+    const q = { theater: safeObjectId(theaterId) };
 
     const todayYmd = toYmdIST();
     const ymd = date ? (/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date(date).toISOString().slice(0, 10)) : null;
@@ -461,18 +474,22 @@ router.get("/theaters/:id", async (req, res) => {
       .lean();
 
     return res.json(docs.map(toDto));
-  } catch {
+  } catch (err) {
+    console.error("❌ GET /showtimes/theaters/:id error:", err);
     return res.status(500).json({ message: "Failed to fetch theater showtimes" });
   }
 });
 
 /* -------------------------------------------------------------------------- */
-/* GET ONE: /api/showtimes/:id -> seats + locks reconciled  (placed AFTER     */
-/* convenience routes so it doesn't shadow them)                              */
+/* GET ONE: /api/showtimes/:id -> seats + locks reconciled                    */
+/* (placed AFTER convenience routes so it doesn't shadow them)               */
 /* -------------------------------------------------------------------------- */
 router.get("/:id", async (req, res) => {
   try {
-    const showtime = await Showtime.findById(req.params.id)
+    const id = String(req.params.id);
+    if (!isId(id)) return res.status(400).json({ message: "Invalid showtime id" });
+
+    const showtime = await Showtime.findById(id)
       .populate("movie", "title posterUrl runtime languages censorRating genres")
       .populate("theater", "name city address")
       .populate("screen", "name rows cols format");
@@ -483,7 +500,7 @@ router.get("/:id", async (req, res) => {
     await reconcileLocks(showtime);
 
     return res.json({
-      ...toDto(showtime.toObject()),
+      ...toDto(showtime.toObject ? showtime.toObject() : showtime),
       seats: showtime.seats,
     });
   } catch (err) {
@@ -515,7 +532,7 @@ router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, re
     ]);
     if (!m || !t || !s) return res.status(400).json({ message: "Invalid movie/theater/screen" });
 
-    if (String(s.theater) !== String(t._id)) {
+    if (s.theater && String(s.theater) !== String(t._id)) {
       return res.status(400).json({ message: "Screen does not belong to the selected theater" });
     }
 
@@ -559,7 +576,10 @@ router.post("/", requireAuth, requireAdmin, requireScopedTheatre, async (req, re
 /* -------------------------------------------------------------------------- */
 router.patch("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
-    const doc = await Showtime.findById(req.params.id).populate("theater", "_id city");
+    const id = String(req.params.id);
+    if (!isId(id)) return res.status(400).json({ message: "Invalid showtime id" });
+
+    const doc = await Showtime.findById(id).populate("theater", "_id city");
     if (!doc) return res.status(404).json({ message: "Showtime not found" });
 
     assertInScopeOrThrow(doc.theater?._id || doc.theater, req);
@@ -607,7 +627,10 @@ router.patch("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req
 /* -------------------------------------------------------------------------- */
 router.delete("/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
-    const doc = await Showtime.findById(req.params.id).populate("theater", "_id");
+    const id = String(req.params.id);
+    if (!isId(id)) return res.status(400).json({ message: "Invalid showtime id" });
+
+    const doc = await Showtime.findById(id).populate("theater", "_id");
     if (!doc) return res.status(404).json({ message: "Showtime not found" });
 
     assertInScopeOrThrow(doc.theater?._id || doc.theater, req);
