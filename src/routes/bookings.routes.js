@@ -115,10 +115,27 @@ const pickUserName = (reqUser, bookingUser) =>
 
 /* ---------------------- Seat initialization / locks ---------------------- */
 
-async function ensureSeatsInitialized(show) {
+/**
+ * Ensure seats array exists on show document.
+ * Accepts options: { session } to operate inside transactions.
+ */
+async function ensureSeatsInitialized(show, options = {}) {
+  const session = options.session;
   if (Array.isArray(show.seats) && show.seats.length > 0) return show;
 
-  const screen = await Screen.findById(show.screen).lean();
+  // load screen (session-aware when possible)
+  let screen;
+  try {
+    if (session && typeof Screen.findById === "function" && typeof Screen.findById().session === "function") {
+      screen = await Screen.findById(show.screen).session(session).lean();
+    } else {
+      screen = await Screen.findById(show.screen).lean();
+    }
+  } catch (e) {
+    // fallback to non-session read
+    screen = await Screen.findById(show.screen).lean();
+  }
+
   const rows = Number(screen?.rows || 10);
   const cols = Number(screen?.cols || 10);
 
@@ -129,26 +146,47 @@ async function ensureSeatsInitialized(show) {
     }
   }
   show.seats = seats;
-  await show.save();
+
+  if (session) {
+    await show.save({ session });
+  } else {
+    await show.save();
+  }
   return show;
 }
 
-async function reconcileLocks(show) {
+/**
+ * Reconcile SeatLock documents with show.seats statuses.
+ * Accepts options: { session } to operate inside transactions.
+ */
+async function reconcileLocks(show, options = {}) {
+  const session = options.session;
   const now = new Date();
 
-  await SeatLock.deleteMany({
+  const deleteQuery = {
     showtime: show._id,
     status: "HELD",
     lockedUntil: { $lte: now },
-  });
+  };
 
-  const activeLocks = await SeatLock.find({
+  if (session) {
+    await SeatLock.deleteMany(deleteQuery).session(session);
+  } else {
+    await SeatLock.deleteMany(deleteQuery);
+  }
+
+  const findQuery = {
     showtime: show._id,
     status: "HELD",
     lockedUntil: { $gt: now },
-  })
-    .select("seat")
-    .lean();
+  };
+
+  let activeLocks;
+  if (session) {
+    activeLocks = await SeatLock.find(findQuery).select("seat").session(session).lean();
+  } else {
+    activeLocks = await SeatLock.find(findQuery).select("seat").lean();
+  }
 
   const lockedSet = new Set(activeLocks.map((l) => l.seat));
   let dirty = false;
@@ -169,7 +207,10 @@ async function reconcileLocks(show) {
       }
     }
   }
-  if (dirty) await show.save();
+  if (dirty) {
+    if (session) await show.save({ session });
+    else await show.save();
+  }
 }
 
 async function freeSeatsForBooking(booking) {
@@ -180,6 +221,7 @@ async function freeSeatsForBooking(booking) {
       return;
     }
     await ensureSeatsInitialized(show);
+    await reconcileLocks(show);
 
     const index = new Map(show.seats.map((s, i) => [seatKey(s.row, s.col), i]));
     for (const s of booking.seats || []) {
@@ -346,6 +388,7 @@ router.post("/lock", requireAuth, async (req, res) => {
 
     const lockedUntil = new Date(Date.now() + 2 * 60 * 1000); // 2 minutes
     try {
+      // bulk create held locks — rely on unique index in SeatLock to avoid duplicates
       await SeatLock.bulkWrite(
         toLockKeys.map((key) => ({
           insertOne: {
@@ -495,9 +538,12 @@ router.post("/confirm", requireAuth, async (req, res) => {
 
     const execTx = async () => {
       await session.withTransaction(async () => {
-        const showForWrite = await Showtime.findById(show._id).session(session).populate("movie");
-        await ensureSeatsInitialized(showForWrite);
-        await reconcileLocks(showForWrite);
+        // re-load show under session and perform session-aware ops
+        let showForWrite = await Showtime.findById(show._id).session(session).populate("movie");
+        if (!showForWrite) throw new Error("Showtime vanished during transaction");
+
+        await ensureSeatsInitialized(showForWrite, { session });
+        await reconcileLocks(showForWrite, { session });
 
         const localIdx = new Map(showForWrite.seats.map((s, i) => [seatKey(s.row, s.col), i]));
 
@@ -518,9 +564,9 @@ router.post("/confirm", requireAuth, async (req, res) => {
         }
         await showForWrite.save({ session });
 
-        const finalAmount = Number(amount || normSeats.length * Number(show.basePrice || 200));
+        const finalAmount = Number(amount || normSeats.length * Number(showForWrite.basePrice || 200));
 
-        // IMPORTANT: set booking.movie from show.movie if available (avoid undefined movie on saved bookings)
+        // set booking.movie from show.movie if available
         const movieValue =
           showForWrite.movie && (typeof showForWrite.movie === "object" ? showForWrite.movie._id ?? showForWrite.movie : showForWrite.movie);
 
@@ -554,16 +600,16 @@ router.post("/confirm", requireAuth, async (req, res) => {
     };
 
     try {
-      await execTx();
-    } catch (e) {
-      const isTransient =
-        e?.errorLabels?.includes?.("TransientTransactionError") ||
-        e?.errorLabels?.includes?.("UnknownTransactionCommitResult");
-      if (isTransient) {
-        console.warn(tag, "Transient transaction error; retrying once:", e?.message);
+      try {
         await execTx();
-      } else {
-        throw e;
+      } catch (e) {
+        const isTransient =
+          e?.errorLabels?.includes?.("TransientTransactionError") ||
+          e?.errorLabels?.includes?.("UnknownTransactionCommitResult");
+        if (isTransient) {
+          console.warn(tag, "Transient transaction error; retrying once:", e?.message);
+          await execTx();
+        } else throw e;
       }
     } finally {
       session.endSession();
