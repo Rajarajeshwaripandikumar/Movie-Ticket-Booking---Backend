@@ -10,18 +10,19 @@ const JWT_SECRET =
   process.env.JWT_SECRET ||
   process.env.JWT_SECRET_BASE64 ||
   "dev_jwt_secret_change_me";
+
 const JWT_PUBLIC_KEY = process.env.JWT_PUBLIC_KEY || null;
 
-// Heartbeat every 10 seconds (safe across proxies/CDNs)
+// heartbeat (10 seconds)
 const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 10000);
 
-// Max open browser tabs allowed per user (optional)
+// Keep open browser tabs limited per user
 const MAX_CLIENTS_PER_USER = parseInt(process.env.SSE_MAX_CLIENTS_PER_USER || "8", 10);
 
-// Store clients: Map(channel → Set of responses)
+// Global client store
 global.sseClients = global.sseClients || new Map();
 
-/* ----------------------------- LOW LEVEL WRITE --------------------------- */
+/* ------------------------------ UTILITIES -------------------------------- */
 function sseWriteRaw(res, str) {
   if (!res || res.writableEnded || res.destroyed) return false;
   try {
@@ -40,7 +41,6 @@ function sseWrite(res, { event, id, data }) {
   return true;
 }
 
-/* --------------------------------- JWT ----------------------------------- */
 function parseCookie(header) {
   const out = {};
   if (!header) return out;
@@ -64,12 +64,26 @@ function extractToken(req) {
   );
 }
 
+/* ------------------------------- FIXED ROLE ------------------------------- */
+/**
+ * FIXED:
+ *   - SUPER_ADMIN → "SUPER_ADMIN"
+ *   - ADMIN → "ADMIN"
+ *   - THEATRE_ADMIN → "THEATRE_ADMIN"
+ *   - THEATER_ADMIN → "THEATRE_ADMIN"
+ *   - User → "USER"
+ */
 function roleFrom(decoded) {
-  return String(decoded?.role || decoded?.roles?.[0] || "USER")
-    .toUpperCase()
-    .includes("ADMIN")
-    ? "ADMIN"
-    : "USER";
+  const raw = String(
+    decoded?.role ||
+    decoded?.roles?.[0] ||
+    "USER"
+  ).trim().toUpperCase();
+
+  if (raw.includes("SUPER")) return "SUPER_ADMIN";
+  if (raw.includes("THEATRE") || raw.includes("THEATER")) return "THEATRE_ADMIN";
+  if (raw === "ADMIN" || raw.includes("ADMIN")) return "ADMIN";
+  return "USER";
 }
 
 /* ------------------------------ CORS PREFLIGHT --------------------------- */
@@ -91,7 +105,6 @@ export const ssePreflight = (req, res) => {
 /* -------------------------------- HANDLER -------------------------------- */
 export const sseHandler = async (req, res) => {
   try {
-    // Keep TCP connection alive (important for SSE behind proxies)
     req.socket?.setKeepAlive?.(true);
     req.socket?.setNoDelay?.(true);
     req.socket?.setTimeout?.(0);
@@ -115,17 +128,32 @@ export const sseHandler = async (req, res) => {
     if (!userId) return res.status(401).end("Unauthorized");
 
     const role = roleFrom(decoded);
-    const scope = String(req.query.scope || "user").toLowerCase();
-    const channel = role === "ADMIN" && scope === "admin" ? "admin" : String(userId);
+
+    /* -------------------------------- CHANNEL FIX ------------------------------- */
+    /**
+     * Old logic → EVERYTHING became "admin"
+     * NEW logic → Fully isolated channels:
+     *   SUPER_ADMIN → "super_admin"
+     *   ADMIN → "admin"
+     *   THEATRE_ADMIN → "theatre_admin_<userId>"
+     *   USER → "<userId>"
+     */
+    let channel;
+
+    if (role === "SUPER_ADMIN") channel = "super_admin";
+    else if (role === "ADMIN") channel = "admin";
+    else if (role === "THEATRE_ADMIN") channel = `theatre_admin_${userId}`;
+    else channel = String(userId);
+
+    /* --------------------------------------------------------------------------- */
 
     // SSE headers
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Content-Encoding", "identity");
-    res.setHeader("X-Accel-Buffering", "no"); // nginx hint (no buffering)
+    res.setHeader("X-Accel-Buffering", "no");
 
-    // Client reconnect hint + hello
     sseWriteRaw(res, "retry: 10000\n");
     sseWriteRaw(res, `: hello ${Date.now()}\n\n`);
     res.flushHeaders?.();
@@ -136,29 +164,32 @@ export const sseHandler = async (req, res) => {
     set.add(res);
     global.sseClients.set(channel, set);
 
-    // Connected signal
+    // Connected event
     sseWrite(res, { event: "connected", data: { channel, role, ts: Date.now() } });
 
-    // Initial notifications (if model exists)
+    // Initial notifications snapshot
     try {
       const Notification = mongoose.model("Notification");
-      const initial = await Notification.find({}).sort({ createdAt: -1 }).limit(20).lean();
+      const initial = await Notification.find({})
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .lean();
+
       sseWrite(res, { event: "init", data: { notifications: initial } });
     } catch {
       sseWrite(res, { event: "init", data: { notifications: [] } });
     }
 
     // Heartbeat
-    const ping = setInterval(
-      () => sseWriteRaw(res, `: ping ${Date.now()}\n\n`),
-      HEARTBEAT_MS
-    );
+    const ping = setInterval(() => {
+      sseWriteRaw(res, `: ping ${Date.now()}\n\n`);
+    }, HEARTBEAT_MS);
 
     const cleanup = () => {
       clearInterval(ping);
-      const c = global.sseClients.get(channel);
-      if (c) c.delete(res);
-      if (!c || c.size === 0) global.sseClients.delete(channel);
+      const set = global.sseClients.get(channel);
+      if (set) set.delete(res);
+      if (!set || set.size === 0) global.sseClients.delete(channel);
     };
 
     req.on("close", cleanup);
@@ -169,20 +200,36 @@ export const sseHandler = async (req, res) => {
   }
 };
 
-/* --------------------------------- PUSH ---------------------------------- */
+/* ----------------------------- PUSH FUNCTIONS ----------------------------- */
+
+/** SEND TO ALL ADMINS (SUPER + ADMIN only) */
 export const pushToAdmins = (payload, { eventName = "notification" } = {}) => {
-  const set = global.sseClients.get("admin") || new Set();
-  for (const res of set) sseWrite(res, { event: eventName, data: payload });
-  return set.size;
+  let total = 0;
+  const channels = ["admin", "super_admin"];
+
+  for (const ch of channels) {
+    const set = global.sseClients.get(ch) || new Set();
+    for (const res of set) {
+      sseWrite(res, { event: eventName, data: payload });
+      total++;
+    }
+  }
+  return total;
 };
 
+/** SEND ONLY TO A SPECIFIC USER */
 export const pushToUser = (userId, payload, { eventName = "notification" } = {}) => {
   const set = global.sseClients.get(String(userId)) || new Set();
-  for (const res of set) sseWrite(res, { event: eventName, data: payload });
-  return set.size;
+  let total = 0;
+
+  for (const res of set) {
+    sseWrite(res, { event: eventName, data: payload });
+    total++;
+  }
+  return total;
 };
 
-/* ----------------------- OPTIONAL ANALYTICS SNAPSHOT ---------------------- */
+/** OPTIONAL: Analytics snapshot (goes only to admins) */
 export async function emitAnalyticsSnapshot(options = {}) {
   try {
     const { days = 30 } = options;
@@ -190,11 +237,6 @@ export async function emitAnalyticsSnapshot(options = {}) {
       type: "analytics_snapshot",
       days,
       ts: Date.now(),
-      metrics: {
-        activeUsers: undefined,
-        ticketsSold: undefined,
-        revenue: undefined,
-      },
     };
     return pushToAdmins(payload, { eventName: "analytics" });
   } catch (e) {
@@ -203,20 +245,10 @@ export async function emitAnalyticsSnapshot(options = {}) {
   }
 }
 
-/* ---------------------------- OPTIONAL WATCHER ---------------------------- */
 export function startBookingWatcher() {
-  try {
-    // Example stub: attach Mongo change streams here and push events
-    // const Booking = mongoose.model("Booking");
-    // const cs = Booking.watch([], { fullDocument: "updateLookup" });
-    // cs.on("change", (ch) => pushToAdmins({ type: "booking_change", change: ch }, { eventName: "booking" }));
-    debug("startBookingWatcher: no-op (stub). Add change streams if needed.");
-  } catch (e) {
-    debug("startBookingWatcher error:", e?.message || e);
-  }
+  debug("startBookingWatcher: stub");
 }
 
-/* ---------------------------- DEFAULT EXPORT ------------------------------ */
 export default {
   sseHandler,
   ssePreflight,
