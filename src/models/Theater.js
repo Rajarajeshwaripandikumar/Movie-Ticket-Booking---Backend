@@ -3,8 +3,18 @@ import mongoose from "mongoose";
 
 const TheaterSchema = new mongoose.Schema(
   {
-    name: { type: String, required: true, trim: true },
-    city: { type: String, required: true, trim: true },
+    name: {
+      type: String,
+      required: [true, "Theater name is required"],
+      trim: true,
+      set: (v) => (v == null ? v : String(v).trim()),
+    },
+    city: {
+      type: String,
+      required: [true, "City is required"],
+      trim: true,
+      set: (v) => (v == null ? v : String(v).trim()),
+    },
     address: { type: String, trim: true, default: "" },
     imageUrl: { type: String, default: "" },
 
@@ -61,6 +71,10 @@ const TheaterSchema = new mongoose.Schema(
 /* -------------------------------------------------------------------------- */
 // Auto-populate lowercase fields for uniqueness enforcement
 TheaterSchema.pre("save", function (next) {
+  // Ensure required fields exist (Mongoose required will also validate, but defensive here)
+  this.name = this.name == null ? this.name : String(this.name).trim();
+  this.city = this.city == null ? this.city : String(this.city).trim();
+
   this.nameLower = (this.name || "").trim().toLowerCase();
   this.cityLower = (this.city || "").trim().toLowerCase();
 
@@ -69,16 +83,50 @@ TheaterSchema.pre("save", function (next) {
     this.displayName = String(this.title).trim();
   }
 
-  // If numeric strings were passed, setters already coerced them to Number or null.
   next();
+});
+
+/* -------------------------------------------------------------------------- */
+/*     Keep lowercase fields in sync for findOneAndUpdate / findByIdAndUpdate  */
+/* -------------------------------------------------------------------------- */
+// When using findOneAndUpdate/updateOne with { new: true } etc., pre('save') is not called.
+// Mirror updates for common update patterns so lower fields remain consistent.
+TheaterSchema.pre("findOneAndUpdate", function (next) {
+  try {
+    const update = this.getUpdate();
+    if (!update) return next();
+
+    // support $set and top-level updates
+    const applied = update.$set ? update.$set : update;
+
+    if (applied.name != null) {
+      applied.name = String(applied.name).trim();
+      (update.$set || update).nameLower = applied.name.toLowerCase();
+    }
+    if (applied.city != null) {
+      applied.city = String(applied.city).trim();
+      (update.$set || update).cityLower = applied.city.toLowerCase();
+    }
+
+    // keep displayName fallback if title is provided and displayName missing
+    if ((applied.title != null) && !(applied.displayName)) {
+      (update.$set || update).displayName = String(applied.title).trim();
+    }
+
+    this.setUpdate(update);
+    next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* -------------------------------------------------------------------------- */
 /*                            Case-insensitive Index                          */
 /* -------------------------------------------------------------------------- */
+// compound unique over (nameLower, cityLower). Build in background to avoid blocking on large collections.
 TheaterSchema.index(
   { nameLower: 1, cityLower: 1 },
-  { unique: true } // enforce unique per lowercase pair
+  { unique: true, background: true }
 );
 
 /* -------------------------------------------------------------------------- */
@@ -101,7 +149,16 @@ TheaterSchema.virtual("titleOrName").get(function () {
   return this.title || this.name || "";
 });
 
-TheaterSchema.set("toJSON", { virtuals: true });
+// Hide internal lower-case fields and __v from JSON responses
+TheaterSchema.set("toJSON", {
+  virtuals: true,
+  transform(doc, ret) {
+    delete ret.__v;
+    delete ret.nameLower;
+    delete ret.cityLower;
+    return ret;
+  },
+});
 TheaterSchema.set("toObject", { virtuals: true });
 
 export default mongoose.model("Theater", TheaterSchema);
