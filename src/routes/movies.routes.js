@@ -157,9 +157,20 @@ router.get("/", async (req, res) => {
 
     if (q) {
       const rx = new RegExp(String(q), "i");
-      filter.$or = [{ title: rx }, { director: rx }, { cast: rx }, { crew: rx }, { genres: rx }, { languages: rx }];
+      // search in title, director, cast.name, crew.name, genres, languages
+      filter.$or = [
+        { title: rx },
+        { director: rx },
+        { "cast.name": rx },
+        { "crew.name": rx },
+        { genres: rx },
+        { languages: rx },
+      ];
     }
-    if (genre) filter.genres = genre;
+    if (genre) {
+      // match genre in genres array
+      filter.genres = { $in: [genre] };
+    }
     if (onlyInTheaters === "true" || onlyInTheaters === true) filter.inTheaters = true;
     if (status) filter.status = status;
 
@@ -198,7 +209,8 @@ router.get("/:id([0-9a-fA-F]{24})", async (req, res) => {
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ ok: false, message: "Movie not found" });
 
-    res.json({ ok: true, data: movie });
+    // return both for compatibility: older clients read `data`, newer can read `movie`
+    res.json({ ok: true, data: movie, movie });
   } catch (err) {
     console.error("[Movies] GET /:id error:", err);
     res.status(500).json({ ok: false, message: "Failed to fetch movie", error: err.message });
@@ -323,14 +335,15 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
         body.runtimeMinutes ? Number(body.runtimeMinutes) : body.runtime ? Number(body.runtime) : existing.runtimeMinutes,
     };
 
-    let oldPosterRef = null;
+    // Only keep the public id for deletion if present (do not treat URL as public id)
+    let oldPosterPublicId = existing.posterPublicId || null;
+
     if (req.file) {
       try {
         const folder = process.env.CLOUDINARY_FOLDER || "movies";
         const result = await uploadBufferToCloudinary(req.file.buffer, folder);
         payload.posterUrl = result.secure_url;
         payload.posterPublicId = result.public_id;
-        oldPosterRef = existing.posterPublicId || existing.posterUrl;
       } catch (e) {
         console.error("[Movies][Admin] Cloudinary upload failed (update):", e?.message || e);
         return res.status(500).json({ ok: false, message: "Failed to upload poster", error: e?.message || String(e) });
@@ -357,15 +370,19 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       return res.status(500).json({ ok: false, message: "Failed to update movie", error: String(validationErr) });
     }
 
-    if (updated && oldPosterRef && oldPosterRef !== (updated.posterPublicId || updated.posterUrl)) {
+    // Only call destroy if we have a cloudinary public id (safe)
+    if (updated && oldPosterPublicId && oldPosterPublicId !== (updated.posterPublicId || updated.posterUrl)) {
       try {
-        if (typeof oldPosterRef === "string" && oldPosterRef.length) {
-          await cloudinary.uploader.destroy(oldPosterRef);
-          console.log("[Cloudinary] destroyed old poster:", oldPosterRef);
-        }
+        await cloudinary.uploader.destroy(oldPosterPublicId);
+        console.log("[Cloudinary] destroyed old poster:", oldPosterPublicId);
       } catch (e) {
-        console.warn("[Movies][Admin] failed to delete previous poster:", e?.message || e);
+        console.warn("[Movies][Admin] failed to delete previous poster (publicId):", e?.message || e);
       }
+    } else if (oldPosterPublicId && !updated) {
+      console.warn("[Movies][Admin] oldPosterPublicId present but update returned no doc; skipping destroy");
+    } else if (!oldPosterPublicId && existing.posterUrl && existing.posterUrl !== updated?.posterUrl) {
+      // If we don't have a public id but the previous poster was a URL, we can't safely tell Cloudinary to destroy it.
+      console.warn("[Movies][Admin] previous poster is a URL (no public id). Skipping cloudinary destroy to avoid accidental deletion.");
     }
 
     console.log(`[Movies][Admin] updated movie id=${id} success`);
@@ -395,6 +412,8 @@ adminRouter.delete("/:id([0-9a-fA-F]{24})", async (req, res) => {
       } catch (err) {
         console.warn("[Cloudinary] Failed to delete poster:", err?.message || err);
       }
+    } else if (deleted.posterUrl) {
+      console.warn("[Movies][Admin] deleted movie had posterUrl but no posterPublicId — cannot safely destroy remote asset");
     }
 
     res.json({ ok: true, message: "Deleted", id: deleted._id });
