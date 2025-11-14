@@ -7,7 +7,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 const AUTH_TRUST_TOKEN = (process.env.AUTH_TRUST_TOKEN || "false").toLowerCase() === "true";
 
 // timeout for DB fetch (ms)
-const FETCH_USER_TIMEOUT_MS = Number(process.env.AUTH_USER_FETCH_TIMEOUT_MS || 1500);
+const FETCH_USER_TIMEOUT_MS = Math.max(200, Number(process.env.AUTH_USER_FETCH_TIMEOUT_MS || 1500));
 
 /* --------------------------------- Role utils -------------------------------- */
 
@@ -60,10 +60,14 @@ async function loadUserFromDbWithTimeout(userId) {
   try {
     // deferred import to avoid cycles
     const User = (await import("../models/User.js")).default;
-    const p = User.findById(userId).select("+password").lean();
+
+    // Only fetch minimal non-sensitive fields we actually need (role, theatre, email, name)
+    const p = User.findById(userId).select("role theatreId theaterId email name").lean();
+
     const t = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error("user-fetch-timeout")), Math.max(200, FETCH_USER_TIMEOUT_MS))
+      setTimeout(() => rej(new Error("user-fetch-timeout")), FETCH_USER_TIMEOUT_MS)
     );
+
     try {
       const result = await Promise.race([p, t]);
       return result || null;
@@ -79,6 +83,19 @@ async function loadUserFromDbWithTimeout(userId) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Helper: parse token and return claims (useful elsewhere)                   */
+/* -------------------------------------------------------------------------- */
+export function parseTokenClaims(token) {
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* 🧩 Middleware: Verify JWT and attach user info                              */
 /* -------------------------------------------------------------------------- */
 export const requireAuth = (opts = {}) => {
@@ -88,7 +105,6 @@ export const requireAuth = (opts = {}) => {
   return async (req, res, next) => {
     // Never block CORS preflight — let OPTIONS through
     if (req.method === "OPTIONS") {
-      // Minimal early return for preflight to avoid auth blocking
       return res.sendStatus(204);
     }
 
@@ -106,7 +122,7 @@ export const requireAuth = (opts = {}) => {
         token = String(req.cookies.token);
       }
 
-      // 3) Query fallback (development/analytics convenience)
+      // 3) Query fallback (development/analytics/stream convenience)
       const isAnalytics = (req.baseUrl && req.baseUrl.includes("/api/analytics"));
       const isStream = (req.path && req.path.includes("/stream"));
       if (
@@ -164,7 +180,7 @@ export const requireAuth = (opts = {}) => {
         theaterId: finalTheatreId ? String(finalTheatreId) : null,
         // include a quiet flag to indicate whether values were loaded from DB
         _fromDb: !!dbUser,
-        // attach raw token claims to help debugging if needed
+        // attach raw token claims to help debugging if needed (only in non-prod)
         _claims: process.env.NODE_ENV !== "production" ? decoded : undefined,
       };
 
@@ -199,10 +215,11 @@ export const requireRoles = (...allowedArgs) => {
 /* 🎭 Middleware: Require theatre ownership                                    */
 /* -------------------------------------------------------------------------- */
 export const requireTheatreOwnership = (req, res, next) => {
+  // Accept many possible parameter names and locations
   const targetTheatreId =
     req.params?.theatreId ??
     req.params?.theaterId ??
-    req.params?.id ??
+    req.params?.id ?? // sometimes the theatre id is in :id
     req.body?.theatreId ??
     req.body?.theaterId ??
     req.body?.theatre ??
@@ -217,8 +234,9 @@ export const requireTheatreOwnership = (req, res, next) => {
 
   if (role === ROLE.SUPER_ADMIN) return next();
 
-  // THEATRE_ADMIN must match their theatreId
   const myId = req.user?.theatreId || req.user?.theaterId || null;
+
+  // THEATRE_ADMIN must match their theatreId. If no target provided, deny (safer).
   if (
     role === ROLE.THEATRE_ADMIN &&
     myId &&
