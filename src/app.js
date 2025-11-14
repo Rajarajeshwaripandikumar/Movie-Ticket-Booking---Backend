@@ -57,14 +57,10 @@ const DEV_ORIGINS = [
     : []),
 ];
 
-// IMPORTANT: include the exact Netlify origin(s) you use here.
-// Added multiple variants to avoid tiny-typo mismatches (rajy/rajv, hyphen variants).
 const PROD_ORIGINS = [
   "https://movieticketbooking-rajy.netlify.app",
-  "https://movie-ticketbooking-rajy.netlify.app",
-  "https://movieticketbooking-rajv.netlify.app",
-  "https://movie-ticketbooking-rajv.netlify.app",
-  // backend origin (harmless to include)
+  // usually not required to allow your own backend as an Origin,
+  // but harmless to keep:
   "https://movie-ticket-booking-backend-o1m2.onrender.com",
   ...(process.env.APP_ORIGINS_PROD
     ? process.env.APP_ORIGINS_PROD.split(",").map((s) => s.trim()).filter(Boolean)
@@ -74,24 +70,30 @@ const PROD_ORIGINS = [
 const ALLOWED_ORIGINS = Array.from(new Set([...DEV_ORIGINS, ...PROD_ORIGINS]));
 console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
 
-/* Normalization helpers for origins to avoid false-negative mismatches */
-function normalizeOrigin(origin) {
-  if (!origin) return "";
-  try {
-    const u = new URL(origin);
-    return `${u.protocol}//${u.host}`.toLowerCase();
-  } catch {
-    return String(origin).toLowerCase();
-  }
-}
-
+/* --------------------------- Robust origin checker ------------------------- */
 function isAllowedOrigin(origin) {
   if (!origin) return true; // non-browser / health checks / server-to-server
-  const norm = normalizeOrigin(origin);
-  if (!global._normAllowedOrigins) {
-    global._normAllowedOrigins = new Set(ALLOWED_ORIGINS.map((o) => normalizeOrigin(o)));
+  try {
+    const u = new URL(origin);
+    const norm = `${u.protocol}//${u.host}`; // strip trailing slash
+
+    // exact whitelist
+    if (ALLOWED_ORIGINS.includes(norm)) return true;
+
+    // allow any Netlify site (preview domains often vary)
+    if (norm.endsWith(".netlify.app")) return true;
+
+    // allow localhost variants
+    if (norm.startsWith("http://localhost") || norm.startsWith("http://127.0.0.1")) return true;
+
+    // helpful debug: print blocked origin once
+    console.warn("[CORS] Blocking origin not in ALLOWED_ORIGINS:", norm);
+
+    return false;
+  } catch (err) {
+    console.warn("[CORS] Invalid origin header:", origin, err && err.message);
+    return false;
   }
-  return global._normAllowedOrigins.has(norm);
 }
 
 // Always vary by Origin so caches don't mix CORS responses
@@ -100,13 +102,21 @@ app.use((req, res, next) => {
   next();
 });
 
+/* ------------------ TEMP DEBUG: log incoming Origin headers ----------------- */
+if (process.env.NODE_ENV !== "production") {
+  app.use((req, res, next) => {
+    const origin = req.headers.origin || "(no-origin)";
+    console.debug(`[CORS-DBG] ${req.method} ${req.path} Origin: ${origin}`);
+    next();
+  });
+}
+
 // Strong manual preflight that mirrors the Origin and allowed headers/methods
 app.use((req, res, next) => {
   if (req.method !== "OPTIONS") return next();
 
   const origin = req.headers.origin || "";
   if (!isAllowedOrigin(origin)) {
-    console.warn("[CORS] ❌ Preflight blocked:", origin);
     return res.sendStatus(403);
   }
 
@@ -116,9 +126,9 @@ app.use((req, res, next) => {
     "Access-Control-Allow-Methods",
     "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
   );
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Idempotency-Key, X-Intent, X-Requested-With, x-role, X-Role, Accept"
+  // include lowercase variants and authorization to be extra-tolerant for preflight
+  res.setHeader("Access-Control-Allow-Headers",
+    "Content-Type, Authorization, authorization, Idempotency-Key, X-Intent, X-Requested-With, x-role, X-Role, Accept"
   );
   res.setHeader("Access-Control-Max-Age", "600"); // 10 minutes
   return res.sendStatus(204);
@@ -153,14 +163,6 @@ app.use(
 app.use(morgan("dev"));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
-
-/* --- Diagnostic middleware (temporary, helpful while debugging CORS/auth) --- */
-app.use((req, res, next) => {
-  const origin = req.headers.origin || "<no-origin>";
-  const auth = req.headers.authorization ? "[has Authorization]" : "[no Authorization]";
-  console.debug(`[DIAG] origin=${origin} method=${req.method} path=${req.path} ${auth}`);
-  next();
-});
 
 /* ───────────────────────────── STATIC FILES ──────────────────────────────── */
 // Use /tmp on Render by default (project dir is read-only there)
@@ -297,6 +299,21 @@ app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", 
  *   /api/screens/by-theatre/:id  (compat alias inside router)
  */
 app.use("/api", screensRoutes);
+
+/* -------------------------------------------------------------------------- */
+/* DEV-ONLY: debug public-theaters route (safe — only in non-production)      */
+/* -------------------------------------------------------------------------- */
+if (process.env.NODE_ENV !== "production") {
+  app.get("/_debug/public-theaters", async (_req, res) => {
+    try {
+      const list = await Theater.find({}).sort({ createdAt: -1 }).lean();
+      return res.json(list);
+    } catch (e) {
+      console.error("[_debug/public-theaters] error:", e && e.message);
+      return res.status(500).json({ message: e.message });
+    }
+  });
+}
 
 /* -------------------------------------------------------------------------- */
 /* 🎯 SSE STREAM TOKEN FIX FOR ANALYTICS                                      */
