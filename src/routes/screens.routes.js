@@ -8,16 +8,20 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { requireScopedTheatre, assertInScopeOrThrow } from "../middleware/scope.js";
 
 const router = Router();
-/** ✅ ensure server auto-mounts under /api (app.use("/api", screensRoutes)) */
+/** ensure server auto-mounts under /api (app.use("/api", screensRoutes)) */
 router.routesPrefix = "/api";
 
-// For multipart/form-data without files (just fields). JSON also works via express.json earlier.
 const parseFields = multer().none();
 const isId = (id) => mongoose.isValidObjectId(String(id || ""));
 
+/* -------------------------
+ * Small helpers
+ * ------------------------- */
+const badReq = (res, msg = "Invalid request") => res.status(400).json({ ok: false, message: msg });
+const notFound = (res, msg = "Not found") => res.status(404).json({ ok: false, message: msg });
+
 /* ----------------------------------------------------------------------------
  * ADMIN (scoped): /api/admin/theaters/:theaterId/screens[/:screenId]
- * SUPER/OWNER -> any theatre; THEATRE_ADMIN -> only their JWT.theatreId
  * ---------------------------------------------------------------------------- */
 
 /** GET all screens of a theatre (admin, scoped) */
@@ -29,9 +33,8 @@ router.get(
   async (req, res) => {
     try {
       const { theaterId } = req.params;
-      if (!isId(theaterId)) return res.status(400).json({ ok: false, message: "Invalid theaterId" });
+      if (!isId(theaterId)) return badReq(res, "Invalid theaterId");
 
-      // Scope: theatre admin must only access own theatre
       assertInScopeOrThrow(theaterId, req);
 
       const screens = await Screen.find({
@@ -48,28 +51,16 @@ router.get(
   }
 );
 
-/**
- * SUPER ADMIN: list ALL screens (no theaterId required)
- * Frontend admin index (Manage Screens) often expects an admin-level list endpoint
- * to populate the screen management UI when a theatreId is not yet selected.
- */
-router.get(
-  "/admin/screens",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const screens = await Screen.find({})
-        .sort({ name: 1 })
-        .lean();
-
-      return res.json({ ok: true, data: screens });
-    } catch (err) {
-      console.error("[Screens] GET ALL (super admin) error:", err);
-      return res.status(500).json({ ok: false, message: err.message });
-    }
+/** SUPER ADMIN: list ALL screens (no theaterId required) */
+router.get("/admin/screens", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const screens = await Screen.find({}).sort({ name: 1 }).lean();
+    return res.json({ ok: true, data: screens });
+  } catch (err) {
+    console.error("[Screens] GET ALL (super admin) error:", err);
+    return res.status(500).json({ ok: false, message: err.message });
   }
-);
+});
 
 /** CREATE a screen in a theatre (admin, scoped) Body: { name, rows, cols } */
 router.post(
@@ -81,31 +72,35 @@ router.post(
   async (req, res) => {
     try {
       const { theaterId } = req.params;
-      if (!isId(theaterId)) return res.status(400).json({ ok: false, message: "Invalid theaterId" });
+      if (!isId(theaterId)) return badReq(res, "Invalid theaterId");
       assertInScopeOrThrow(theaterId, req);
 
       const theater = await Theater.findById(theaterId).select("_id").lean();
-      if (!theater) return res.status(404).json({ ok: false, message: "Theater not found" });
+      if (!theater) return notFound(res, "Theater not found");
 
-      // Accept rows/cols; also tolerate legacy "columns" but store as cols
-      const { name, rows, cols, columns } = req.body || {};
+      const { name, rows, cols, columns, format } = req.body || {};
       const nRows = Number(rows);
       const nCols = Number(cols ?? columns);
 
       if (!name || !nRows || !nCols) {
-        return res.status(400).json({ ok: false, message: "name, rows, and cols are required" });
+        return badReq(res, "name, rows, and cols are required");
       }
       if (!Number.isFinite(nRows) || !Number.isFinite(nCols) || nRows <= 0 || nCols <= 0) {
-        return res.status(400).json({ ok: false, message: "rows and cols must be positive" });
+        return badReq(res, "rows and cols must be positive numbers");
       }
 
-      const created = await Screen.create({
+      const payload = {
         name: String(name).trim(),
         rows: nRows,
-        cols: nCols,            // ✅ canonical
-        theater: theaterId,     // ✅ canonical
-      });
+        cols: nCols,
+        theater: theaterId,
+      };
 
+      if (format !== undefined) payload.format = String(format).trim();
+
+      const created = await Screen.create(payload);
+
+      // respond with the created document (lean copy)
       return res.status(201).json({ ok: true, data: created });
     } catch (err) {
       console.error("[Screens] POST create error:", err);
@@ -126,7 +121,7 @@ router.get(
   async (req, res) => {
     try {
       const { theaterId, screenId } = req.params;
-      if (!isId(theaterId) || !isId(screenId)) return res.status(400).json({ ok: false, message: "Invalid ids" });
+      if (!isId(theaterId) || !isId(screenId)) return badReq(res, "Invalid ids");
 
       assertInScopeOrThrow(theaterId, req);
 
@@ -135,7 +130,7 @@ router.get(
         $or: [{ theater: theaterId }, { theatreId: theaterId }],
       }).lean();
 
-      if (!screen) return res.status(404).json({ ok: false, message: "Screen not found" });
+      if (!screen) return notFound(res, "Screen not found");
 
       return res.json({ ok: true, data: screen });
     } catch (err) {
@@ -145,7 +140,7 @@ router.get(
   }
 );
 
-/** UPDATE a screen (admin, scoped) Body (optional): { name, rows, cols } */
+/** UPDATE a screen (admin, scoped) Body (optional): { name, rows, cols, format } */
 router.patch(
   "/admin/theaters/:theaterId/screens/:screenId",
   requireAuth,
@@ -155,7 +150,7 @@ router.patch(
   async (req, res) => {
     try {
       const { theaterId, screenId } = req.params;
-      if (!isId(theaterId) || !isId(screenId)) return res.status(400).json({ ok: false, message: "Invalid ids" });
+      if (!isId(theaterId) || !isId(screenId)) return badReq(res, "Invalid ids");
 
       assertInScopeOrThrow(theaterId, req);
 
@@ -164,16 +159,18 @@ router.patch(
 
       if (req.body.rows !== undefined) {
         const r = Number(req.body.rows);
-        if (!r || r <= 0) return res.status(400).json({ ok: false, message: "rows must be a positive number" });
+        if (!Number.isFinite(r) || r <= 0) return badReq(res, "rows must be a positive number");
         update.rows = r;
       }
 
       // Accept cols or legacy columns, write to cols
       if (req.body.cols !== undefined || req.body.columns !== undefined) {
         const c = Number(req.body.cols ?? req.body.columns);
-        if (!c || c <= 0) return res.status(400).json({ ok: false, message: "cols must be a positive number" });
+        if (!Number.isFinite(c) || c <= 0) return badReq(res, "cols must be a positive number");
         update.cols = c;
       }
+
+      if (req.body.format !== undefined) update.format = String(req.body.format).trim();
 
       const updated = await Screen.findOneAndUpdate(
         { _id: screenId, $or: [{ theater: theaterId }, { theatreId: theaterId }] },
@@ -181,7 +178,7 @@ router.patch(
         { new: true, runValidators: true }
       ).lean();
 
-      if (!updated) return res.status(404).json({ ok: false, message: "Screen not found" });
+      if (!updated) return notFound(res, "Screen not found");
       return res.json({ ok: true, data: updated });
     } catch (err) {
       console.error("[Screens] PATCH update error:", err);
@@ -202,7 +199,7 @@ router.delete(
   async (req, res) => {
     try {
       const { theaterId, screenId } = req.params;
-      if (!isId(theaterId) || !isId(screenId)) return res.status(400).json({ ok: false, message: "Invalid ids" });
+      if (!isId(theaterId) || !isId(screenId)) return badReq(res, "Invalid ids");
 
       assertInScopeOrThrow(theaterId, req);
 
@@ -211,8 +208,10 @@ router.delete(
         $or: [{ theater: theaterId }, { theatreId: theaterId }],
       });
 
-      if (!deleted) return res.status(404).json({ ok: false, message: "Screen not found" });
+      if (!deleted) return notFound(res, "Screen not found");
 
+      // NOTE: If you maintain showtimes or seat reservations tied to a screen,
+      // consider cascading deletes or marking the screen as disabled instead.
       return res.json({ ok: true });
     } catch (err) {
       console.error("[Screens] DELETE error:", err);
@@ -229,7 +228,7 @@ router.delete(
 router.get("/theaters/:theaterId/screens", async (req, res) => {
   try {
     const { theaterId } = req.params;
-    if (!isId(theaterId)) return res.status(400).json({ ok: false, message: "Invalid theaterId" });
+    if (!isId(theaterId)) return badReq(res, "Invalid theaterId");
 
     const screens = await Screen.find({
       $or: [{ theater: theaterId }, { theatreId: theaterId }],
@@ -248,10 +247,10 @@ router.get("/theaters/:theaterId/screens", async (req, res) => {
 router.get("/screens/:screenId", async (req, res) => {
   try {
     const { screenId } = req.params;
-    if (!isId(screenId)) return res.status(400).json({ ok: false, message: "Invalid screenId" });
+    if (!isId(screenId)) return badReq(res, "Invalid screenId");
 
     const screen = await Screen.findById(screenId).lean();
-    if (!screen) return res.status(404).json({ ok: false, message: "Screen not found" });
+    if (!screen) return notFound(res, "Screen not found");
 
     return res.json({ ok: true, data: screen });
   } catch (err) {
@@ -264,13 +263,12 @@ router.get("/screens/:screenId", async (req, res) => {
  * FRONTEND COMPATIBILITY ALIAS (expected by AdminShowtimes page)
  * ---------------------------------------------------------------------------- */
 
-/** ✅ AdminShowtimes expects: GET /api/screens/by-theatre/:id -> raw array */
+/** AdminShowtimes expects: GET /api/screens/by-theatre/:id -> raw array */
 router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!isId(id)) return res.status(400).json({ error: "Invalid theatre id" });
 
-    // Support both schema shapes: { theater } and legacy { theatreId }
     const list = await Screen.find({
       $or: [{ theater: id }, { theatreId: id }],
     })
@@ -278,11 +276,92 @@ router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
       .sort({ name: 1 })
       .lean();
 
-    // return a raw array (not wrapped), matching your frontend expectations
-    return res.json(list);
+    // return a raw array (not wrapped), matching frontend expectations
+    return res.json(list || []);
   } catch (err) {
     console.error("[Screens] alias /screens/by-theatre/:id error:", err);
     return res.status(500).json({ error: "Failed to load screens" });
+  }
+});
+
+/* --------------------------------------------------------------------------
+ * Seat-label helper endpoints (useful for showtimes / seat map UI)
+ * - Admin scoped: /admin/theaters/:theaterId/screens/:screenId/seats
+ * - Public: /screens/:screenId/seats
+ * Returns: { ok: true, data: [ "A1", "A2", ... ] , rows, cols }
+ * -------------------------------------------------------------------------- */
+
+const buildSeatLabels = (rows, cols) => {
+  // rows is number of rows; convert to letters A, B, ... AA, AB if needed
+  const labels = [];
+  const toRowLabel = (n) => {
+    // 1 -> A, 26 -> Z, 27 -> AA
+    let label = "";
+    let x = n;
+    while (x > 0) {
+      x -= 1;
+      label = String.fromCharCode(65 + (x % 26)) + label;
+      x = Math.floor(x / 26);
+    }
+    return label;
+  };
+
+  for (let r = 1; r <= rows; r++) {
+    const rowLabel = toRowLabel(r);
+    for (let c = 1; c <= cols; c++) {
+      labels.push(`${rowLabel}${c}`);
+    }
+  }
+  return labels;
+};
+
+router.get(
+  "/admin/theaters/:theaterId/screens/:screenId/seats",
+  requireAuth,
+  requireAdmin,
+  requireScopedTheatre,
+  async (req, res) => {
+    try {
+      const { theaterId, screenId } = req.params;
+      if (!isId(theaterId) || !isId(screenId)) return badReq(res, "Invalid ids");
+
+      assertInScopeOrThrow(theaterId, req);
+
+      const screen = await Screen.findOne({
+        _id: screenId,
+        $or: [{ theater: theaterId }, { theatreId: theaterId }],
+      }).lean();
+
+      if (!screen) return notFound(res, "Screen not found");
+
+      const rows = Number(screen.rows) || 0;
+      const cols = Number(screen.cols) || 0;
+      const seats = buildSeatLabels(rows, cols);
+
+      return res.json({ ok: true, data: seats, rows, cols });
+    } catch (err) {
+      console.error("[Screens] GET seats (admin) error:", err);
+      return res.status(500).json({ ok: false, message: err.message });
+    }
+  }
+);
+
+router.get("/screens/:screenId/seats", async (req, res) => {
+  try {
+    const { screenId } = req.params;
+    if (!isId(screenId)) return badReq(res, "Invalid screenId");
+
+    const screen = await Screen.findById(screenId).lean();
+    if (!screen) return notFound(res, "Screen not found");
+
+    const rows = Number(screen.rows) || 0;
+    const cols = Number(screen.cols) || 0;
+    const seats = buildSeatLabels(rows, cols);
+
+    return res.json({ ok: true, data: seats, rows, cols });
+  } catch (err) {
+    console.error("[Screens] GET seats (public) error:", err);
+    return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
