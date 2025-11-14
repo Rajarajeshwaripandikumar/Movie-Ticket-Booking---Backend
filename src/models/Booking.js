@@ -131,6 +131,10 @@ const bookingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// indexes for common queries
+bookingSchema.index({ showtime: 1 });
+bookingSchema.index({ user: 1 });
+
 /* ------------------------- pre-validate normalization ------------------------ */
 /*
   On validate we:
@@ -178,11 +182,16 @@ bookingSchema.pre("validate", async function (next) {
       }
     }
 
-    // Only normalize seats if not already objects with label/row/col
+    // Only normalize seats if any element is not already an object with label/row/col
     const needNormalize =
       !Array.isArray(this.seats) ||
       this.seats.length === 0 ||
-      !(typeof this.seats[0] === "object" && ("label" in this.seats[0] || ("row" in this.seats[0] && "col" in this.seats[0])));
+      this.seats.some(
+        (s) =>
+          s == null ||
+          typeof s !== "object" ||
+          (!("label" in s) && !("row" in s && "col" in s))
+      );
 
     if (needNormalize) {
       this.seats = normalizeSeatsRaw(this.seats || [], seatsPerRow);
@@ -218,4 +227,5 @@ bookingSchema.pre("validate", async function (next) {
   }
 });
 
-export default mongoose.model("Booking", bookingSchema);
+const Booking = mongoose.models?.Booking || mongoose.model("Booking", bookingSchema);
+export default Booking;
