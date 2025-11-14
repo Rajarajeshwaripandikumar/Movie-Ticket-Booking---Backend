@@ -518,7 +518,7 @@ router.post(
       const cols = Number(payload.cols ?? payload.columns ?? screen.columns ?? 12);
 
       const showtimeDoc = {
-        movie: payload.movie || payload.movieId || payload.movieId ?? null,
+        movie: payload.movie ?? payload.movieId ?? null,
         movieTitle: payload.movieTitle || payload.movie_title || payload.movieName || null,
         theater: payload.theater || payload.theatre || screen.theater,
         screen: screen._id,
