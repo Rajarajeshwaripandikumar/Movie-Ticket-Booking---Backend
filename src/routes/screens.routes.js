@@ -48,6 +48,29 @@ router.get(
   }
 );
 
+/**
+ * SUPER ADMIN: list ALL screens (no theaterId required)
+ * Frontend admin index (Manage Screens) often expects an admin-level list endpoint
+ * to populate the screen management UI when a theatreId is not yet selected.
+ */
+router.get(
+  "/admin/screens",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const screens = await Screen.find({})
+        .sort({ name: 1 })
+        .lean();
+
+      return res.json({ ok: true, data: screens });
+    } catch (err) {
+      console.error("[Screens] GET ALL (super admin) error:", err);
+      return res.status(500).json({ ok: false, message: err.message });
+    }
+  }
+);
+
 /** CREATE a screen in a theatre (admin, scoped) Body: { name, rows, cols } */
 router.post(
   "/admin/theaters/:theaterId/screens",
