@@ -28,7 +28,7 @@ router.get("/debug/me", requireAuth, (req, res) => {
 });
 
 // All admin routes require auth
-router.use(requireAuth);
+router.use(requireAuth());
 
 /* ----------------------------- PROFILE / ME ------------------------------ */
 
