@@ -1,4 +1,4 @@
-// backend/src/app.js
+// backend/src/app.js  — patched: call requireAuth() where needed
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -237,32 +237,32 @@ const adminTheatersHandler = async (req, res) => {
 
 app.get(
   "/api/admin/theaters",
-  requireAuth,
+  requireAuth(), // <- fixed
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
   adminTheatersHandler
 );
 
 app.get(
   "/api/admin/theatres",
-  requireAuth,
+  requireAuth(), // <- fixed
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
   adminTheatersHandler
 );
 
 /* -------------------------------------------------------------------------- */
-app.use("/api/admin", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"), adminRoutes);
+app.use("/api/admin", requireAuth(), requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"), adminRoutes);
 
 /* -------------------------------------------------------------------------- */
 app.use("/api", screensRoutes);
 
 /* -------------------------------------------------------------------------- */
-app.use("/api/pricing", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), pricingRoutes);
+app.use("/api/pricing", requireAuth(), requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), pricingRoutes);
 
 /* -------------------------------------------------------------------------- */
-app.use("/api/superadmin", requireAuth, requireRoles("SUPER_ADMIN"), superAdminRoutes);
+app.use("/api/superadmin", requireAuth(), requireRoles("SUPER_ADMIN"), superAdminRoutes);
 
 /* -------------------------------------------------------------------------- */
-app.use("/api/analytics", requireAuth, requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), analyticsRoutes);
+app.use("/api/analytics", requireAuth(), requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), analyticsRoutes);
 
 /* -------------------------------------------------------------------------- */
 /* 404 HANDLER */
