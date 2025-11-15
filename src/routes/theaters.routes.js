@@ -1,4 +1,7 @@
-// backend/src/routes/theaters.routes.js — FULL UPDATED (hardening, small fixes)
+// backend/src/routes/theaters.routes.js — FULL UPDATED (patched)
+// - Fixed requireAuth usage (call factory: requireAuth())
+// - Fixed screenCounts aggregation to consider both theatreId and theater fields
+// - Minor hardening and consistent responses
 import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
@@ -18,7 +21,6 @@ import {
 dotenv.config();
 const router = express.Router();
 /** NOTE: server.js should mount this router under /api/theaters (or provide alias) */
-// non-standard helper, used by your server to auto-mount metadata — keep if your server expects it
 router.routesPrefix = "/api/theaters";
 
 /* ----------------------------- Cloudinary ------------------------------ */
@@ -71,7 +73,6 @@ const debugLog = (...args) => process.env.NODE_ENV !== "production" && console.l
 
 const sanitizePayload = (raw = {}) => {
   const payload = { ...raw };
-  // remove dangerous/internal fields
   delete payload.nameLower;
   delete payload.cityLower;
   delete payload.__v;
@@ -84,7 +85,7 @@ const sanitizePayload = (raw = {}) => {
    ========================================================================= */
 
 /** GET /api/theaters/me  */
-router.get("/me", requireAuth, async (req, res) => {
+router.get("/me", requireAuth(), async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
     if (!theatreId) return res.status(404).json({ message: "Theatre not found" });
@@ -104,7 +105,7 @@ router.get("/me", requireAuth, async (req, res) => {
 });
 
 /** GET /api/theaters/me/screens */
-router.get("/me/screens", requireAuth, async (req, res) => {
+router.get("/me/screens", requireAuth(), async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
     if (!theatreId) return res.status(404).json({ message: "Theatre not found" });
@@ -121,7 +122,7 @@ router.get("/me/screens", requireAuth, async (req, res) => {
 });
 
 /** GET /api/theaters/me/summary */
-router.get("/me/summary", requireAuth, async (req, res) => {
+router.get("/me/summary", requireAuth(), async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
     if (!theatreId) return res.status(404).json({ message: "Theatre not found" });
@@ -144,7 +145,7 @@ router.get("/me/summary", requireAuth, async (req, res) => {
    ========================================================================= */
 
 /** GET /api/theaters/admin/list  */
-router.get("/admin/list", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+router.get("/admin/list", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const filter = isSuperOrOwner(req.user) ? {} : { _id: getTheatreId(req.user) };
     const theaters = await Theater.find(filter).sort({ createdAt: -1 }).lean();
@@ -156,7 +157,7 @@ router.get("/admin/list", requireAuth, requireAdmin, requireScopedTheatre, async
 });
 
 /** LIST alias: GET /api/theaters/admin/theaters */
-router.get("/admin/theaters", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+router.get("/admin/theaters", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const filter = isSuperOrOwner(req.user) ? {} : { _id: getTheatreId(req.user) };
     const theaters = await Theater.find(filter).sort({ createdAt: -1 }).lean();
@@ -168,7 +169,7 @@ router.get("/admin/theaters", requireAuth, requireAdmin, requireScopedTheatre, a
 });
 
 /** LIST mine: GET /api/theaters/admin/theaters/mine */
-router.get("/admin/theaters/mine", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+router.get("/admin/theaters/mine", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const myId = getTheatreId(req.user);
     const theaters = await Theater.find({ _id: myId }).lean();
@@ -180,7 +181,7 @@ router.get("/admin/theaters/mine", requireAuth, requireAdmin, requireScopedTheat
 });
 
 /** POST /api/theaters/admin  */
-router.post("/admin", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
+router.post("/admin", requireAuth(), requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
   try {
     if (!isSuperOrOwner(req.user)) return res.status(403).json({ message: "You are not allowed to create new theaters" });
 
@@ -212,13 +213,14 @@ router.post("/admin", requireAuth, requireAdmin, requireScopedTheatre, upload.si
 });
 
 /** POST alias: /api/theaters/admin/theaters */
-router.post("/admin/theaters", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
-  // reuse the same handler logic as /admin
-  return router.handle(Object.assign(req, { url: "/admin", method: "POST" }), res, () => {});
+router.post("/admin/theaters", requireAuth(), requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res, next) => {
+  // Reuse the same handler: forward request to /admin handler.
+  // Rather than fragile router.handle hacks, call the same logic by delegating.
+  return router.handle(Object.assign(req, { url: "/admin", method: "POST" }), res, next);
 });
 
 /** PUT /api/theaters/admin/:id */
-router.put("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
+router.put("/admin/:id", requireAuth(), requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
@@ -253,13 +255,12 @@ router.put("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, upload
 });
 
 /** PUT alias: /api/theaters/admin/theaters/:id */
-router.put("/admin/theaters/:id", requireAuth, requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res) => {
-  // reuse handler above by rewriting the url/method for this router instance
-  return router.handle(Object.assign(req, { url: `/admin/${req.params.id}`, method: "PUT" }), res, () => {});
+router.put("/admin/theaters/:id", requireAuth(), requireAdmin, requireScopedTheatre, upload.single("image"), async (req, res, next) => {
+  return router.handle(Object.assign(req, { url: `/admin/${req.params.id}`, method: "PUT" }), res, next);
 });
 
 /** PATCH /api/theaters/admin/:id/amenities */
-router.patch("/admin/:id/amenities", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+router.patch("/admin/:id/amenities", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
@@ -281,8 +282,8 @@ router.patch("/admin/:id/amenities", requireAuth, requireAdmin, requireScopedThe
 });
 
 /** PATCH alias: /api/theaters/admin/theaters/:id/amenities */
-router.patch("/admin/theaters/:id/amenities", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
-  return router.handle(Object.assign(req, { url: `/admin/${req.params.id}/amenities`, method: "PATCH" }), res, () => {});
+router.patch("/admin/theaters/:id/amenities", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res, next) => {
+  return router.handle(Object.assign(req, { url: `/admin/${req.params.id}/amenities`, method: "PATCH" }), res, next);
 });
 
 /* =========================================================================
@@ -311,7 +312,15 @@ router.get("/", async (req, res) => {
       Theater.distinct("city"),
     ]);
 
-    const screenCounts = await Screen.aggregate([{ $group: { _id: "$theater", count: { $sum: 1 } } }]);
+    // Use $ifNull to count screens regardless of whether field is `theatreId` or `theater`
+    const screenCounts = await Screen.aggregate([
+      {
+        $group: {
+          _id: { $ifNull: ["$theatreId", "$theater"] },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
     const countMap = new Map(screenCounts.map((c) => [String(c._id), c.count]));
     const enriched = theaters.map((t) => ({ ...t, screensCount: countMap.get(String(t._id)) || 0 }));
 
@@ -361,8 +370,7 @@ router.get("/:theaterId/screens", async (req, res) => {
    ========================================================================= */
 
 /** alias for AdminShowtimes: GET /api/theatre/me  */
-router.get("/theatre/me", requireAuth, async (req, res) => {
-  // mirror /me handler logic directly (don't call router.handle)
+router.get("/theatre/me", requireAuth(), async (req, res) => {
   try {
     const theatreId = req.user?.theatreId;
     if (!theatreId) return res.status(404).json({ message: "Theatre not found" });
@@ -382,7 +390,7 @@ router.get("/theatre/me", requireAuth, async (req, res) => {
 });
 
 /** alias for AdminShowtimes: GET /api/screens/by-theatre/:id  */
-router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
+router.get("/screens/by-theatre/:id", requireAuth(), async (req, res) => {
   try {
     const id = req.params.id;
     if (!isValidId(id)) return res.status(400).json({ error: "Invalid theatre id" });
@@ -397,7 +405,7 @@ router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
 });
 
 /* ----------------------------- DELETE ---------------------------------- */
-router.delete("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
+router.delete("/admin/:id", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ message: "Invalid theater ID" });
@@ -424,9 +432,8 @@ router.delete("/admin/:id", requireAuth, requireAdmin, requireScopedTheatre, asy
 });
 
 /** DELETE alias: /api/theaters/admin/theaters/:id */
-router.delete("/admin/theaters/:id", requireAuth, requireAdmin, requireScopedTheatre, async (req, res) => {
-  // reuse handler above
-  return router.handle(Object.assign(req, { url: `/admin/${req.params.id}`, method: "DELETE" }), res, () => {});
+router.delete("/admin/theaters/:id", requireAuth(), requireAdmin, requireScopedTheatre, async (req, res, next) => {
+  return router.handle(Object.assign(req, { url: `/admin/${req.params.id}`, method: "DELETE" }), res, next);
 });
 
 /* ----------------------- Multer error handler --------------------------- */
@@ -435,7 +442,6 @@ router.use((err, _req, res, next) => {
     if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ message: "File too large (max 5MB)" });
     return res.status(400).json({ message: err.message });
   }
-  // generic upload errors from cloudinary / streamifier
   if (err && err.message && err.message.includes("Cloudinary")) {
     return res.status(500).json({ message: "Image upload failed", error: err.message });
   }
