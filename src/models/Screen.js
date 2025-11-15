@@ -1,17 +1,24 @@
+// backend/src/models/Screen.js
 import mongoose from "mongoose";
 
-/**
- * Screen Model
- * - Belongs to a Theater
- * - Has seat grid (rows × cols)
- * - Supports premium format tags (2D, 3D, IMAX, Dolby, 4DX, etc.)
- */
-
-const ScreenSchema = new mongoose.Schema(
+const seatSchema = new mongoose.Schema(
   {
-    /* -----------------------------------------------------------
-     🎭 Theater Reference
-     ----------------------------------------------------------- */
+    seatId: { type: String, required: true }, // e.g. "A1", "A2"
+    row: { type: String, required: true },    // A, B, C...
+    col: { type: Number, required: true },    // column number
+    seatType: {
+      type: String,
+      enum: ["REGULAR", "PREMIUM", "VIP", "RECLINER", "DISABLED"],
+      default: "REGULAR",
+    },
+    price: { type: Number, default: 0 },
+    isBlocked: { type: Boolean, default: false }, // can't be booked
+  },
+  { _id: false }
+);
+
+const screenSchema = new mongoose.Schema(
+  {
     theater: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Theater",
@@ -19,50 +26,39 @@ const ScreenSchema = new mongoose.Schema(
       index: true,
     },
 
-    /* -----------------------------------------------------------
-     🏷️ Screen Name
-     ----------------------------------------------------------- */
-    name: {
-      type: String,
-      required: true,
-      trim: true,
+    name: { type: String, required: true },
+
+    // You can still store basic structure, but now optional
+    rows: { type: Number, default: 0 },
+    cols: { type: Number, default: 0 },
+
+    // 🔥 FULL seat layout
+    seats: {
+      type: [seatSchema],
+      default: [],
     },
 
-    /* -----------------------------------------------------------
-     🎟️ Seat Grid (rows × columns)
-     ----------------------------------------------------------- */
-    rows: {
-      type: Number,
-      required: true,
-      min: [1, "Rows must be at least 1"],
-    },
-    cols: {
-      type: Number,
-      required: true,
-      min: [1, "Columns must be at least 1"],
+    // supports multi-seat types pricing at screen level
+    pricing: {
+      REGULAR: { type: Number, default: 150 },
+      PREMIUM: { type: Number, default: 250 },
+      VIP: { type: Number, default: 350 },
+      RECLINER: { type: Number, default: 450 },
     },
 
-    /* -----------------------------------------------------------
-     ⭐ Premium Format
-     - Your UI already expects this field in toDto()
-     - Auto-supported by Admin UI filters
-     ----------------------------------------------------------- */
-    format: {
+    // optional screen properties
+    screenType: {
       type: String,
-      trim: true,
-      default: "", // Allowed values: 2D, 3D, IMAX, Dolby, 4DX, etc.
+      enum: ["2D", "3D", "IMAX", "4DX", "DOLBY"],
+      default: "2D",
     },
+
+    active: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
 
-/* -----------------------------------------------------------
-🔒 Unique screen name per theater
-E.g., "Screen 1" shouldn't exist twice under same theater
------------------------------------------------------------ */
-ScreenSchema.index({ theater: 1, name: 1 }, { unique: true });
+// Unique screen name per theater
+screenSchema.index({ theater: 1, name: 1 }, { unique: true });
 
-/* -----------------------------------------------------------
-📦 Export
------------------------------------------------------------ */
-export default mongoose.models.Screen || mongoose.model("Screen", ScreenSchema);
+export default mongoose.model("Screen", screenSchema);
