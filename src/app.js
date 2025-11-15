@@ -216,28 +216,37 @@ app.use("/api/notifications", notificationsRoutes);
 app.use("/api/notification-prefs", notificationPrefRoutes);
 
 /* -------------------------------------------------------------------------- */
-/* ADMIN: /api/admin/theaters */
+/* ADMIN: /api/admin/theaters (accept both spellings) */
 /* -------------------------------------------------------------------------- */
+const adminTheatersHandler = async (req, res) => {
+  try {
+    const role = String(req.user?.role || "").toUpperCase();
+    const myId = req.user?.theatreId || req.user?.theaterId || null;
+
+    const filter = role === "SUPER_ADMIN" ? {} : { _id: myId };
+
+    const list = await Theater.find(filter).sort({ createdAt: -1 }).lean();
+
+    // Return a consistent response shape expected by the frontend
+    return res.json({ ok: true, data: list });
+  } catch (err) {
+    console.error("[/api/admin/theaters] ERROR:", err);
+    return res.status(500).json({ ok: false, message: "Failed to load theaters" });
+  }
+};
+
 app.get(
   "/api/admin/theaters",
   requireAuth,
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
-  async (req, res) => {
-    try {
-      const role = String(req.user?.role || "").toUpperCase();
-      const myId = req.user?.theatreId || req.user?.theaterId || null;
+  adminTheatersHandler
+);
 
-      const filter = role === "SUPER_ADMIN" ? {} : { _id: myId };
-
-      const list = await Theater.find(filter).sort({ createdAt: -1 }).lean();
-
-      // Return a consistent response shape expected by the frontend
-      return res.json({ ok: true, data: list });
-    } catch (err) {
-      console.error("[/api/admin/theaters] ERROR:", err);
-      return res.status(500).json({ ok: false, message: "Failed to load theaters" });
-    }
-  }
+app.get(
+  "/api/admin/theatres",
+  requireAuth,
+  requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
+  adminTheatersHandler
 );
 
 /* -------------------------------------------------------------------------- */
