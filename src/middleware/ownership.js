@@ -1,36 +1,30 @@
 // backend/src/middleware/ownership.js
-// Compatibility shim for older imports that expect `middleware/ownership.js`.
-// Re-exports the canonical helpers from auth.js and scope.js so both old and
-// new code paths work without touching many files.
+// Compatibility shim for older imports expecting `middleware/ownership.js`.
+// Re-exports canonical helpers from auth.js and scope.js.
 
 import { requireTheatreOwnership as _requireTheatreOwnership } from "./auth.js";
 import { isSuperOrOwner as _isSuperOrOwner, getTheatreId as _getTheatreId } from "./scope.js";
 
-/**
- * Named exports:
- *  - requireTheatreOwnership(req,res,next)  -> middleware (same shape as original)
- *  - requireOwnership(req,res,next)         -> alias for requireTheatreOwnership
- *  - isSuperOrOwner(user)                   -> role helper
- *  - getTheatreId(user)                     -> helper
- *
- * Default export keeps backwards-compatibility with `import ownership from './ownership'`
- */
 export const requireTheatreOwnership = (req, res, next) => {
-  // if the auth middleware exported the function, call it directly
-  if (typeof _requireTheatreOwnership === "function") return _requireTheatreOwnership(req, res, next);
-  // otherwise, fail safe
+  if (typeof _requireTheatreOwnership === "function")
+    return _requireTheatreOwnership(req, res, next);
   return res.status(500).json({ message: "Ownership middleware not available" });
 };
 
-// alias historically used in some codebases
+// 🔥 American spelling alias (needed!)
+export const requireTheaterOwnership = requireTheatreOwnership;
+
+// Older alias
 export const requireOwnership = requireTheatreOwnership;
 
-// small helpers re-export
+// Helpers
 export const isSuperOrOwner = _isSuperOrOwner;
 export const getTheatreId = _getTheatreId;
 
+// Default export (backward compatibility)
 export default {
   requireTheatreOwnership,
+  requireTheaterOwnership,
   requireOwnership,
   isSuperOrOwner,
   getTheatreId,
