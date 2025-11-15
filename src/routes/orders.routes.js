@@ -8,9 +8,8 @@ import Booking from "../models/Booking.js";
 import Showtime from "../models/Showtime.js";
 import User from "../models/User.js";
 
-import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/auth.js"; // adjust path if single export
-import notifyService from "../services/notify.service.js"; // dispatchNotification
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { dispatchNotification } from "../services/notify.service.js"; // named export
 import { sendEmail, renderTemplate } from "../models/mailer.js"; // optional email fallback
 
 const router = express.Router();
@@ -24,19 +23,21 @@ function parseSeats(seats) {
   // Accept [{row, col}] or ["r:c"] or "1-2,1-3"
   if (!seats) return [];
   if (Array.isArray(seats)) {
-    return seats.map((s) => {
-      if (typeof s === "string") {
-        const m = s.match(/(\d+)[-:](\d+)/);
-        if (m) return { row: Number(m[1]), col: Number(m[2]) };
+    return seats
+      .map((s) => {
+        if (typeof s === "string") {
+          const m = s.match(/(\d+)[-:](\d+)/);
+          if (m) return { row: Number(m[1]), col: Number(m[2]) };
+          return null;
+        }
+        if (typeof s === "object" && s !== null) {
+          const r = Number(s.row ?? s.r ?? s[0]);
+          const c = Number(s.col ?? s.c ?? s[1]);
+          if (Number.isInteger(r) && Number.isInteger(c)) return { row: r, col: c };
+        }
         return null;
-      }
-      if (typeof s === "object" && s !== null) {
-        const r = Number(s.row ?? s.r ?? s[0]);
-        const c = Number(s.col ?? s.c ?? s[1]);
-        if (Number.isInteger(r) && Number.isInteger(c)) return { row: r, col: c };
-      }
-      return null;
-    }).filter(Boolean);
+      })
+      .filter(Boolean);
   }
   if (typeof seats === "string") {
     return seats
@@ -57,7 +58,7 @@ function parseSeats(seats) {
    - In production you should integrate this with payment initiation (Razorpay checkout order)
    - This endpoint simply saves an order record in PENDING/CART state for later webhook to confirm
 */
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", requireAuth(), async (req, res) => {
   try {
     const userId = String(req.user._id);
     const idemKey = (req.headers["x-idempotency-key"] || "").trim() || null;
@@ -100,7 +101,7 @@ router.post("/", requireAuth, async (req, res) => {
 /* -------------------------------------------------------------------------- */
 /* GET / - list orders (admin only)                                             */
 /* -------------------------------------------------------------------------- */
-router.get("/", requireAuth, requireAdmin, async (req, res) => {
+router.get("/", requireAuth(), requireAdmin, async (req, res) => {
   try {
     const q = {};
     // optional query filters
@@ -125,7 +126,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
 /* -------------------------------------------------------------------------- */
 /* GET /me - current user's orders                                               */
 /* -------------------------------------------------------------------------- */
-router.get("/me", requireAuth, async (req, res) => {
+router.get("/me", requireAuth(), async (req, res) => {
   try {
     const userId = String(req.user._id);
     const rows = await Order.find({ user: userId })
@@ -187,8 +188,6 @@ router.post("/payment-success", async (req, res) => {
     // Optional: verify Razorpay signature if env present
     if (String(provider).toLowerCase() === "razorpay" && process.env.RAZORPAY_SECRET) {
       try {
-        // Razorpay typically sends: hmac(secret, order_id|payment_id) in X-Razorpay-Signature or in payload fields
-        // We'll support simple scenario: signature in req.body.signature and verify HMAC of paymentId|orderMetaId
         const secret = String(process.env.RAZORPAY_SECRET);
         const toSign = `${orderMetaId || ""}|${paymentId}`; // adapt depending on provider's doc
         const h = crypto.createHmac("sha256", secret).update(toSign).digest("hex");
@@ -227,8 +226,6 @@ router.post("/payment-success", async (req, res) => {
         createdOrder = await newOrder.save({ session });
 
         // Create a lightweight Booking doc so bookings analytics and tickets work.
-        // If you have a more complex booking flow (seat locks, transactions against showtime),
-        // you should replace this with your confirm booking flow that updates showtime.seats.
         const bk = new Booking({
           user: mongoose.Types.ObjectId(userId),
           showtime: mongoose.Types.ObjectId(showtimeId),
@@ -264,8 +261,8 @@ router.post("/payment-success", async (req, res) => {
 
     // Post-processing: send notification (best-effort)
     try {
-      // Use notifyService.dispatchNotification: target is user id
-      const notifRes = await notifyService.dispatchNotification(String(userId), {
+      // Use dispatchNotification (named export) to notify the user
+      const notifRes = await dispatchNotification(String(userId), {
         type: "BOOKING_CONFIRMED",
         title: "🎟️ Booking Confirmed",
         message: `Your booking is confirmed (Order: ${String(createdOrder?._id || "")}).`,
@@ -277,8 +274,7 @@ router.post("/payment-success", async (req, res) => {
         },
       });
 
-      // Also send an email using your mailer as fallback (notifyService will respect prefs)
-      // (no-op if preferences disallow)
+      // Also log/optionally send an email using your mailer as fallback (notify service should handle prefs)
       console.log("[orders] notification result:", notifRes?.results || notifRes);
     } catch (notifyErr) {
       console.warn("[orders] notification failed:", notifyErr);
