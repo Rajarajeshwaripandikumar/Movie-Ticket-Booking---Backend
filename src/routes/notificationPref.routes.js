@@ -1,4 +1,4 @@
-// routes/notificationPrefs.routes.js
+// backend/src/routes/notificationPrefs.routes.js
 import { Router } from "express";
 import NotificationPref from "../models/NotificationPref.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -42,61 +42,80 @@ function toDotSet(obj, prefix = "", out = {}) {
   return out;
 }
 
-// GET /me -> always return a complete object (defaults merged with stored)
-router.get("/me", requireAuth, async (req, res) => {
-  const doc = await NotificationPref.findOne({ user: req.user._id }).lean();
-  const merged = {
-    ...defaultPrefs,
-    ...(doc ? {
-      bookingConfirmed: { ...defaultPrefs.bookingConfirmed, ...(doc.bookingConfirmed || {}) },
-      bookingCancelled: { ...defaultPrefs.bookingCancelled, ...(doc.bookingCancelled || {}) },
-      bookingReminder:  { ...defaultPrefs.bookingReminder,  ...(doc.bookingReminder  || {}) },
-      showtimeChanged:  { ...defaultPrefs.showtimeChanged,  ...(doc.showtimeChanged  || {}) },
-      upcomingMovie:    { ...defaultPrefs.upcomingMovie,    ...(doc.upcomingMovie    || {}) },
-      timezone: doc.timezone || defaultPrefs.timezone,
-    } : {}),
+function buildMerged(prefDoc) {
+  return {
+    bookingConfirmed: { ...defaultPrefs.bookingConfirmed, ...(prefDoc?.bookingConfirmed || {}) },
+    bookingCancelled: { ...defaultPrefs.bookingCancelled, ...(prefDoc?.bookingCancelled || {}) },
+    bookingReminder:  { ...defaultPrefs.bookingReminder,  ...(prefDoc?.bookingReminder  || {}) },
+    showtimeChanged:  { ...defaultPrefs.showtimeChanged,  ...(prefDoc?.showtimeChanged  || {}) },
+    upcomingMovie:    { ...defaultPrefs.upcomingMovie,    ...(prefDoc?.upcomingMovie    || {}) },
+    timezone: prefDoc?.timezone || defaultPrefs.timezone,
   };
-  res.json(merged);
+}
+
+/**
+ * GET /api/notification-prefs/me
+ * Return merged preferences (defaults + stored)
+ */
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const pref = await NotificationPref.findOne({ user: req.user._id }).lean();
+    const merged = buildMerged(pref);
+    return res.json({ ok: true, prefs: merged, raw: pref || null });
+  } catch (err) {
+    console.error("[NotificationPrefs] GET /me error:", err);
+    return res.status(500).json({ ok: false, error: "Failed to load preferences" });
+  }
 });
 
-// PATCH /me -> partial update, whitelist + coerce booleans, upsert
+/**
+ * PATCH /api/notification-prefs/me
+ * Partial update, only whitelisted boolean paths + timezone allowed.
+ * Upserts a document for the user if missing.
+ */
 router.patch("/me", requireAuth, async (req, res) => {
-  const flat = toDotSet(req.body);
+  try {
+    const flat = toDotSet(req.body || {});
+    const $set = {};
 
-  const $set = {};
-  for (const [path, val] of Object.entries(flat)) {
-    if (path === "timezone") {
-      // Basic TZ guard (keep it simple; you can validate against IANA DB if you like)
-      if (typeof val === "string" && val.trim()) $set.timezone = val.trim();
-      continue;
+    for (const [path, val] of Object.entries(flat)) {
+      if (path === "timezone") {
+        if (typeof val === "string" && val.trim()) {
+          // simple guard — do not accept extremely long strings
+          const tz = val.trim();
+          if (tz.length > 64) return res.status(400).json({ ok: false, error: "Invalid timezone" });
+          $set.timezone = tz;
+        }
+        continue;
+      }
+
+      if (allowedBooleanPaths.has(path)) {
+        $set[path] = coerceBoolean(val);
+      }
     }
-    if (allowedBooleanPaths.has(path)) {
-      $set[path] = coerceBoolean(val);
+
+    if (Object.keys($set).length === 0) {
+      return res.status(400).json({ ok: false, error: "No valid fields to update" });
     }
+
+    // Build update: ensure the user field exists and merge
+    const update = {
+      $set: { ...$set, user: req.user._id },
+      $setOnInsert: { user: req.user._id, createdAt: new Date() },
+    };
+
+    const pref = await NotificationPref.findOneAndUpdate(
+      { user: req.user._id },
+      update,
+      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    ).lean();
+
+    const merged = buildMerged(pref);
+    return res.json({ ok: true, prefs: merged, raw: pref });
+  } catch (err) {
+    console.error("[NotificationPrefs] PATCH /me error:", err);
+    return res.status(500).json({ ok: false, error: "Failed to update preferences" });
   }
-
-  if (Object.keys($set).length === 0 && !$set.timezone) {
-    return res.status(400).json({ message: "No valid fields to update" });
-  }
-
-  const pref = await NotificationPref.findOneAndUpdate(
-    { user: req.user._id },
-    { $set: { user: req.user._id, ...$set } },
-    { new: true, upsert: true }
-  ).lean();
-
-  // Return the merged view so the frontend always receives a full object
-  const merged = {
-    ...defaultPrefs,
-    bookingConfirmed: { ...defaultPrefs.bookingConfirmed, ...(pref.bookingConfirmed || {}) },
-    bookingCancelled: { ...defaultPrefs.bookingCancelled, ...(pref.bookingCancelled || {}) },
-    bookingReminder:  { ...defaultPrefs.bookingReminder,  ...(pref.bookingReminder  || {}) },
-    showtimeChanged:  { ...defaultPrefs.showtimeChanged,  ...(pref.showtimeChanged  || {}) },
-    upcomingMovie:    { ...defaultPrefs.upcomingMovie,    ...(pref.upcomingMovie    || {}) },
-    timezone: pref.timezone || defaultPrefs.timezone,
-  };
-
-  res.json(merged);
 });
 
 export default router;
