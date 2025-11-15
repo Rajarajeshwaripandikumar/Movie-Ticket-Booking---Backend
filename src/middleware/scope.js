@@ -1,23 +1,42 @@
 // backend/src/middleware/scope.js
 import mongoose from "mongoose";
-import { ROLE } from "./auth.js"; // canonical roles
+import { ROLE } from "./auth.js"; // must export canonical ROLE from your auth middleware
 
-/* -------------------------------------------------------------------------- */
-/* Utility: normalize role match                                              */
-/* -------------------------------------------------------------------------- */
+/**
+ * normalizeRole(v) -> returns one of ROLE.SUPER_ADMIN | ROLE.THEATRE_ADMIN | ROLE.ADMIN | ROLE.USER
+ * Keep normalized roles aligned with the canonical ROLE object used elsewhere.
+ */
 function normalizeRole(v) {
   if (!v) return ROLE.USER;
   const s = String(v).trim().toUpperCase().replace(/\s+/g, "_");
-  if (s === "SUPER-ADMIN" || s === "SUPERADMIN" || s === "OWNER") return ROLE.SUPER_ADMIN;
-  if (s === "ADMIN") return ROLE.ADMIN;
+
+  if (s === "SUPER-ADMIN" || s === "SUPERADMIN" || s === "OWNER" || s === "OWNER_ADMIN")
+    return ROLE.SUPER_ADMIN;
+
+  // Accept "ADMIN" as either a generic admin or map to theatre-level admin depending on your ROLE definitions.
+  // Prefer explicit THEATRE_ADMIN when possible.
+  if (s === "ADMIN") {
+    // If your ROLE contains ADMIN as a separate entry, keep it; otherwise map ADMIN -> THEATRE_ADMIN
+    return ROLE.ADMIN ?? ROLE.THEATRE_ADMIN ?? ROLE.USER;
+  }
+
   if (
     s === "THEATER_ADMIN" ||
     s === "THEATRE_ADMIN" ||
     s === "MANAGER" ||
     s === "PVR_ADMIN" ||
     s === "PVR_MANAGER"
-  ) return ROLE.THEATRE_ADMIN;
-  return s;
+  ) {
+    return ROLE.THEATRE_ADMIN;
+  }
+
+  // Default fallback — try to match any direct ROLE key, else USER
+  if (Object.values(ROLE).includes(s)) {
+    // if ROLE values are strings like 'SUPER_ADMIN', this maps correctly
+    return s;
+  }
+
+  return ROLE.USER;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -46,11 +65,10 @@ export function getTheatreId(user) {
 /* Helper: attach scope helpers (fills multiple convenient fields)            */
 /* -------------------------------------------------------------------------- */
 function attachScopeToReq(req, tidObj) {
-  // tidObj is a mongoose ObjectId
   if (!req) return;
   req.scope = req.scope || {};
   req.scope.theatreId = tidObj;
-  // also expose string-friendly variants to match existing code that compares strings
+  // string-friendly variants for older code
   req.scopeTheatreId = String(tidObj);
   req.scopeTheaterId = String(tidObj);
 }
@@ -59,6 +77,7 @@ function attachScopeToReq(req, tidObj) {
 /* Middleware: require the user to have a scoped theatre                      */
 /* SUPER_ADMIN → always allowed                                               */
 /* THEATRE_ADMIN or ADMIN → must have theatreId                               */
+/* NOTE: expects req.user already populated by your authentication middleware  */
 /* -------------------------------------------------------------------------- */
 export function requireScopedTheatre(req, res, next) {
   try {
@@ -73,7 +92,7 @@ export function requireScopedTheatre(req, res, next) {
     const role = normalizeRole(req.user?.role);
     const tid = getTheatreId(req.user);
 
-    // Allow both THEATRE_ADMIN and ADMIN if they have a theatreId assigned
+    // Allow both theatre-level admin types if they have a theatreId assigned
     if (role === ROLE.THEATRE_ADMIN || role === ROLE.ADMIN) {
       if (!tid) {
         return res.status(403).json({ message: "Your admin account is not linked to any theatre" });
@@ -97,7 +116,6 @@ export function requireScopedTheatre(req, res, next) {
 /* Throws an actual error (so try/catch works)                                */
 /* -------------------------------------------------------------------------- */
 export function assertInScopeOrThrow(resourceTheatreId, req) {
-  // resourceTheatreId may be a string or ObjectId
   if (!req?.user) {
     const err = new Error("Unauthorized: no user attached");
     err.status = 401;
@@ -109,7 +127,6 @@ export function assertInScopeOrThrow(resourceTheatreId, req) {
   const role = normalizeRole(req.user?.role);
   const tid = getTheatreId(req.user);
 
-  // Only theatre-level admins (THEATRE_ADMIN or ADMIN) are allowed to check scope here
   if (role !== ROLE.THEATRE_ADMIN && role !== ROLE.ADMIN) {
     const err = new Error("Forbidden: Admin role required");
     err.status = 403;
@@ -122,13 +139,14 @@ export function assertInScopeOrThrow(resourceTheatreId, req) {
     throw err;
   }
 
-  // normalize both to strings for safe comparison
-  if (String(tid) !== String(resourceTheatreId)) {
+  // If resourceTheatreId might be an object, normalize to string
+  const resourceTid = String(resourceTheatreId?._id ?? resourceTheatreId);
+
+  if (String(tid) !== String(resourceTid)) {
     const err = new Error("Forbidden: Outside your theatre scope");
     err.status = 403;
     throw err;
   }
 
-  // attach scope (helpful for callers that expect req.scope)
   attachScopeToReq(req, tid);
 }
