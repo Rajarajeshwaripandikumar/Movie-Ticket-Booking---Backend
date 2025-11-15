@@ -1,4 +1,4 @@
-// backend/src/app.js  — patched: call requireAuth() where needed
+// backend/src/app.js  — patched and consolidated
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -20,7 +20,7 @@ import bookingsRoutes from "./routes/bookings.routes.js";
 import paymentsRoutes from "./routes/payments.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
 import profileRoutes from "./routes/profile.routes.js";
-import ticketRoutes from "./routes/ticket.routes.js";
+import ticketsRoutes from "./routes/tickets.routes.js"; // <- plural (matches your file)
 import theatersRouter from "./routes/theaters.routes.js";
 import notificationsRoutes from "./routes/notifications.routes.js";
 import notificationPrefRoutes from "./routes/notificationPref.routes.js";
@@ -200,8 +200,8 @@ app.use("/api/upload", uploadRoutes);
 app.use("/api/movies", moviesRoutes);
 app.use("/api/showtimes", showtimesRoutes);
 app.use("/api/theaters", theatersRouter);
-app.use("/api/theatres", theatersRouter);
-app.use("/api/tickets", ticketRoutes);
+app.use("/api/theatres", theatersRouter); // alias
+app.use("/api/tickets", ticketsRoutes);
 app.use("/api/bookings", bookingsRoutes);
 app.use("/api/payments", paymentsRoutes);
 
@@ -210,10 +210,10 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 app.use("/api/orders", ordersRouter);
-app.use("/api/profile", profileRoutes);
+app.use("/api/profile", requireAuth(), profileRoutes);
 
 app.use("/api/notifications", notificationsRoutes);
-app.use("/api/notification-prefs", notificationPrefRoutes);
+app.use("/api/notification-prefs", requireAuth(), notificationPrefRoutes);
 
 /* -------------------------------------------------------------------------- */
 /* ADMIN: /api/admin/theaters (accept both spellings) */
@@ -237,31 +237,29 @@ const adminTheatersHandler = async (req, res) => {
 
 app.get(
   "/api/admin/theaters",
-  requireAuth(), // <- fixed
+  requireAuth(), // <- ensure factory called
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
   adminTheatersHandler
 );
 
 app.get(
   "/api/admin/theatres",
-  requireAuth(), // <- fixed
+  requireAuth(), // <- ensure factory called
   requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"),
   adminTheatersHandler
 );
 
 /* -------------------------------------------------------------------------- */
+/* Mount admin dashboard/wide routes (protected)                             */
+/* -------------------------------------------------------------------------- */
 app.use("/api/admin", requireAuth(), requireRoles("SUPER_ADMIN", "THEATRE_ADMIN", "ADMIN"), adminRoutes);
 
 /* -------------------------------------------------------------------------- */
-app.use("/api", screensRoutes);
-
+/* Mount other routers (some have their own internal requireAuth calls)       */
 /* -------------------------------------------------------------------------- */
+app.use("/api", screensRoutes); // screensRoutes.router.routesPrefix === "/api/screens"
 app.use("/api/pricing", requireAuth(), requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), pricingRoutes);
-
-/* -------------------------------------------------------------------------- */
 app.use("/api/superadmin", requireAuth(), requireRoles("SUPER_ADMIN"), superAdminRoutes);
-
-/* -------------------------------------------------------------------------- */
 app.use("/api/analytics", requireAuth(), requireRoles("SUPER_ADMIN", "THEATRE_ADMIN"), analyticsRoutes);
 
 /* -------------------------------------------------------------------------- */
