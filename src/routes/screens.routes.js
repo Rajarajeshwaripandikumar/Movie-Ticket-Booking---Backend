@@ -1,4 +1,6 @@
-// backend/src/routes/screens.routes.js
+// backend/src/routes/screens.routes.js — FULL UPDATED (patched)
+// - Fixed requireAuth usage (call factory: requireAuth())
+// - Set router.routesPrefix to /api/screens for predictable auto-mount
 import { Router } from "express";
 import mongoose from "mongoose";
 import multer from "multer";
@@ -8,8 +10,8 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { requireScopedTheatre, assertInScopeOrThrow } from "../middleware/scope.js";
 
 const router = Router();
-/** ensure server auto-mounts under /api (app.use("/api", screensRoutes)) */
-router.routesPrefix = "/api";
+/** ensure server auto-mounts under /api/screens (app or autoloader can use this) */
+router.routesPrefix = "/api/screens";
 
 const parseFields = multer().none();
 const isId = (id) => mongoose.isValidObjectId(String(id || ""));
@@ -27,7 +29,7 @@ const notFound = (res, msg = "Not found") => res.status(404).json({ ok: false, m
 /** GET all screens of a theatre (admin, scoped) */
 router.get(
   "/admin/theaters/:theaterId/screens",
-  requireAuth,
+  requireAuth(), // FIXED: call factory
   requireAdmin,
   requireScopedTheatre,
   async (req, res) => {
@@ -53,7 +55,7 @@ router.get(
 
 /** SUPER ADMIN: list ALL screens (no theaterId required) */
 /** Now scoped: SUPER_ADMIN => all, THEATRE_ADMIN => only their theatre */
-router.get("/admin/screens", requireAuth, requireAdmin, async (req, res) => {
+router.get("/admin/screens", requireAuth(), requireAdmin, async (req, res) => {
   try {
     const role = String(req.user?.role || "").toUpperCase();
     const myTheatre = req.user?.theatreId || req.user?.theaterId || null;
@@ -63,7 +65,7 @@ router.get("/admin/screens", requireAuth, requireAdmin, async (req, res) => {
       if (!myTheatre) return res.status(403).json({ ok: false, message: "No theatre set for this admin" });
       filter = { $or: [{ theater: myTheatre }, { theatreId: myTheatre }] };
     } else {
-      // SUPER_ADMIN and ADMIN (if desired) see all
+      // SUPER_ADMIN and ADMIN (if intended) see all
       filter = {};
     }
 
@@ -78,7 +80,7 @@ router.get("/admin/screens", requireAuth, requireAdmin, async (req, res) => {
 /** CREATE a screen in a theatre (admin, scoped) Body: { name, rows, cols } */
 router.post(
   "/admin/theaters/:theaterId/screens",
-  requireAuth,
+  requireAuth(),
   requireAdmin,
   requireScopedTheatre,
   parseFields,
@@ -128,7 +130,7 @@ router.post(
 /** GET one screen (admin, scoped) */
 router.get(
   "/admin/theaters/:theaterId/screens/:screenId",
-  requireAuth,
+  requireAuth(),
   requireAdmin,
   requireScopedTheatre,
   async (req, res) => {
@@ -156,7 +158,7 @@ router.get(
 /** UPDATE a screen (admin, scoped) Body (optional): { name, rows, cols, format } */
 router.patch(
   "/admin/theaters/:theaterId/screens/:screenId",
-  requireAuth,
+  requireAuth(),
   requireAdmin,
   requireScopedTheatre,
   parseFields,
@@ -206,7 +208,7 @@ router.patch(
 /** DELETE a screen (admin, scoped) */
 router.delete(
   "/admin/theaters/:theaterId/screens/:screenId",
-  requireAuth,
+  requireAuth(),
   requireAdmin,
   requireScopedTheatre,
   async (req, res) => {
@@ -277,7 +279,7 @@ router.get("/screens/:screenId", async (req, res) => {
  * ---------------------------------------------------------------------------- */
 
 /** AdminShowtimes expects: GET /api/screens/by-theatre/:id -> raw array */
-router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
+router.get("/screens/by-theatre/:id", requireAuth(), async (req, res) => {
   try {
     const id = req.params.id;
     if (!isId(id)) return res.status(400).json({ error: "Invalid theatre id" });
@@ -336,7 +338,7 @@ const buildSeatLabels = (rows, cols) => {
 
 router.get(
   "/admin/theaters/:theaterId/screens/:screenId/seats",
-  requireAuth,
+  requireAuth(),
   requireAdmin,
   requireScopedTheatre,
   async (req, res) => {
