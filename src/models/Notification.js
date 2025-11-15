@@ -1,71 +1,62 @@
 // backend/src/models/Notification.js
 import mongoose from "mongoose";
 
-const Schema = mongoose.Schema;
-
-/* ==========================================================================
-   NOTIFICATION SCHEMA
-   Supports:
-   - User-specific notifications
-   - Admin notifications
-   - Global "ALL" audience notifications
-   - Rich payload + multiple channels
-   - Mark-as-read (single or multi-user)
-   ========================================================================== */
-
-const notificationSchema = new Schema(
+const notificationSchema = new mongoose.Schema(
   {
-    /* ---------------------------- Recipient binding ---------------------------- */
-
-    // USER-only notifications. Optional because admins + ALL may not have a user.
-    user: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      default: null, // previously required → now optional for ADMIN/ALL
-      index: true,
-    },
-
-    // Audience:
-    // USER  → Only that specific user
-    // ADMIN → All admins / theatre-admins
-    // ALL   → All users + admins
+    // Target audience type:
     audience: {
       type: String,
-      enum: ["USER", "ADMIN", "ALL"],
+      enum: ["USER", "THEATER_USERS", "THEATER_ADMIN", "ADMIN", "ALL"],
       default: "USER",
       index: true,
     },
 
-    /* ------------------------------- Meta fields ------------------------------- */
+    /**
+     * Who should receive this?
+     *
+     * USER               → specific user only
+     * THEATER_USERS      → all users who booked in this theater
+     * THEATER_ADMIN      → specific theater admin
+     * ADMIN              → all super-admins
+     * ALL                → everyone
+     */
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+
+    theater: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Theater",
+      default: null,
+      index: true,
+    },
 
     type: {
       type: String,
-      required: true,
       enum: [
-        // BOOKING
         "BOOKING_CONFIRMED",
         "BOOKING_CANCELLED",
         "BOOKING_REMINDER",
-
-        // CONTENT / SYSTEM UPDATES
         "SHOWTIME_CHANGED",
         "UPCOMING_MOVIE",
-
-        // PAYMENTS
         "PAYMENT_FAILED",
         "PAYMENT_SUCCEEDED",
+        "SYSTEM_ALERT",
+        "ADMIN_MESSAGE",
       ],
+      required: true,
     },
 
     title: { type: String, default: "" },
     message: { type: String, default: "" },
 
     data: {
-      type: Object,
+      type: mongoose.Schema.Types.Mixed,
       default: {},
     },
-
-    /* ----------------------------- Delivery channels --------------------------- */
 
     channels: {
       type: [String],
@@ -73,90 +64,27 @@ const notificationSchema = new Schema(
       default: ["IN_APP"],
     },
 
-    /* ------------------------------- Read tracking ----------------------------- */
-
-    // For user-specific notifications
-    readAt: { type: Date, default: null },
-
-    // Multi-reader array (admin dashboards etc.)
-    // Stores strings: userId OR "admin" OR any consumer identifier
+    // Read tracking:
     readBy: {
-      type: [String],
+      type: [String], // userId as string or "SUPER_ADMIN"
       default: [],
     },
 
-    // If sent externally (email/sms), record timestamp
     sentAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
-/* ==========================================================================
-   INDEXES
-   ========================================================================== */
+/* -------------------------------------------------------------------------- */
+/*                                   INDEXES                                   */
+/* -------------------------------------------------------------------------- */
 
-// Fast lookup by user
+// Fetch notifications fast for user-specific, theater-specific and global
 notificationSchema.index({ user: 1, createdAt: -1 });
-
-// Fast lookup by audience group
+notificationSchema.index({ theater: 1, createdAt: -1 });
 notificationSchema.index({ audience: 1, createdAt: -1 });
 
-// When looking for unread user notifications
-notificationSchema.index({ user: 1, readAt: 1 });
+// Send reminders efficiently (e.g. cron: upcoming bookings)
+notificationSchema.index({ sentAt: 1 });
 
-/* ==========================================================================
-   METHODS
-   ========================================================================== */
-
-/** Mark a single-user notification as read */
-notificationSchema.methods.markRead = async function (readerId = null) {
-  if (this.audience === "USER") {
-    this.readAt = new Date();
-  }
-  if (readerId) {
-    if (!this.readBy.includes(readerId)) {
-      this.readBy.push(readerId);
-    }
-  }
-  await this.save();
-  return this;
-};
-
-/** Mark a notification as read by a specific admin/user (multi-read) */
-notificationSchema.methods.markReadBy = async function (id) {
-  if (!id) return this;
-  if (!this.readBy.includes(id)) {
-    this.readBy.push(id);
-    await this.save();
-  }
-  return this;
-};
-
-/* ==========================================================================
-   STATIC HELPERS
-   ========================================================================== */
-
-/** Mark all notifications for a user as read */
-notificationSchema.statics.markAllForUser = async function (userId) {
-  return this.updateMany(
-    { user: userId, readAt: null },
-    { $set: { readAt: new Date() } }
-  );
-};
-
-/** Mark all admin notifications as read for a specific admin */
-notificationSchema.statics.markAllForAdmin = async function (adminId) {
-  return this.updateMany(
-    {
-      audience: "ADMIN",
-      readBy: { $ne: adminId },
-    },
-    { $push: { readBy: adminId } }
-  );
-};
-
-/* ==========================================================================
-   EXPORT
-   ========================================================================== */
-export default mongoose.models.Notification ||
-  mongoose.model("Notification", notificationSchema);
+export default mongoose.model("Notification", notificationSchema);
