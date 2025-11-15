@@ -6,20 +6,17 @@ const seatLockSchema = new mongoose.Schema(
     showtime: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Showtime",
-      required: true,
       index: true,
+      required: true,
     },
 
-    // Always normalized seat ID (A1, B10, etc.)
     seat: {
       type: String,
-      required: true,
-      index: true,
+      required: true, // e.g. "A1" or "8-1" — use consistent format
     },
 
-    // User who locked it
     lockedBy: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: mongoose.Schema.Types.ObjectId, // or String if you allow anonymous holds
       ref: "User",
       required: true,
     },
@@ -34,55 +31,22 @@ const seatLockSchema = new mongoose.Schema(
     lockedUntil: {
       type: Date,
       required: true,
-      index: true, // TTL cleanup
+      index: true, // TTL below
     },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
-/* -------------------------------------------------------------------------- */
-/* UNIQUE INDEX: One lock per seat per showtime                               */
-/* -------------------------------------------------------------------------- */
-seatLockSchema.index(
-  { showtime: 1, seat: 1 },
-  {
-    unique: true,
-    partialFilterExpression: {
-      status: { $in: ["HELD", "USED"] },
-    },
-  }
-);
+// Prevent multiple locks for the same seat in a showtime
+seatLockSchema.index({ showtime: 1, seat: 1 }, { unique: true });
 
-/* -------------------------------------------------------------------------- */
-/* TTL INDEX: auto delete expired locks                                       */
-/* -------------------------------------------------------------------------- */
-seatLockSchema.index(
-  { lockedUntil: 1 },
-  { expireAfterSeconds: 0 }
-);
+// MongoDB TTL cleanup: automatically removes expired locks
+// Docs are deleted once current time > lockedUntil
+seatLockSchema.index({ lockedUntil: 1 }, { expireAfterSeconds: 0 });
 
-/* -------------------------------------------------------------------------- */
-/* Utility helpers                                                            */
-/* -------------------------------------------------------------------------- */
-
-// Normalized check
+// Utility: check if lock is still valid
 seatLockSchema.methods.isActive = function () {
   return this.status === "HELD" && this.lockedUntil > new Date();
-};
-
-// Mark seat as used when booking is confirmed
-seatLockSchema.methods.markUsed = function () {
-  this.status = "USED";
-  return this.save();
-};
-
-// Release a lock manually
-seatLockSchema.methods.release = function () {
-  this.status = "RELEASED";
-  this.lockedUntil = new Date(); // expire immediately
-  return this.save();
 };
 
 export default mongoose.model("SeatLock", seatLockSchema);
