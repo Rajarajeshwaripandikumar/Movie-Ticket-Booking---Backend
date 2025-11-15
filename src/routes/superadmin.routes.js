@@ -4,7 +4,8 @@ import mongoose from "mongoose";
 import User from "../models/User.js";
 import Theater from "../models/Theater.js";
 import Showtime from "../models/Showtime.js";
-import { requireAuth, requireRoles } from "../middleware/auth.js";
+// use the new roles middleware (factory style)
+import { requireAuth, requireRole } from "../middleware/roles.js";
 
 const router = Router();
 // Optional: used by your server to mount with a prefix
@@ -266,8 +267,8 @@ const adminBases = ["theatre-admins", "theater-admins"];
 // Legacy create route kept for backward compatibility
 router.post(
   "/create-theatre-admin",
-  requireAuth,
-  requireRoles("SUPER_ADMIN"),
+  requireAuth(),
+  requireRole(["SUPER_ADMIN"]),
   createAdmin
 );
 
@@ -275,38 +276,38 @@ router.post(
 adminBases.forEach((base) => {
   router.post(
     `/${base}`,
-    requireAuth,
-    requireRoles("SUPER_ADMIN"),
+    requireAuth(),
+    requireRole(["SUPER_ADMIN"]),
     createAdmin
   );
   router.get(
     `/${base}`,
-    requireAuth,
-    requireRoles("SUPER_ADMIN"),
+    requireAuth(),
+    requireRole(["SUPER_ADMIN"]),
     listAdmins
   );
   router.get(
     `/${base}/:id`,
-    requireAuth,
-    requireRoles("SUPER_ADMIN"),
+    requireAuth(),
+    requireRole(["SUPER_ADMIN"]),
     getAdmin
   );
   router.put(
     `/${base}/:id`,
-    requireAuth,
-    requireRoles("SUPER_ADMIN"),
+    requireAuth(),
+    requireRole(["SUPER_ADMIN"]),
     updateAdmin
   );
   router.patch(
     `/${base}/:id/status`,
-    requireAuth,
-    requireRoles("SUPER_ADMIN"),
+    requireAuth(),
+    requireRole(["SUPER_ADMIN"]),
     updateAdminStatus
   );
   router.delete(
     `/${base}/:id`,
-    requireAuth,
-    requireRoles("SUPER_ADMIN"),
+    requireAuth(),
+    requireRole(["SUPER_ADMIN"]),
     deleteAdmin
   );
 });
@@ -319,8 +320,8 @@ adminBases.forEach((base) => {
    GET /api/superadmin/theaters?q=&city= */
 router.get(
   "/theaters",
-  requireAuth,
-  requireRoles("SUPER_ADMIN"),
+  requireAuth(),
+  requireRole(["SUPER_ADMIN"]),
   async (req, res) => {
     try {
       const { q, city } = req.query || {};
@@ -345,8 +346,8 @@ router.get(
    Body: { name, city, address?, imageUrl? } */
 router.post(
   "/theaters",
-  requireAuth,
-  requireRoles("SUPER_ADMIN"),
+  requireAuth(),
+  requireRole(["SUPER_ADMIN"]),
   async (req, res) => {
     try {
       const { name, city, address = "", imageUrl = "" } = req.body || {};
@@ -375,8 +376,8 @@ router.post(
    Body: { name?, city?, address?, imageUrl? } */
 router.put(
   "/theaters/:id",
-  requireAuth,
-  requireRoles("SUPER_ADMIN"),
+  requireAuth(),
+  requireRole(["SUPER_ADMIN"]),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -408,8 +409,8 @@ router.put(
    DELETE /api/superadmin/theaters/:id */
 router.delete(
   "/theaters/:id",
-  requireAuth,
-  requireRoles("SUPER_ADMIN"),
+  requireAuth(),
+  requireRole(["SUPER_ADMIN"]),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -432,8 +433,8 @@ router.delete(
    Body: { basePrice: number >= 1 } */
 router.put(
   "/showtimes/:showtimeId/pricing",
-  requireAuth,
-  requireRoles("SUPER_ADMIN"),
+  requireAuth(),
+  requireRole(["SUPER_ADMIN"]),
   async (req, res) => {
     try {
       const { showtimeId } = req.params;
