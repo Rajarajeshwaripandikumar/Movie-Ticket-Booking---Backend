@@ -52,12 +52,25 @@ router.get(
 );
 
 /** SUPER ADMIN: list ALL screens (no theaterId required) */
+/** Now scoped: SUPER_ADMIN => all, THEATRE_ADMIN => only their theatre */
 router.get("/admin/screens", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const screens = await Screen.find({}).sort({ name: 1 }).lean();
+    const role = String(req.user?.role || "").toUpperCase();
+    const myTheatre = req.user?.theatreId || req.user?.theaterId || null;
+
+    let filter = {};
+    if (role === "THEATRE_ADMIN") {
+      if (!myTheatre) return res.status(403).json({ ok: false, message: "No theatre set for this admin" });
+      filter = { $or: [{ theater: myTheatre }, { theatreId: myTheatre }] };
+    } else {
+      // SUPER_ADMIN and ADMIN (if desired) see all
+      filter = {};
+    }
+
+    const screens = await Screen.find(filter).sort({ name: 1 }).lean();
     return res.json({ ok: true, data: screens });
   } catch (err) {
-    console.error("[Screens] GET ALL (super admin) error:", err);
+    console.error("[Screens] GET ALL (admin) error:", err);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -269,6 +282,17 @@ router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
     const id = req.params.id;
     if (!isId(id)) return res.status(400).json({ error: "Invalid theatre id" });
 
+    const role = String(req.user?.role || "").toUpperCase();
+    const myTheatre = req.user?.theatreId || req.user?.theaterId || null;
+
+    // SUPER_ADMIN -> allowed any id
+    if (role === "THEATRE_ADMIN") {
+      // theatre admin only allowed their own theatre
+      if (!myTheatre || String(myTheatre) !== String(id)) {
+        return res.status(403).json({ error: "Forbidden — not your theatre" });
+      }
+    }
+
     const list = await Screen.find({
       $or: [{ theater: id }, { theatreId: id }],
     })
@@ -286,16 +310,11 @@ router.get("/screens/by-theatre/:id", requireAuth, async (req, res) => {
 
 /* --------------------------------------------------------------------------
  * Seat-label helper endpoints (useful for showtimes / seat map UI)
- * - Admin scoped: /admin/theaters/:theaterId/screens/:screenId/seats
- * - Public: /screens/:screenId/seats
- * Returns: { ok: true, data: [ "A1", "A2", ... ] , rows, cols }
  * -------------------------------------------------------------------------- */
 
 const buildSeatLabels = (rows, cols) => {
-  // rows is number of rows; convert to letters A, B, ... AA, AB if needed
   const labels = [];
   const toRowLabel = (n) => {
-    // 1 -> A, 26 -> Z, 27 -> AA
     let label = "";
     let x = n;
     while (x > 0) {
