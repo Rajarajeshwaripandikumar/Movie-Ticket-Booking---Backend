@@ -201,6 +201,12 @@ export const requireRoles = (...allowedArgs) => {
   const normalizedAllowed = normalizeRoleList(allowed);
 
   return (req, res, next) => {
+    // Defensive: detect incorrect import-time invocation or wrong wiring
+    if (!res || typeof res.status !== "function") {
+      console.error("[Auth] requireRoles used incorrectly (res missing). Check route wiring.");
+      return next(new Error("requireRoles used incorrectly; ensure you're calling the factory and not invoking middleware at import time"));
+    }
+
     if (!req.user) return res.status(401).json({ message: "Unauthorized (no user)" });
     const have = normalizeRole(req.user.role);
     if (!normalizedAllowed.includes(have)) {
@@ -250,8 +256,29 @@ export const requireTheatreOwnership = (req, res, next) => {
 };
 
 /* -------------------------------------------------------------------------- */
-/* Convenience guards                                                          */
+/* Convenience guards (factories)                                              */
 /* -------------------------------------------------------------------------- */
-export const requireAdmin = requireRoles(ROLE.SUPER_ADMIN, ROLE.THEATRE_ADMIN, ROLE.ADMIN);
-export const requireSuperAdmin = requireRoles(ROLE.SUPER_ADMIN);
-export const requireTheatreAdmin = requireRoles(ROLE.THEATRE_ADMIN);
+
+/**
+ * requireAdmin(opts)
+ *  - opts.allowTheatreAdmin (boolean): if true, THEATRE_ADMIN is allowed
+ *
+ * Returns middleware. Do NOT call the returned middleware at module-load time.
+ * Usage:
+ *   router.get(..., requireAdmin({ allowTheatreAdmin: true }), handler)
+ */
+export const requireAdmin = (opts = {}) => {
+  const { allowTheatreAdmin = false } = typeof opts === "object" ? opts : {};
+  const allowed = [ROLE.SUPER_ADMIN, ROLE.ADMIN];
+  if (allowTheatreAdmin) allowed.push(ROLE.THEATRE_ADMIN);
+  return requireRoles(allowed);
+};
+
+/**
+ * requireSuperAdmin()
+ * requireTheatreAdmin()
+ * Return middleware factories for explicitness/consistency.
+ * Usage: router.use(requireSuperAdmin()); or router.get(..., requireTheatreAdmin(), handler)
+ */
+export const requireSuperAdmin = () => requireRoles(ROLE.SUPER_ADMIN);
+export const requireTheatreAdmin = () => requireRoles(ROLE.THEATRE_ADMIN);
