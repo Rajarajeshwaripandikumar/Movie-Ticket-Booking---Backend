@@ -225,15 +225,17 @@ app.get(
   async (req, res) => {
     try {
       const role = String(req.user?.role || "").toUpperCase();
-      const myId = req.user?.theatreId || req.user?.theaterId;
+      const myId = req.user?.theatreId || req.user?.theaterId || null;
 
       const filter = role === "SUPER_ADMIN" ? {} : { _id: myId };
 
       const list = await Theater.find(filter).sort({ createdAt: -1 }).lean();
-      return res.json(list);
+
+      // Return a consistent response shape expected by the frontend
+      return res.json({ ok: true, data: list });
     } catch (err) {
       console.error("[/api/admin/theaters] ERROR:", err);
-      return res.status(500).json({ message: "Failed to load theaters" });
+      return res.status(500).json({ ok: false, message: "Failed to load theaters" });
     }
   }
 );
