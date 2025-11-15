@@ -2,41 +2,18 @@
 import { Router } from "express";
 import crypto from "crypto";
 import User from "../models/User.js";
-import mailer from "../models/mailer.js"; // must export sendEmail (and optionally templates)
+import mailer from "../models/mailer.js";
 
 const router = Router();
 
-/* -------------------------------------------------------------------------- */
-/*                                   CONFIG                                   */
-/* -------------------------------------------------------------------------- */
+const RESET_EXP_MIN = Number(process.env.RESET_TOKEN_EXPIRY_MIN || 60);
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
-const RESET_EXPIRES_MINUTES = Number(process.env.RESET_TOKEN_EXPIRES_MINUTES || process.env.RESET_TOKEN_EXPIRY_MIN || 60);
-const APP_PUBLIC_BASE =
-  process.env.APP_PUBLIC_BASE ||
-  process.env.CLIENT_BASE_URL ||
-  process.env.FRONTEND_URL ||
-  "http://localhost:5173";
-
-/* -------------------------------------------------------------------------- */
-/*                                   HELPERS                                   */
-/* -------------------------------------------------------------------------- */
-
-function hashToken(token) {
-  return crypto.createHash("sha256").update(String(token)).digest("hex");
-}
-
-function buildResetUrl(token, email) {
-  const base = APP_PUBLIC_BASE.replace(/\/$/, "");
-  const params = new URLSearchParams({ token, email });
-  // Frontend page expected at /reset-password
-  return `${base}/reset-password?${params.toString()}`;
-}
-
-/* -------------------------------------------------------------------------- */
-/*                             FORGOT PASSWORD                                 */
-/* POST /api/auth/forgot-password  { email }                                   */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * POST /api/auth/forgot-password
+ * Body: { email }
+ * Generates a token, stores it on user with expiry, and emails reset link.
+ */
 router.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -44,117 +21,92 @@ router.post("/forgot-password", async (req, res) => {
 
     const normalized = String(email).toLowerCase().trim();
     const user = await User.findOne({ email: normalized });
+    if (!user) {
+      // Do not reveal whether email exists
+      return res.json({ message: "If that email exists, a reset link has been sent" });
+    }
 
-    // Always respond generically to prevent email enumeration
-    const generic = { message: "If that email exists, a reset link has been sent." };
+    // generate token and expiry
+    const token = crypto.randomBytes(32).toString("hex");
+    const expires = new Date(Date.now() + RESET_EXP_MIN * 60 * 1000);
 
-    if (!user) return res.json(generic);
-
-    // Create token + hash; store only the hash
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    const hashed = hashToken(rawToken);
-    const expires = new Date(Date.now() + RESET_EXPIRES_MINUTES * 60 * 1000);
-
-    user.resetPasswordToken = hashed;
+    // set token fields (these fields are stored with select:false in the model)
+    user.resetPasswordToken = token;
     user.resetPasswordExpires = expires;
     await user.save();
 
-    // Compose email
-    const resetUrl = buildResetUrl(rawToken, normalized);
-    const name = user.name || normalized;
+    // build reset URL for frontend
+    const resetUrl = `${FRONTEND_URL}/reset-password?token=${token}&email=${encodeURIComponent(user.email)}`;
 
-    // Prefer template if your mailer provides one
-    const html =
-      mailer.resetPasswordTemplate?.({
-        name,
-        resetUrl,
-        expiresMinutes: RESET_EXPIRES_MINUTES,
-      }) ||
-      `
-        <p>Hello ${name},</p>
-        <p>You (or someone else) requested a password reset. Click the link below to reset your password.</p>
-        <p><a href="${resetUrl}">Reset your password</a></p>
-        <p>This link expires in ${RESET_EXPIRES_MINUTES} minutes. If you did not request this, you can ignore this email.</p>
-      `;
+    // use mailer (your backend/src/models/mailer.js)
+    const html = `
+      <div style="font-family:sans-serif">
+        <p>Hello ${user.name || "User"},</p>
+        <p>You (or someone else) requested a password reset. Click the link below to reset your password. This link expires in ${RESET_EXP_MIN} minutes.</p>
+        <p><a href="${resetUrl}">Reset password</a></p>
+        <p>If you did not request this, ignore this email.</p>
+      </div>
+    `;
 
-    const ok = await mailer.sendEmail({
-      to: normalized,
-      subject: "Reset your password",
+    const sent = await mailer.sendEmail({
+      to: user.email,
+      subject: "MovieBook — Password reset request",
       html,
-      text: `Reset your password: ${resetUrl}\nThis link expires in ${RESET_EXPIRES_MINUTES} minutes.`,
+      text: `Reset your password: ${resetUrl}`,
     });
 
-    if (!ok?.ok) {
-      // Don’t leak mail errors to client, but log for ops
-      console.error("[Auth] forgot-password mail failed:", ok?.error || ok);
-    }
-
-    return res.json(generic);
-  } catch (err) {
-    console.error("[Auth] forgot-password error:", err);
-    return res.status(500).json({ message: "Failed to process request." });
+    // in dev Ethereal previewUrl will be present; we log/return preview for convenience only in dev
+    const note = sent.previewUrl ? { previewUrl: sent.previewUrl } : {};
+    return res.json({ message: "If that email exists, a reset link has been sent", ...note });
+  } catch (e) {
+    console.error("[Auth] forgot password error", e);
+    return res.status(500).json({ message: "Failed to process request" });
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*                              RESET PASSWORD                                 */
-/* POST /api/auth/reset-password  { email, token, newPassword }                */
-/* -------------------------------------------------------------------------- */
-
+/**
+ * POST /api/auth/reset-password
+ * Body: { email, token, newPassword }
+ * Validates token and expiry, sets new password.
+ */
 router.post("/reset-password", async (req, res) => {
   try {
-    const { email, token } = req.body || {};
-    const newPassword = req.body.newPassword || req.body.password;
-
-    if (!email || !token || !newPassword) {
-      return res.status(400).json({ message: "email, token, and newPassword are required" });
-    }
-    if (String(newPassword).length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-    }
+    const { email, token, newPassword } = req.body || {};
+    if (!email || !token || !newPassword) return res.status(400).json({ message: "email, token and newPassword required" });
+    if (typeof newPassword !== "string" || newPassword.length < 8) return res.status(400).json({ message: "Password must be at least 8 characters" });
 
     const normalized = String(email).toLowerCase().trim();
-    const hashed = hashToken(token);
 
-    const user = await User.findOne({
-      email: normalized,
-      resetPasswordToken: hashed,
-      resetPasswordExpires: { $gt: new Date() },
-    }).select("+password"); // allow setting new password
+    // find user by email + token
+    const user = await User.findOne({ email: normalized, resetPasswordToken: token }).select("+passwordHash +resetPasswordToken +resetPasswordExpires");
+    if (!user) return res.status(400).json({ message: "Invalid token or email" });
 
-    if (!user) {
-      return res.status(400).json({ message: "Invalid or expired reset link" });
+    if (!user.resetPasswordExpires || user.resetPasswordExpires < new Date()) {
+      return res.status(400).json({ message: "Token expired" });
     }
 
-    // IMPORTANT: rely on your User pre-save hook to hash the password
-    user.password = newPassword;
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpires = undefined;
-    await user.save();
+    // Set new password in the model field `passwordHash` **as plain text**.
+    // The User model's pre-save hook will hash `passwordHash` before saving.
+    user.passwordHash = String(newPassword);
+    user.resetPasswordToken = null;
+    user.resetPasswordExpires = null;
+    await user.save(); // triggers pre-save hashing
 
-    // Optional confirmation email
-    try {
-      await mailer.sendEmail({
-        to: normalized,
-        subject: "Your password has been changed",
-        html: `<p>Hello ${user.name || normalized},</p><p>Your password was successfully changed. If you did not do this, please contact support immediately.</p>`,
-        text: `Your password was successfully changed. If you did not do this, please contact support immediately.`,
-      });
-    } catch (e) {
-      console.warn("[Auth] reset-password confirmation mail failed:", e?.message || e);
-    }
+    // Send confirmation email (fire-and-forget)
+    mailer.sendEmail({
+      to: user.email,
+      subject: "Your password has been changed",
+      html: `<p>Hello ${user.name || "User"},</p><p>Your password was successfully changed. If you did not do this, contact support immediately.</p>`,
+      text: `Your password was successfully changed. If you did not do this, contact support immediately.`,
+    }).then(r => {
+      if (r.previewUrl) console.log("Password change email preview:", r.previewUrl);
+    }).catch(err => console.error("Password change mail error:", err));
 
-    return res.json({ message: "Password reset successful. You can now log in." });
-  } catch (err) {
-    console.error("[Auth] reset-password error:", err);
-    return res.status(500).json({ message: "Failed to reset password." });
+    return res.json({ message: "Password reset successful" });
+  } catch (e) {
+    console.error("[Auth] reset password error", e);
+    return res.status(500).json({ message: "Failed to reset password" });
   }
 });
-
-/* -------------------------------------------------------------------------- */
-/*                           ROUTER PREFIX (FYI)                               */
-/* -------------------------------------------------------------------------- */
-// Mount at /api/auth in your server bootstrap (same as other auth routes)
-// e.g. app.use("/api/auth", authPasswordsRouter);
 
 export default router;
