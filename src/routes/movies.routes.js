@@ -5,13 +5,14 @@ import multer from "multer";
 import streamifier from "streamifier";
 import { v2 as cloudinary } from "cloudinary";
 import dotenv from "dotenv";
+
 import Movie from "../models/Movie.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 dotenv.config();
 const router = express.Router();
 
-/* ✅ Tell server.js to mount this router at /api/movies */
+/* Optional hint to server.js: mount under /api/movies */
 router.routesPrefix = "/api/movies";
 
 /* --------------------------- Cloudinary config --------------------------- */
@@ -25,17 +26,11 @@ cloudinary.config({
 /* ------------------------------ Multer ---------------------------------- */
 const memoryStorage = multer.memoryStorage();
 const allowedMimes = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
-
 const fileFilter = (_, file, cb) => {
   const ok = allowedMimes.includes(file.mimetype);
   ok ? cb(null, true) : cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "Only image files are allowed"));
 };
-
-const upload = multer({
-  storage: memoryStorage,
-  fileFilter,
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
-});
+const upload = multer({ storage: memoryStorage, fileFilter, limits: { fileSize: 8 * 1024 * 1024 } });
 
 /* ----------------------------- Helpers ---------------------------------- */
 const isValidId = (id) => mongoose.isValidObjectId(id);
@@ -56,44 +51,36 @@ function uploadBufferToCloudinary(buffer, folder = "movies") {
   });
 }
 
-/**
- * Normalize a request body field into an array.
- */
+/* Normalize body fields into arrays */
 function normalizeArrayField(value) {
   if (value == null) return [];
   if (Array.isArray(value)) {
-    if (value.length === 0) return [];
-    if (typeof value[0] === "object" && value[0] !== null) {
-      return value.map((v) => {
-        if (typeof v === "string") {
-          try {
-            return JSON.parse(v);
-          } catch {
-            return v;
-          }
+    return value.flatMap((v) => {
+      if (typeof v === "string") {
+        try {
+          return JSON.parse(v);
+        } catch {
+          return v;
         }
-        return v;
-      });
-    }
-    return value.map((s) => String(s).trim()).filter(Boolean);
+      }
+      return v;
+    }).map((s) => (typeof s === "string" ? s.trim() : s)).filter(Boolean);
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) return [];
     try {
       const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        if (parsed.length > 0 && typeof parsed[0] === "object" && parsed[0] !== null) return parsed;
-        return parsed.map((s) => String(s).trim()).filter(Boolean);
-      }
-    } catch {}
-    return trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+      return Array.isArray(parsed) ? parsed : trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+    } catch {
+      return trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+    }
   }
   if (typeof value === "object") return [value];
   return [String(value).trim()].filter(Boolean);
 }
 
-/* --------------------- Defensive sanitizers for cast/crew ----------------- */
+/* Cast/Crew sanitizers */
 function sanitizeCastArray(inputArr) {
   if (!Array.isArray(inputArr)) return [];
   return inputArr
@@ -101,9 +88,7 @@ function sanitizeCastArray(inputArr) {
       if (!entry && entry !== 0) return null;
       if (typeof entry === "string") return { name: entry.trim(), character: "" };
       if (Array.isArray(entry)) {
-        const names = entry
-          .map((x) => (typeof x === "string" ? x : x?.name || x?.actorName || JSON.stringify(x)))
-          .filter(Boolean);
+        const names = entry.map((x) => (typeof x === "string" ? x : x?.name || JSON.stringify(x))).filter(Boolean);
         return { name: names.join(", "), character: "" };
       }
       if (typeof entry === "object") {
@@ -144,7 +129,7 @@ function sanitizeCrewArray(inputArr) {
 /* ----------------------------- Public API -------------------------------- */
 /**
  * GET /api/movies
- * public — paginated, optional search and status filter
+ * public — paginated, optional search, genre, inTheaters, status
  */
 router.get("/", async (req, res) => {
   try {
@@ -157,7 +142,6 @@ router.get("/", async (req, res) => {
 
     if (q) {
       const rx = new RegExp(String(q), "i");
-      // search in title, director, cast.name, crew.name, genres, languages
       filter.$or = [
         { title: rx },
         { director: rx },
@@ -167,10 +151,7 @@ router.get("/", async (req, res) => {
         { languages: rx },
       ];
     }
-    if (genre) {
-      // match genre in genres array
-      filter.genres = { $in: [genre] };
-    }
+    if (genre) filter.genres = { $in: [genre] };
     if (onlyInTheaters === "true" || onlyInTheaters === true) filter.inTheaters = true;
     if (status) filter.status = status;
 
@@ -199,7 +180,6 @@ router.get("/", async (req, res) => {
 
 /**
  * GET /api/movies/:id
- * param restricted to 24-hex ObjectId to avoid matching '/admin'
  */
 router.get("/:id([0-9a-fA-F]{24})", async (req, res) => {
   try {
@@ -209,7 +189,6 @@ router.get("/:id([0-9a-fA-F]{24})", async (req, res) => {
     const movie = await Movie.findById(id).lean();
     if (!movie) return res.status(404).json({ ok: false, message: "Movie not found" });
 
-    // return both for compatibility: older clients read `data`, newer can read `movie`
     res.json({ ok: true, data: movie, movie });
   } catch (err) {
     console.error("[Movies] GET /:id error:", err);
@@ -218,16 +197,21 @@ router.get("/:id([0-9a-fA-F]{24})", async (req, res) => {
 });
 
 /* ------------------------------- Admin Routes ---------------------------- */
-/* Use adminRouter and mount at /admin so /admin/* never gets captured by :id param */
+/* adminRouter mounted at /admin and protected by requireAuth + requireAdmin */
 const adminRouter = express.Router();
 
 /**
  * GET /api/movies/admin/list
- * admin — returns all movies (protected)
+ * admin — returns all movies for SUPER_ADMIN OR theater-owned for THEATER_ADMIN
  */
-adminRouter.get("/list", async (_req, res) => {
+adminRouter.get("/list", async (req, res) => {
   try {
-    const movies = await Movie.find().sort({ createdAt: -1 }).lean();
+    const q = {};
+    if (req.user && req.user.role === "THEATER_ADMIN") {
+      if (!req.user.theater) return res.status(403).json({ ok: false, message: "Your account is not linked to a theater" });
+      q.theater = req.user.theater;
+    }
+    const movies = await Movie.find(q).sort({ createdAt: -1 }).lean();
     res.json({ ok: true, data: movies });
   } catch (err) {
     console.error("[Movies][Admin] GET /list error:", err);
@@ -238,23 +222,25 @@ adminRouter.get("/list", async (_req, res) => {
 /**
  * POST /api/movies/admin
  * create movie; accepts multipart form-data "poster" or JSON with posterUrl
+ * THEATER_ADMIN: movie is automatically assigned to their theater
  */
 adminRouter.post("/", upload.single("poster"), async (req, res) => {
   try {
     const payload = req.body || {};
 
     const genres = normalizeArrayField(payload.genres);
-    const cast = normalizeArrayField(payload.cast);
-    const crew = normalizeArrayField(payload.crew);
+    const rawCast = normalizeArrayField(payload.cast);
+    const rawCrew = normalizeArrayField(payload.crew);
     let languages = normalizeArrayField(payload.languages);
     if (!languages || languages.length === 0) languages = ["English"];
 
     const doc = {
       title: payload.title ?? "",
       description: payload.description ?? payload.synopsis ?? "",
+      synopsis: payload.synopsis ?? payload.description ?? "",
       director: payload.director ?? "",
-      cast,
-      crew,
+      cast: sanitizeCastArray(rawCast),
+      crew: sanitizeCrewArray(rawCrew),
       genres,
       languages,
       releasedAt: payload.releasedAt ? new Date(payload.releasedAt) : payload.releasedAt ?? null,
@@ -266,6 +252,7 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
         payload.runtimeMinutes ? Number(payload.runtimeMinutes) : payload.runtime ? Number(payload.runtime) : null,
       posterUrl: payload.posterUrl ?? null,
       posterPublicId: payload.posterPublicId ?? null,
+      status: payload.status || "PUBLISHED",
     };
 
     if (req.file) {
@@ -280,9 +267,18 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
       }
     }
 
+    // Ownership enforcement for THEATER_ADMIN
+    if (req.user && req.user.role === "THEATER_ADMIN") {
+      if (!req.user.theater) return res.status(403).json({ ok: false, message: "Your account is not linked to a theater" });
+      doc.theater = req.user.theater;
+    } else if (payload.theater && isValidId(payload.theater)) {
+      doc.theater = payload.theater;
+    }
+
+    // uploader metadata
     if (req.user) {
       doc.uploaderId = req.user.id || req.user._id || req.user.sub;
-      doc.uploaderRole = req.user.role || "admin";
+      doc.uploaderRole = req.user.role || "ADMIN";
     }
 
     const created = await Movie.create(doc);
@@ -296,16 +292,22 @@ adminRouter.post("/", upload.single("poster"), async (req, res) => {
 /**
  * PUT /api/movies/admin/:id
  * update movie, optional poster replace
+ * THEATER_ADMIN may only update movies owned by their theater
  */
 adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
 
-    console.log(`[Movies][Admin] PUT start id=${id} user=${req.user?.id || "anon"}`);
-
     const existing = await Movie.findById(id);
     if (!existing) return res.status(404).json({ ok: false, message: "Movie not found" });
+
+    if (req.user && req.user.role === "THEATER_ADMIN") {
+      if (!req.user.theater) return res.status(403).json({ ok: false, message: "Your account is not linked to a theater" });
+      if (!existing.theater || String(existing.theater) !== String(req.user.theater)) {
+        return res.status(403).json({ ok: false, message: "Forbidden — this movie is not owned by your theater" });
+      }
+    }
 
     const body = req.body || {};
     const genres = body.genres ? normalizeArrayField(body.genres) : existing.genres || [];
@@ -313,15 +315,13 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
     const rawCrew = body.crew ? normalizeArrayField(body.crew) : existing.crew || [];
     const languages = body.languages ? normalizeArrayField(body.languages) : existing.languages || ["English"];
 
-    const cast = sanitizeCastArray(rawCast);
-    const crew = sanitizeCrewArray(rawCrew);
-
     const payload = {
       title: body.title ?? existing.title,
       description: body.description ?? body.synopsis ?? existing.description,
+      synopsis: body.synopsis ?? existing.synopsis,
       director: body.director ?? existing.director,
-      cast,
-      crew,
+      cast: sanitizeCastArray(rawCast),
+      crew: sanitizeCrewArray(rawCrew),
       genres,
       languages,
       releasedAt: body.releasedAt ? new Date(body.releasedAt) : existing.releasedAt,
@@ -333,9 +333,9 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       posterPublicId: existing.posterPublicId,
       runtimeMinutes:
         body.runtimeMinutes ? Number(body.runtimeMinutes) : body.runtime ? Number(body.runtime) : existing.runtimeMinutes,
+      status: body.status ?? existing.status,
     };
 
-    // Only keep the public id for deletion if present (do not treat URL as public id)
     let oldPosterPublicId = existing.posterPublicId || null;
 
     if (req.file) {
@@ -350,9 +350,17 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       }
     }
 
+    // Prevent THEATER_ADMIN changing theater to other value
+    if (req.user && req.user.role === "THEATER_ADMIN") {
+      payload.theater = req.user.theater;
+    } else if (body.theater && isValidId(body.theater)) {
+      payload.theater = body.theater;
+    }
+
+    // uploader metadata
     if (req.user) {
       payload.uploaderId = req.user.id || req.user._id || req.user.sub;
-      payload.uploaderRole = req.user.role || "admin";
+      payload.uploaderRole = req.user.role || "ADMIN";
     }
 
     let updated;
@@ -370,7 +378,7 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
       return res.status(500).json({ ok: false, message: "Failed to update movie", error: String(validationErr) });
     }
 
-    // Only call destroy if we have a cloudinary public id (safe)
+    // Cloudinary cleanup: destroy old poster only if we have safe public id
     if (updated && oldPosterPublicId && oldPosterPublicId !== (updated.posterPublicId || updated.posterUrl)) {
       try {
         await cloudinary.uploader.destroy(oldPosterPublicId);
@@ -381,11 +389,9 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
     } else if (oldPosterPublicId && !updated) {
       console.warn("[Movies][Admin] oldPosterPublicId present but update returned no doc; skipping destroy");
     } else if (!oldPosterPublicId && existing.posterUrl && existing.posterUrl !== updated?.posterUrl) {
-      // If we don't have a public id but the previous poster was a URL, we can't safely tell Cloudinary to destroy it.
       console.warn("[Movies][Admin] previous poster is a URL (no public id). Skipping cloudinary destroy to avoid accidental deletion.");
     }
 
-    console.log(`[Movies][Admin] updated movie id=${id} success`);
     return res.json({ ok: true, data: updated });
   } catch (err) {
     console.error("[Movies][Admin] PUT /:id error:", err && (err.stack || err.message || err));
@@ -396,15 +402,28 @@ adminRouter.put("/:id([0-9a-fA-F]{24})", upload.single("poster"), async (req, re
 
 /**
  * DELETE /api/movies/admin/:id
+ * THEATER_ADMIN may delete only owned movies
  */
 adminRouter.delete("/:id([0-9a-fA-F]{24})", async (req, res) => {
   try {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ ok: false, message: "Invalid movie id" });
 
+    const existing = await Movie.findById(id);
+    if (!existing) return res.status(404).json({ ok: false, message: "Movie not found" });
+
+    // THEATER_ADMIN check
+    if (req.user && req.user.role === "THEATER_ADMIN") {
+      if (!req.user.theater) return res.status(403).json({ ok: false, message: "Your account is not linked to a theater" });
+      if (!existing.theater || String(existing.theater) !== String(req.user.theater)) {
+        return res.status(403).json({ ok: false, message: "Forbidden — this movie is not owned by your theater" });
+      }
+    }
+
     const deleted = await Movie.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ ok: false, message: "Movie not found" });
 
+    // delete poster if Cloudinary public id present
     if (deleted.posterPublicId) {
       try {
         await cloudinary.uploader.destroy(deleted.posterPublicId);
@@ -423,7 +442,11 @@ adminRouter.delete("/:id([0-9a-fA-F]{24})", async (req, res) => {
   }
 });
 
-/* ----------------- mount adminRouter with auth ------------------ */
+/* ----------------- mount adminRouter with auth + role guard ------------------ */
+/**
+ * Protect admin routes: must be authenticated and an admin (SUPER_ADMIN or THEATER_ADMIN)
+ * requireAdmin should allow both super and theater admin (adjust detail inside middleware)
+ */
 router.use("/admin", requireAuth, requireAdmin, adminRouter);
 
 /* ----------------------- Multer error handler ---------------------------- */
