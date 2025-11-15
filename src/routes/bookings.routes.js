@@ -17,125 +17,59 @@ import { sendEmail, renderTemplate } from "../models/mailer.js";
 const router = Router();
 
 /* -------------------------------------------------------------------------- */
+/*                                  Config                                    */
+/* -------------------------------------------------------------------------- */
+
+const APP_PUBLIC_BASE = process.env.APP_PUBLIC_BASE || process.env.APP_BASE_URL || "http://localhost:5173";
+const BACKEND_PUBLIC_BASE = process.env.BACKEND_PUBLIC_BASE || `http://localhost:${process.env.PORT || 8080}`;
+const TIMEZONE = process.env.TIMEZONE || "Asia/Kolkata";
+const SEAT_LOCK_TTL_MS = Number(process.env.SEAT_LOCK_TTL_MS || 2 * 60 * 1000); // 2 minutes default
+
+/* -------------------------------------------------------------------------- */
 /*                                  Helpers                                   */
 /* -------------------------------------------------------------------------- */
 
-const seatKey = (r, c) => `${Number(r)}:${Number(c)}`;
+/**
+ * Build a canonical key for seat lookup.
+ * Supports two modes:
+ *  - seatId string keys (preferred): "A1"
+ *  - numeric grid keys: "r:c" where r and c are numbers (e.g. "1:4")
+ */
+const seatKeyFrom = (seat) => {
+  if (!seat) return null;
+  if (seat.seatId) return String(seat.seatId);
+  if (seat.row !== undefined && seat.col !== undefined) return `${Number(seat.row)}:${Number(seat.col)}`;
+  return null;
+};
 
-// --- helpers to generate labels like A1, B12, AA3…
-function rowToLabel(rowNum) {
-  let n = Number(rowNum);
-  if (!Number.isInteger(n) || n <= 0) return String(rowNum);
-  let s = "";
-  while (n > 0) {
-    n -= 1;
-    s = String.fromCharCode(65 + (n % 26)) + s;
-    n = Math.floor(n / 26);
-  }
-  return s;
-}
-function seatLabel(row, col) {
-  return `${rowToLabel(row)}${col}`;
-}
-
-// ----------------- Normalized base URL helpers -----------------
-
-function normalizeCandidate(candidate) {
-  if (!candidate) return null;
-  let s = String(candidate).trim();
+/**
+ * For showtime seat snapshot, derive the canonical key for each seat object.
+ * If `seatId` exists, use that. Otherwise fallback to `row:col`.
+ */
+const seatKeyForSnapshot = (s) => {
   if (!s) return null;
-  if (!/^https?:\/\//i.test(s)) {
-    s = `https://${s}`;
-  }
-  return s.replace(/\/$/, "");
-}
+  if (s.seatId) return String(s.seatId);
+  if (s.row !== undefined && s.col !== undefined) return `${Number(s.row)}:${Number(s.col)}`;
+  return null;
+};
 
-function resolveAppPublicBase() {
-  const candidates = [
-    process.env.APP_PUBLIC_BASE,
-    process.env.CLIENT_BASE_URL,
-    process.env.FRONTEND_BASE_URL,
-    process.env.APP_BASE_URL,
-    process.env.VITE_APP_BASE_URL,
-    process.env.REACT_APP_BASE_URL,
-    process.env.NEXT_PUBLIC_BASE_URL,
-    process.env.URL,
-  ].filter(Boolean);
+const fmtTime = (d) => new Date(d).toLocaleString("en-IN", { timeZone: TIMEZONE });
 
-  const picked = candidates.length > 0 ? normalizeCandidate(candidates[0]) : null;
-
-  if (process.env.NODE_ENV === "production") {
-    if (picked && picked !== "http://localhost:5173") {
-      console.info("[BASE_URL] APP_PUBLIC_BASE resolved (production):", picked);
-      return picked;
-    }
-    if (process.env.CLIENT_BASE_URL) {
-      const cb = normalizeCandidate(process.env.CLIENT_BASE_URL);
-      console.warn("[BASE_URL] production but initial resolve was unsafe — forcing CLIENT_BASE_URL:", cb);
-      return cb;
-    }
-    throw new Error(
-      "Missing frontend base URL in production. Set APP_PUBLIC_BASE or CLIENT_BASE_URL environment variable."
-    );
-  }
-
-  const result = picked || "http://localhost:5173";
-  console.info("[BASE_URL] APP_PUBLIC_BASE resolved:", result);
-  return result;
-}
-
-function resolveBackendPublicBase() {
-  const picked = process.env.BACKEND_PUBLIC_BASE || null;
-  const normalized = normalizeCandidate(picked) || `http://localhost:${process.env.PORT || 8080}`;
-  console.info("[BASE_URL] BACKEND_PUBLIC_BASE resolved:", normalized);
-  return normalized;
-}
-
-let APP_PUBLIC_BASE;
-let BACKEND_PUBLIC_BASE;
-
-try {
-  APP_PUBLIC_BASE = resolveAppPublicBase();
-} catch (err) {
-  console.error("[BASE_URL] failed to resolve APP_PUBLIC_BASE:", err?.message || err);
-  APP_PUBLIC_BASE = process.env.APP_PUBLIC_BASE || "http://localhost:5173";
-}
-
-BACKEND_PUBLIC_BASE = resolveBackendPublicBase();
-
-const fmtTime = (d) =>
-  new Date(d).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-const pickUserEmail = (reqUser, bookingUser) =>
-  bookingUser?.email || reqUser?.email || null;
+const pickUserEmail = (reqUser, bookingUser) => bookingUser?.email || reqUser?.email || null;
 const pickUserName = (reqUser, bookingUser) =>
   bookingUser?.name ||
   reqUser?.name ||
   (pickUserEmail(reqUser, bookingUser)?.split("@")[0]) ||
   "there";
 
-/* ---------------------- Seat initialization / locks ---------------------- */
+/* -------------------------------------------------------------------------- */
+/*                   Ensure showtime has seat snapshot & reconcile locks      */
+/* -------------------------------------------------------------------------- */
 
-/**
- * Ensure seats array exists on show document.
- * Accepts options: { session } to operate inside transactions.
- */
-async function ensureSeatsInitialized(show, options = {}) {
-  const session = options.session;
+async function ensureSeatsInitialized(show) {
   if (Array.isArray(show.seats) && show.seats.length > 0) return show;
-
-  // load screen (session-aware when possible)
-  let screen;
-  try {
-    if (session && typeof Screen.findById === "function" && typeof Screen.findById().session === "function") {
-      screen = await Screen.findById(show.screen).session(session).lean();
-    } else {
-      screen = await Screen.findById(show.screen).lean();
-    }
-  } catch (e) {
-    // fallback to non-session read
-    screen = await Screen.findById(show.screen).lean();
-  }
-
+  // fallback to screen rows/cols
+  const screen = await Screen.findById(show.screen).lean();
   const rows = Number(screen?.rows || 10);
   const cols = Number(screen?.cols || 10);
 
@@ -146,54 +80,37 @@ async function ensureSeatsInitialized(show, options = {}) {
     }
   }
   show.seats = seats;
-
-  if (session) {
-    await show.save({ session });
-  } else {
-    await show.save();
-  }
+  await show.save();
   return show;
 }
 
 /**
- * Reconcile SeatLock documents with show.seats statuses.
- * Accepts options: { session } to operate inside transactions.
+ * Removes expired locks and updates show.seats status for any currently held locks.
+ * This function is conservative — it doesn't override BOOKED seats.
  */
-async function reconcileLocks(show, options = {}) {
-  const session = options.session;
+async function reconcileLocks(show) {
   const now = new Date();
 
-  const deleteQuery = {
+  // remove expired locks (TTL index will also run)
+  await SeatLock.deleteMany({
     showtime: show._id,
     status: "HELD",
     lockedUntil: { $lte: now },
-  };
+  });
 
-  if (session) {
-    await SeatLock.deleteMany(deleteQuery).session(session);
-  } else {
-    await SeatLock.deleteMany(deleteQuery);
-  }
-
-  const findQuery = {
+  const activeLocks = await SeatLock.find({
     showtime: show._id,
     status: "HELD",
     lockedUntil: { $gt: now },
-  };
+  }).select("seat").lean();
 
-  let activeLocks;
-  if (session) {
-    activeLocks = await SeatLock.find(findQuery).select("seat").session(session).lean();
-  } else {
-    activeLocks = await SeatLock.find(findQuery).select("seat").lean();
-  }
-
-  const lockedSet = new Set(activeLocks.map((l) => l.seat));
+  const lockedSet = new Set(activeLocks.map((l) => String(l.seat)));
   let dirty = false;
 
   for (let i = 0; i < show.seats.length; i++) {
     const s = show.seats[i];
-    const k = seatKey(s.row, s.col);
+    const k = seatKeyForSnapshot(s);
+    if (!k) continue;
 
     if (lockedSet.has(k)) {
       if (s.status !== "BOOKED" && s.status !== "LOCKED") {
@@ -207,25 +124,46 @@ async function reconcileLocks(show, options = {}) {
       }
     }
   }
-  if (dirty) {
-    if (session) await show.save({ session });
-    else await show.save();
-  }
+  if (dirty) await show.save();
 }
+
+/* -------------------------------------------------------------------------- */
+/*                               seat utilities                               */
+/* -------------------------------------------------------------------------- */
+
+function normalizeRequestedSeats(seats = []) {
+  // Accept either array of {seatId} or {row,col} or mixed.
+  const out = [];
+  for (const s of seats) {
+    if (!s) continue;
+    if (s.seatId) out.push({ seatId: String(s.seatId) });
+    else if (s.row !== undefined && s.col !== undefined) out.push({ row: Number(s.row), col: Number(s.col) });
+  }
+  // dedupe by canonical key
+  const m = new Map();
+  for (const s of out) {
+    const k = seatKeyFrom(s);
+    if (k) m.set(k, s);
+  }
+  return Array.from(m.values());
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             free seats helper                              */
+/* -------------------------------------------------------------------------- */
 
 async function freeSeatsForBooking(booking) {
   try {
     const show = await Showtime.findById(booking.showtime);
     if (!show) {
-      console.error("[cancel] showtime not found for booking", String(booking._id));
+      console.error("[freeSeatsForBooking] showtime not found for booking", String(booking._id));
       return;
     }
     await ensureSeatsInitialized(show);
-    await reconcileLocks(show);
 
-    const index = new Map(show.seats.map((s, i) => [seatKey(s.row, s.col), i]));
+    const index = new Map(show.seats.map((s, i) => [seatKeyForSnapshot(s), i]));
     for (const s of booking.seats || []) {
-      const k = seatKey(s.row, s.col);
+      const k = seatKeyFrom(s);
       const i = index.get(k);
       if (i !== undefined) show.seats[i].status = "AVAILABLE";
     }
@@ -242,140 +180,33 @@ async function freeSeatsForBooking(booking) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                        Seat normalization utilities                        */
+/*                                   ROUTES                                   */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Expand a range/comma/label string into tokens.
- * Examples:
- *  "1-7" -> [1,2,3,4,5,6,7]
- *  "5,6,7" -> [5,6,7]
- *  "A-6,B-3" -> ["A-6","B-3"]
- *  "6" -> [6]
- */
-function expandRangeString(s) {
-  if (!s || typeof s !== "string") return [];
-  s = s.trim();
-  if (s.includes(",")) return s.split(",").map((p) => p.trim()).flatMap(expandRangeString);
-
-  if (/^\d+\s*-\s*\d+$/.test(s)) {
-    const [a, b] = s.split("-").map((x) => parseInt(x.trim(), 10)).sort((x, y) => x - y);
-    if (Number.isFinite(a) && Number.isFinite(b)) return Array.from({ length: b - a + 1 }, (_, i) => a + i);
-  }
-
-  if (/^\d+$/.test(s)) return [Number(s)];
-
-  if (/^[A-Za-z]+\s*[-_\s]?\s*\d+$/.test(s) || /^[A-Za-z]+\d+$/.test(s)) {
-    const parts = s.split(/[-_\s]+/).filter(Boolean);
-    return [`${parts[0].toUpperCase()}-${parts[1]}`];
-  }
-
-  return [s];
-}
-
-/**
- * Convert global numeric seat id to row/col using seatsPerRow (cols)
- * Numeric ids are 1-indexed across the whole auditorium.
- */
-function numericIdToRowCol(id, seatsPerRow) {
-  if (!Number.isFinite(id) || !Number.isInteger(id) || !seatsPerRow) return null;
-  const idx = id - 1;
-  const row = Math.floor(idx / seatsPerRow) + 1;
-  const col = (idx % seatsPerRow) + 1;
-  return { row, col };
-}
-
-/**
- * Normalize raw seats input into array of { row, col, label }.
- * Accepts arrays, numbers, strings like "1-7", "5,6", "A-6", or older objects.
- */
-function normalizeSeatsRaw(rawSeats, seatsPerRow = 10) {
-  if (rawSeats == null) return [];
-  let arr = Array.isArray(rawSeats) ? rawSeats.slice() : expandRangeString(String(rawSeats));
-  const out = [];
-
-  for (const token of arr) {
-    if (token == null) continue;
-
-    // object shape {row, col, label}
-    if (typeof token === "object" && !Array.isArray(token)) {
-      const r = Number(token.row);
-      const c = Number(token.col);
-      if (Number.isFinite(r) && Number.isFinite(c)) {
-        out.push({ row: r, col: c, label: token.label || seatLabel(r, c) });
-      } else if (token.label) {
-        out.push({ row: null, col: null, label: String(token.label) });
-      }
-      continue;
-    }
-
-    // numeric token
-    if (typeof token === "number") {
-      const rc = numericIdToRowCol(token, seatsPerRow);
-      if (rc) out.push({ row: rc.row, col: rc.col, label: seatLabel(rc.row, rc.col) });
-      else out.push({ row: null, col: null, label: String(token) });
-      continue;
-    }
-
-    // string token like "A-6" or "12"
-    if (typeof token === "string") {
-      const t = token.trim();
-      if (/^[A-Za-z]+-\d+$/.test(t)) {
-        const parts = t.split("-");
-        const colNum = parseInt(parts[1], 10);
-        out.push({ row: null, col: Number.isFinite(colNum) ? colNum : null, label: t.toUpperCase() });
-      } else if (/^\d+$/.test(t)) {
-        const id = parseInt(t, 10);
-        const rc = numericIdToRowCol(id, seatsPerRow);
-        if (rc) out.push({ row: rc.row, col: rc.col, label: seatLabel(rc.row, rc.col) });
-        else out.push({ row: null, col: null, label: t });
-      } else {
-        out.push({ row: null, col: null, label: t });
-      }
-      continue;
-    }
-
-    out.push({ row: null, col: null, label: String(token) });
-  }
-
-  return out;
-}
-
-/* -------------------------------------------------------------------------- */
-/*                                   Routes                                   */
-/* -------------------------------------------------------------------------- */
-
-/** 🔒 LOCK */
+/** 🔒 LOCK seats */
 router.post("/lock", requireAuth, async (req, res) => {
   const tag = "[POST /bookings/lock]";
   try {
     const { showtimeId } = req.body || {};
-    let { seats } = req.body || {};
+    let seats = normalizeRequestedSeats(req.body?.seats || []);
 
-    if (!mongoose.isValidObjectId(showtimeId))
-      return res.status(400).json({ ok: false, error: "Invalid showtimeId" });
-    if (!Array.isArray(seats) || seats.length === 0)
-      return res.status(400).json({ ok: false, error: "seats array is required" });
-
-    const norm = (s) => ({ row: Number(s.row), col: Number(s.col) });
-    seats = seats.map(norm).filter((s) => Number.isInteger(s.row) && Number.isInteger(s.col));
-    if (seats.length === 0)
-      return res.status(400).json({ ok: false, error: "seats must be integers" });
-
-    const uniq = new Map(seats.map((s) => [seatKey(s.row, s.col), s]));
-    seats = Array.from(uniq.values());
+    if (!mongoose.isValidObjectId(showtimeId)) return res.status(400).json({ ok: false, error: "Invalid showtimeId" });
+    if (!seats.length) return res.status(400).json({ ok: false, error: "seats array is required" });
 
     let show = await Showtime.findById(showtimeId);
     if (!show) return res.status(404).json({ ok: false, error: "Showtime not found" });
+
     await ensureSeatsInitialized(show);
     await reconcileLocks(show);
 
-    const idx = new Map(show.seats.map((s, i) => [seatKey(s.row, s.col), i]));
-    const toLockKeys = seats.map((s) => seatKey(s.row, s.col));
+    // Build index from snapshot using canonical keys
+    const idx = new Map(show.seats.map((s, i) => [seatKeyForSnapshot(s), i]));
+    const toLockKeys = seats.map((s) => seatKeyFrom(s));
 
+    // detect unavailable seats
     const unavailable = [];
     for (const s of seats) {
-      const key = seatKey(s.row, s.col);
+      const key = seatKeyFrom(s);
       const i = idx.get(key);
       const st = i === undefined ? "MISSING" : show.seats[i].status;
       if (i === undefined || st !== "AVAILABLE") {
@@ -386,25 +217,26 @@ router.post("/lock", requireAuth, async (req, res) => {
       return res.status(409).json({ ok: false, error: "Some seats unavailable", details: { unavailable } });
     }
 
-    const lockedUntil = new Date(Date.now() + 2 * 60 * 1000); // 2 minutes
+    const lockedUntil = new Date(Date.now() + SEAT_LOCK_TTL_MS);
+
+    // Bulk insert locks; unique index on (showtime, seat) prevents races
     try {
-      // bulk create held locks — rely on unique index in SeatLock to avoid duplicates
       await SeatLock.bulkWrite(
         toLockKeys.map((key) => ({
           insertOne: {
             document: {
               showtime: show._id,
               seat: key,
-              lockedBy: req.user._id,
+              lockedBy: req.user?.id || req.user?._id,
               lockedUntil,
               status: "HELD",
-              createdAt: new Date(),
             },
           },
         })),
         { ordered: true }
       );
     } catch (err) {
+      // Duplicate key means someone else locked concurrently
       if (err?.code === 11000) {
         return res.status(409).json({
           ok: false,
@@ -416,6 +248,7 @@ router.post("/lock", requireAuth, async (req, res) => {
       throw err;
     }
 
+    // Update show snapshot to LOCKED for these seats
     for (const key of toLockKeys) {
       const i = idx.get(key);
       if (i !== undefined) show.seats[i].status = "LOCKED";
@@ -423,7 +256,7 @@ router.post("/lock", requireAuth, async (req, res) => {
     await show.save();
 
     console.log(tag, "ok", {
-      user: String(req.user._id),
+      user: String(req.user?.id || req.user?._id),
       showtime: String(show._id),
       seats: toLockKeys,
       lockedUntil: lockedUntil.toISOString(),
@@ -442,111 +275,105 @@ router.post("/lock", requireAuth, async (req, res) => {
   }
 });
 
-/** 🔓 RELEASE */
+/** 🔓 RELEASE seats held by requester */
 router.post("/release", requireAuth, async (req, res) => {
   const tag = "[POST /bookings/release]";
   try {
-    const { showtimeId, seats } = req.body || {};
-    if (!mongoose.isValidObjectId(showtimeId))
-      return res.status(400).json({ ok: false, error: "Invalid showtimeId" });
+    const { showtimeId } = req.body || {};
+    let seats = normalizeRequestedSeats(req.body?.seats || []);
 
-    let show = await Showtime.findById(showtimeId);
+    if (!mongoose.isValidObjectId(showtimeId)) return res.status(400).json({ ok: false, error: "Invalid showtimeId" });
+
+    const show = await Showtime.findById(showtimeId);
     if (!show) return res.status(404).json({ ok: false, error: "Showtime not found" });
+
     await ensureSeatsInitialized(show);
 
-    const keys = (seats || []).map((s) => seatKey(s.row, s.col));
+    const keys = seats.length ? seats.map((s) => seatKeyFrom(s)) : null;
 
-    await SeatLock.deleteMany({
+    const filter = {
       showtime: showtimeId,
-      lockedBy: req.user._id,
-      seat: { $in: keys },
+      lockedBy: req.user?.id || req.user?._id,
       status: "HELD",
-    });
+    };
+    if (keys) filter.seat = { $in: keys };
+
+    const deleted = await SeatLock.deleteMany(filter);
 
     await reconcileLocks(show);
 
-    res.json({ ok: true, message: "Released", seats: seats || [] });
+    return res.json({ ok: true, message: "Released", releasedCount: deleted.deletedCount || 0, seats: seats || [] });
   } catch (err) {
     console.error(tag, "Release error:", err);
-    res.status(500).json({ ok: false, error: "Failed to release seats" });
+    return res.status(500).json({ ok: false, error: "Failed to release seats" });
   }
 });
 
-/** ✅ CONFIRM (atomic) */
+/** ✅ CONFIRM booking (atomic transaction) */
 router.post("/confirm", requireAuth, async (req, res) => {
   const tag = "[POST /bookings/confirm]";
   try {
-    const idemKey = (req.headers["x-idempotency-key"] || "").trim();
-    const { showtimeId, seats, amount } = req.body || {};
+    const idemKey = String(req.headers["x-idempotency-key"] || "").trim() || null;
+    const { showtimeId } = req.body || {};
+    let seats = normalizeRequestedSeats(req.body?.seats || []);
+    const amountFromClient = req.body?.amount;
 
-    if (!mongoose.isValidObjectId(showtimeId))
-      return res.status(400).json({ ok: false, error: "Invalid showtimeId" });
-    if (!Array.isArray(seats) || seats.length === 0)
-      return res.status(400).json({ ok: false, error: "seats array is required" });
+    if (!mongoose.isValidObjectId(showtimeId)) return res.status(400).json({ ok: false, error: "Invalid showtimeId" });
+    if (!seats.length) return res.status(400).json({ ok: false, error: "seats array is required" });
 
-    // Populate movie at the show level so we can set booking.movie
+    const userId = req.user?.id || req.user?._id;
+
     let show = await Showtime.findById(showtimeId).populate("movie");
     if (!show) return res.status(404).json({ ok: false, error: "Showtime not found" });
+
     await ensureSeatsInitialized(show);
     await reconcileLocks(show);
 
-    // normalize seats and add label property
-    const normSeats = seats.map((s) => {
-      const r = Number(s.row);
-      const c = Number(s.col);
-      return { row: r, col: c, label: seatLabel(r, c) };
-    });
-    const keys = normSeats.map((s) => seatKey(s.row, s.col));
+    // prepare canonical keys & index map from snapshot
+    const idx = new Map(show.seats.map((s, i) => [seatKeyForSnapshot(s), i]));
+    const keys = seats.map((s) => seatKeyFrom(s));
 
-    const idx = new Map(show.seats.map((s, i) => [seatKey(s.row, s.col), i]));
+    // check known seats
     const missing = [];
-    for (const k of keys) {
-      if (idx.get(k) === undefined) missing.push(k);
-    }
-    if (missing.length) {
-      return res.status(400).json({ ok: false, error: "Unknown seats in snapshot", details: { missing } });
-    }
+    for (const k of keys) if (idx.get(k) === undefined) missing.push(k);
+    if (missing.length) return res.status(400).json({ ok: false, error: "Unknown seats in snapshot", details: { missing } });
 
+    // ensure all seats are locked by this user and still valid
     const now = new Date();
     const activeLocks = await SeatLock.find({
       showtime: show._id,
-      lockedBy: req.user._id,
+      lockedBy: userId,
       seat: { $in: keys },
       status: "HELD",
       lockedUntil: { $gt: now },
-    })
-      .select("seat")
-      .lean();
+    }).select("seat").lean();
 
     if (activeLocks.length !== keys.length) {
       return res.status(409).json({ ok: false, error: "Seats already booked or lock expired" });
     }
 
+    // idempotency: if a booking already exists with same idempotency key for this user/showtime -> return it
     if (idemKey) {
       const existing = await Booking.findOne({
-        user: req.user._id,
+        user: userId,
         showtime: show._id,
         "meta.idempotencyKey": idemKey,
       }).lean();
-      if (existing) {
-        return res.status(200).json({ ok: true, message: "Already confirmed", booking: existing });
-      }
+      if (existing) return res.status(200).json({ ok: true, message: "Already confirmed", booking: existing });
     }
 
-    let bookingDoc;
+    // transaction: mark seats BOOKED, create booking, mark locks USED
+    let bookingDoc = null;
     const session = await mongoose.startSession();
-
-    const execTx = async () => {
+    try {
       await session.withTransaction(async () => {
-        // re-load show under session and perform session-aware ops
-        let showForWrite = await Showtime.findById(show._id).session(session).populate("movie");
-        if (!showForWrite) throw new Error("Showtime vanished during transaction");
+        const showForWrite = await Showtime.findById(show._id).session(session);
+        await ensureSeatsInitialized(showForWrite);
+        await reconcileLocks(showForWrite);
 
-        await ensureSeatsInitialized(showForWrite, { session });
-        await reconcileLocks(showForWrite, { session });
+        const localIdx = new Map(showForWrite.seats.map((s, i) => [seatKeyForSnapshot(s), i]));
 
-        const localIdx = new Map(showForWrite.seats.map((s, i) => [seatKey(s.row, s.col), i]));
-
+        // verify statuses inside transaction and set to BOOKED
         for (const k of keys) {
           const i = localIdx.get(k);
           if (i === undefined) throw new Error(`Seat missing in snapshot: ${k}`);
@@ -564,19 +391,14 @@ router.post("/confirm", requireAuth, async (req, res) => {
         }
         await showForWrite.save({ session });
 
-        const finalAmount = Number(amount || normSeats.length * Number(showForWrite.basePrice || 200));
-
-        // set booking.movie from show.movie if available
-        const movieValue =
-          showForWrite.movie && (typeof showForWrite.movie === "object" ? showForWrite.movie._id ?? showForWrite.movie : showForWrite.movie);
+        const finalAmount = Number(amountFromClient || seats.length * Number(show.basePrice || 200));
 
         const [booking] = await Booking.create(
           [
             {
-              user: req.user._id,
+              user: userId,
               showtime: show._id,
-              movie: movieValue ?? undefined,
-              seats: normSeats,
+              seats: seats.map((s) => (s.seatId ? { seatId: s.seatId } : { row: s.row, col: s.col })),
               amount: finalAmount,
               status: "CONFIRMED",
               meta: { idempotencyKey: idemKey || null },
@@ -584,12 +406,13 @@ router.post("/confirm", requireAuth, async (req, res) => {
           ],
           { session }
         );
+
         bookingDoc = booking;
 
         await SeatLock.updateMany(
           {
             showtime: show._id,
-            lockedBy: req.user._id,
+            lockedBy: userId,
             seat: { $in: keys },
             status: "HELD",
           },
@@ -597,61 +420,26 @@ router.post("/confirm", requireAuth, async (req, res) => {
           { session }
         );
       });
-    };
-
-    try {
-      try {
-        await execTx();
-      } catch (e) {
-        const isTransient =
-          e?.errorLabels?.includes?.("TransientTransactionError") ||
-          e?.errorLabels?.includes?.("UnknownTransactionCommitResult");
-        if (isTransient) {
-          console.warn(tag, "Transient transaction error; retrying once:", e?.message);
-          await execTx();
-        } else throw e;
-      }
     } finally {
       session.endSession();
     }
 
-    // Populate bookingDoc (so it contains movie and showtime.movie for downstream code)
-    try {
-      bookingDoc = await Booking.findById(bookingDoc._id)
-        .populate({ path: "movie", select: "title posterUrl runtime" })
-        .populate({
-          path: "showtime",
-          populate: [
-            { path: "movie", select: "title posterUrl runtime" },
-            { path: "screen", select: "name rows cols" },
-          ],
-        })
-        .lean();
-    } catch (popErr) {
-      console.warn(tag, "Failed to populate bookingDoc after create:", popErr?.message || popErr);
-    }
-
-    // Post-commit side effects (non-blocking)
+    // Post-commit side-effects (async, non-blocking)
     (async () => {
       try {
-        // USER notification (+ SSE)
+        // Create USER notification + push
         const userNotif = await Notification.create({
           audience: "USER",
-          user: req.user._id,
+          user: userId,
           type: "BOOKING_CONFIRMED",
           title: "🎟️ Booking Confirmed",
-          message: `Your booking for "${bookingDoc?.showtime?.movie?.title || bookingDoc?.movie?.title || "a movie"}" on ${fmtTime(bookingDoc?.showtime?.startTime || show.startTime)} has been confirmed.`,
+          message: `Your booking for "${show.movie?.title || "a movie"}" on ${fmtTime(show.startTime)} has been confirmed.`,
           data: { bookingId: bookingDoc._id, showtimeId: show._id },
           channels: ["IN_APP", "EMAIL"],
         });
-        try {
-          const delivered = pushNotification?.(userNotif);
-          console.log(tag, "pushNotification (user) delivered:", delivered);
-        } catch (npErr) {
-          console.warn(tag, "pushNotification (user) failed:", npErr?.message);
-        }
+        try { pushNotification?.(userNotif); } catch (e) { console.warn("pushNotification user failed:", e?.message); }
 
-        // ADMIN notification (+ SSE to admin channel)
+        // Create ADMIN notification
         try {
           const adminNotif = await Notification.create({
             audience: "ADMIN",
@@ -663,43 +451,39 @@ router.post("/confirm", requireAuth, async (req, res) => {
           });
           pushNotification?.(adminNotif);
         } catch (anErr) {
-          console.warn(tag, "admin notification create failed:", anErr?.message);
+          console.warn("admin notification create failed:", anErr?.message);
         }
 
-        // EMAIL (with optional PDF attachment)
+        // Prepare and send email (with optional PDF)
         const to = pickUserEmail(req.user, null);
         if (!to) {
-          console.warn(tag, "No recipient email; skipping email send.");
+          console.warn("No recipient email; skipping email send.");
         } else {
           const name = pickUserName(req.user, null);
-          const seatsText = normSeats.map((s) => s.label || `${s.row}-${s.col}`).join(", ");
+          const seatsText = seats.map((s) => (s.seatId ? s.seatId : `${s.row}-${s.col}`)).join(", ");
 
-          const linkToken = jwt.sign(
-            { sub: String(req.user._id), role: "USER" },
-            process.env.JWT_SECRET,
-            { expiresIn: "24h" }
-          );
+          const linkToken = jwt.sign({ sub: String(userId), role: "USER" }, process.env.JWT_SECRET, { expiresIn: "24h" });
 
           const viewUrl = `${APP_PUBLIC_BASE}/bookings/${bookingDoc._id}?token=${encodeURIComponent(linkToken)}`;
-          const pdfUrl  = `${BACKEND_PUBLIC_BASE}/api/bookings/${bookingDoc._id}/pdf?token=${encodeURIComponent(linkToken)}`;
+          const pdfUrl = `${BACKEND_PUBLIC_BASE}/api/bookings/${bookingDoc._id}/pdf?token=${encodeURIComponent(linkToken)}`;
 
           const html =
-            renderTemplate?.("booking-confirmed", {
+            (renderTemplate && renderTemplate("booking-confirmed", {
               name,
-              movieTitle: bookingDoc?.showtime?.movie?.title || bookingDoc?.movie?.title || "your movie",
-              showtime: fmtTime(bookingDoc?.showtime?.startTime || show.startTime),
+              movieTitle: show.movie?.title || "your movie",
+              showtime: fmtTime(show.startTime),
               seats: seatsText,
               bookingId: String(bookingDoc._id),
               ticketViewUrl: viewUrl,
               ticketPdfUrl: pdfUrl,
-            }) || `<p>${userNotif.message}</p>`;
+            })) || `<p>Your booking for ${show.movie?.title} is confirmed.</p>`;
 
-          let attachments = [];
+          const attachments = [];
           try {
             const { buffer } = await generateTicketPdf(
-              bookingDoc,
+              bookingDoc.toObject ? bookingDoc.toObject() : bookingDoc,
               { name, email: to },
-              bookingDoc?.showtime || show,
+              show,
               { baseUrl: APP_PUBLIC_BASE }
             );
             if (buffer) {
@@ -710,18 +494,15 @@ router.post("/confirm", requireAuth, async (req, res) => {
               });
             }
           } catch (pdfErr) {
-            console.warn(tag, "Ticket PDF generation failed (email will still send):", pdfErr?.message);
+            console.warn("Ticket PDF generation failed (email will still send):", pdfErr?.message);
           }
 
           const mailRes = await sendEmail({ to, subject: userNotif.title, html, attachments });
-          if (!mailRes?.ok) {
-            console.error(tag, "❌ Email failed:", mailRes?.error || "unknown");
-          } else {
-            console.log(tag, "📧 Email sent:", mailRes.messageId, mailRes.previewUrl || "");
-          }
+          if (!mailRes?.ok) console.error("Email failed:", mailRes?.error || "unknown");
+          else console.log("Email sent:", mailRes.messageId, mailRes.previewUrl || "");
         }
       } catch (e) {
-        console.warn(tag, "Notification/email failed:", e?.message);
+        console.warn("Notification/email post-commit failed:", e?.message || e);
       }
     })();
 
@@ -736,39 +517,33 @@ router.post("/confirm", requireAuth, async (req, res) => {
   }
 });
 
-/** 👤 USER’s bookings */
+/** 🧾 USER's bookings */
 router.get("/me", requireAuth, async (req, res) => {
   try {
-    const bookings = await Booking.find({ user: req.user._id })
-      .populate({ path: "movie", select: "title posterUrl runtime" })
+    const userId = req.user?.id || req.user?._id;
+    const bookings = await Booking.find({ user: userId })
       .populate({
         path: "showtime",
         populate: [
           { path: "movie", select: "title posterUrl runtime" },
-          { path: "screen", select: "name rows cols" },
+          { path: "screen", select: "name" },
         ],
       })
       .sort({ createdAt: -1 })
       .lean();
 
-    const normalized = bookings.map((b) => {
-      const seatsPerRow = b.showtime?.screen?.cols || 10;
-      b.seats = normalizeSeatsRaw(b.seats, seatsPerRow);
-      return b;
-    });
-
-    res.json({ ok: true, bookings: normalized });
+    res.json({ ok: true, bookings });
   } catch (err) {
     console.error("Fetch bookings error:", err);
     res.status(500).json({ ok: false, error: "Failed to fetch bookings" });
   }
 });
 
-/** 🧾 SINGLE booking details — ADMIN can view any booking; accepts ?token=... */
+/** 🧾 SINGLE booking details — accepts ?token=... */
 router.get(
   "/:id",
   (req, _res, next) => {
-    if (req.query?.token) {
+    if (req.query?.token && !req.headers.authorization) {
       req.headers.authorization = `Bearer ${String(req.query.token)}`;
     }
     next();
@@ -776,17 +551,14 @@ router.get(
   requireAuth,
   async (req, res) => {
     try {
-      if (!mongoose.isValidObjectId(req.params.id)) {
-        return res.status(400).json({ ok: false, error: "Invalid booking id" });
-      }
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ ok: false, error: "Invalid booking id" });
 
       const booking = await Booking.findById(req.params.id)
-        .populate({ path: "movie", select: "title posterUrl runtime" })
         .populate({
           path: "showtime",
           populate: [
             { path: "movie", select: "title posterUrl runtime" },
-            { path: "screen", select: "name rows cols" },
+            { path: "screen", select: "name" },
           ],
         })
         .populate({ path: "user", select: "name email" })
@@ -796,46 +568,38 @@ router.get(
 
       const isAdmin = String(req.user?.role || "").toUpperCase().includes("ADMIN");
       const bookingUserId = String(booking.user?._id || booking.user);
-      if (!isAdmin && bookingUserId !== String(req.user._id)) {
+      if (!isAdmin && bookingUserId !== String(req.user?.id || req.user?._id)) {
         return res.status(403).json({ ok: false, error: "Forbidden" });
       }
-
-      // Normalize seats for older/new bookings
-      const seatsPerRow = booking.showtime?.screen?.cols || 10;
-      booking.seats = normalizeSeatsRaw(booking.seats, seatsPerRow);
 
       res.json({ ok: true, booking });
     } catch (err) {
       console.error("Fetch booking error:", err);
-      res.status(500).json({ ok: false, error: "Failed to fetch bookings" });
+      res.status(500).json({ ok: false, error: "Failed to fetch booking" });
     }
   }
 );
 
-/** ❌ CANCEL (DELETE style) */
+/** ❌ CANCEL booking (DELETE) */
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const booking = await Booking.findById(req.params.id).populate({
-      path: "movie",
-      select: "title",
-    }).populate({
       path: "showtime",
       populate: { path: "movie", select: "title" },
     });
     if (!booking) return res.status(404).json({ ok: false, error: "Booking not found" });
 
-    if (String(booking.user) !== String(req.user._id))
-      return res.status(403).json({ ok: false, error: "Forbidden" });
+    const userId = String(req.user?.id || req.user?._id);
+    if (String(booking.user) !== userId) return res.status(403).json({ ok: false, error: "Forbidden" });
 
-    if (booking.status === "CANCELLED") {
-      return res.status(200).json({ ok: true, message: "Already cancelled", bookingId: booking._id });
-    }
+    if (booking.status === "CANCELLED") return res.status(200).json({ ok: true, message: "Already cancelled", bookingId: booking._id });
 
     booking.status = "CANCELLED";
     booking.cancelledAt = new Date();
     await booking.save();
     await freeSeatsForBooking(booking);
 
+    // async notifications + email
     (async () => {
       try {
         const notif = await Notification.create({
@@ -843,12 +607,13 @@ router.delete("/:id", requireAuth, async (req, res) => {
           user: booking.user,
           type: "BOOKING_CANCELLED",
           title: "❌ Booking Cancelled",
-          message: `Your booking for "${booking.showtime?.movie?.title || booking.movie?.title}" has been cancelled.`,
+          message: `Your booking for "${booking.showtime?.movie?.title}" has been cancelled.`,
           data: { bookingId: booking._id },
           channels: ["IN_APP", "EMAIL"],
         });
-        try { pushNotification?.(notif); } catch {}
+        try { pushNotification?.(notif); } catch (e) {}
 
+        // admin notification
         try {
           const adminNotif = await Notification.create({
             audience: "ADMIN",
@@ -861,136 +626,59 @@ router.delete("/:id", requireAuth, async (req, res) => {
           pushNotification?.(adminNotif);
         } catch {}
 
+        // email
         const to = pickUserEmail(req.user, booking.user);
-        if (!to) {
-          console.warn("[delete cancel] No recipient email; skipping email send.");
-        } else {
+        if (to) {
           const html =
-            renderTemplate?.("booking-cancelled", {
+            (renderTemplate && renderTemplate("booking-cancelled", {
               name: pickUserName(req.user, booking.user),
-              movieTitle: booking.showtime?.movie?.title || booking.movie?.title || "your movie",
+              movieTitle: booking.showtime?.movie?.title || "your movie",
               bookingId: String(booking._id),
               ticketViewUrl: `${APP_PUBLIC_BASE}/bookings/${booking._id}`,
-            }) || `<p>${notif.message}</p>`;
+            })) || `<p>${notif.message}</p>`;
+
           const mailRes = await sendEmail({ to, subject: notif.title, html });
-          if (!mailRes?.ok) console.error("[delete cancel] ❌ Email failed:", mailRes?.error || "unknown");
-          else console.log("[delete cancel] 📧 Email sent:", mailRes.messageId, mailRes.previewUrl || "");
+          if (!mailRes?.ok) console.error("Email failed:", mailRes?.error || "unknown");
+          else console.log("Email sent:", mailRes.messageId, mailRes.previewUrl || "");
         }
       } catch (e) {
-        console.warn("[delete cancel] Notification/email failed:", e?.message);
+        console.warn("Cancellation notification/email failed:", e?.message);
       }
     })();
 
-    res.json({ ok: true, message: "Booking cancelled", bookingId: booking._id });
+    return res.json({ ok: true, message: "Booking cancelled", bookingId: booking._id });
   } catch (err) {
     console.error("Cancel booking (DELETE) error:", err);
     res.status(500).json({ ok: false, error: err?.message || "Failed to cancel booking" });
   }
 });
 
-/** ❌ CANCEL (PATCH style) */
+/** ❌ CANCEL (PATCH style) — identical to DELETE but kept for API parity */
 router.patch("/:id/cancel", requireAuth, async (req, res) => {
-  const tag = "[PATCH /bookings/:id/cancel]";
+  // reuse delete logic for consistency
   try {
-    const { id } = req.params;
-    if (!mongoose.isValidObjectId(id)) {
-      return res.status(400).json({ ok: false, error: "Invalid booking id" });
-    }
-
-    const booking = await Booking.findById(id).populate({
-      path: "movie",
-      select: "title",
-    }).populate({
-      path: "showtime",
-      populate: { path: "movie", select: "title" },
-    });
-    if (!booking) return res.status(404).json({ ok: false, error: "Booking not found" });
-    if (String(booking.user) !== String(req.user._id))
-      return res.status(403).json({ ok: false, error: "Forbidden" });
-
-    if (booking.status === "CANCELLED") {
-      return res.status(200).json({ ok: true, message: "Already cancelled", bookingId: booking._id });
-    }
-
-    booking.status = "CANCELLED";
-    booking.cancelledAt = new Date();
-    await booking.save();
-    await freeSeatsForBooking(booking);
-
-    (async () => {
-      try {
-        const notif = await Notification.create({
-          audience: "USER",
-          user: booking.user,
-          type: "BOOKING_CANCELLED",
-          title: "❌ Booking Cancelled",
-          message: `Your booking for "${booking.showtime?.movie?.title || booking.movie?.title || "a movie"}" has been cancelled.`,
-          data: { bookingId: booking._id },
-          channels: ["IN_APP", "EMAIL"],
-        });
-        try { pushNotification?.(notif); } catch {}
-
-        try {
-          const adminNotif = await Notification.create({
-            audience: "ADMIN",
-            type: "BOOKING_CANCELLED",
-            title: "Booking cancelled",
-            message: `Booking #${String(booking._id)} cancelled by ${req.user?.email || "user"}`,
-            data: { bookingId: booking._id, userEmail: req.user?.email },
-            channels: ["IN_APP"],
-          });
-          pushNotification?.(adminNotif);
-        } catch {}
-
-        const to = pickUserEmail(req.user, booking.user);
-        if (!to) {
-          console.warn(tag, "No recipient email; skipping email send.");
-        } else {
-          const html =
-            renderTemplate?.("booking-cancelled", {
-              name: pickUserName(req.user, booking.user),
-              movieTitle: booking.showtime?.movie?.title || booking.movie?.title || "your movie",
-              bookingId: String(booking._id),
-              ticketViewUrl: `${APP_PUBLIC_BASE}/bookings/${booking._id}`,
-            }) || `<p>${notif.message}</p>`;
-          const mailRes = await sendEmail({ to, subject: notif.title, html });
-          if (!mailRes?.ok) console.error(tag, "❌ Email failed:", mailRes?.error || "unknown");
-          else console.log(tag, "📧 Email sent:", mailRes.messageId, mailRes.previewUrl || "");
-        }
-      } catch (e) {
-        console.warn(tag, "Notification/email failed:", e?.message);
-      }
-    })();
-
-    return res.json({ ok: true, message: "Booking cancelled", bookingId: booking._id });
+    const result = await router.handle({ ...req, method: "DELETE" }, res);
+    return result;
   } catch (err) {
-    console.error(tag, "error:", err);
-    return res.status(500).json({ ok: false, error: err?.message || "Failed to cancel booking" });
+    console.error("[PATCH cancel] error:", err);
+    return res.status(500).json({ ok: false, error: "Failed to cancel booking" });
   }
 });
 
-/** 🗓️ CALENDAR */
+/** 🗓️ Calendar — user's bookings as calendar events */
 router.get("/calendar", requireAuth, async (req, res) => {
   try {
     const { start, end } = req.query;
     const startDate = start ? new Date(start) : new Date();
     const endDate = end ? new Date(end) : new Date(startDate.getTime() + 90 * 86400000);
 
-    const bookings = await Booking.find({ user: req.user._id })
-      .populate({ path: "movie", select: "title posterUrl" })
-      .populate({
-        path: "showtime",
-        populate: { path: "movie", select: "title posterUrl" },
-      })
+    const userId = req.user?.id || req.user?._id;
+    const bookings = await Booking.find({ user: userId })
+      .populate({ path: "showtime", populate: { path: "movie", select: "title posterUrl" } })
       .lean();
 
     const events = bookings
-      .map((b) => ({
-        id: b._id,
-        title: b.showtime?.movie?.title || b.movie?.title || "Booking",
-        start: b.showtime?.startTime,
-        raw: b,
-      }))
+      .map((b) => ({ id: b._id, title: b.showtime?.movie?.title || "Booking", start: b.showtime?.startTime, raw: b }))
       .filter((e) => {
         const t = new Date(e.start);
         return t >= startDate && t <= endDate;
@@ -1003,9 +691,7 @@ router.get("/calendar", requireAuth, async (req, res) => {
   }
 });
 
-/** 🧾 PDF Ticket Generator — ADMIN can download any ticket
- *  Uses requireAuth, but allows token via ?token=... for window.open/email flows.
- */
+/** 🧾 PDF Ticket Generator — accepts ?token=..., requires auth */
 router.get(
   "/:id/pdf",
   (req, _res, next) => {
@@ -1017,17 +703,14 @@ router.get(
   requireAuth,
   async (req, res) => {
     try {
-      if (!mongoose.isValidObjectId(req.params.id)) {
-        return res.status(400).json({ ok: false, error: "Invalid booking id" });
-      }
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ ok: false, error: "Invalid booking id" });
 
       const booking = await Booking.findById(req.params.id)
-        .populate({ path: "movie", select: "title posterUrl runtime" })
         .populate({
           path: "showtime",
           populate: [
             { path: "movie", select: "title posterUrl runtime" },
-            { path: "screen", select: "name rows cols" },
+            { path: "screen", select: "name" },
           ],
         })
         .populate({ path: "user", select: "name email" })
@@ -1037,7 +720,7 @@ router.get(
 
       const isAdmin = String(req.user?.role || "").toUpperCase().includes("ADMIN");
       const bookingUserId = String(booking.user?._id || booking.user);
-      if (!isAdmin && bookingUserId !== String(req.user._id)) {
+      if (!isAdmin && bookingUserId !== String(req.user?.id || req.user?._id)) {
         return res.status(403).json({ ok: false, error: "Forbidden" });
       }
 
@@ -1050,16 +733,7 @@ router.get(
         email: booking.user?.email || req.user?.email || undefined,
       };
 
-      // Normalize seats for PDF generation (use screen.cols where available)
-      const seatsPerRow = booking.showtime?.screen?.cols || 10;
-      booking.seats = normalizeSeatsRaw(booking.seats, seatsPerRow);
-
-      const { buffer } = await generateTicketPdf(
-        booking,
-        userForPdf,
-        booking.showtime,
-        { baseUrl: APP_PUBLIC_BASE } // explicit baseUrl
-      );
+      const { buffer } = await generateTicketPdf(booking, userForPdf, booking.showtime, { baseUrl: APP_PUBLIC_BASE });
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `inline; filename=ticket-${booking._id}.pdf`);
