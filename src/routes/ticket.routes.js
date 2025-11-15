@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import jwt from "jsonwebtoken";
 import Booking from "../models/Booking.js";
 import Showtime from "../models/Showtime.js";
 import Notification from "../models/Notification.js";
@@ -12,12 +13,49 @@ import { sendEmail, renderTemplate, createTicketUrls } from "../models/mailer.js
 
 const router = Router();
 
+/**
+ * Helper: extract token from Authorization header or query param and decode it.
+ * Returns { userId, role, theatreId } or { userId: null, role: null } on failure.
+ */
+function decodeAuth(req) {
+  const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
+  const header = req.headers?.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice(7) : req.query?.token || null;
+  if (!token) return { userId: null, role: null, theatreId: null, rawToken: null };
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded.sub || decoded.id || decoded.userId || decoded._id || null;
+    const roleRaw =
+      decoded.role ||
+      (Array.isArray(decoded.roles) && decoded.roles.find((r) => String(r).toUpperCase().includes("ADMIN"))) ||
+      null;
+    const role = roleRaw ? String(roleRaw).toUpperCase() : null;
+    const theatreId = decoded.theatreId || decoded.theaterId || decoded.theatre || decoded.theater || null;
+    return { userId: userId ? String(userId) : null, role, theatreId: theatreId ? String(theatreId) : null, rawToken: token };
+  } catch (err) {
+    // invalid token
+    return { userId: null, role: null, theatreId: null, rawToken: null };
+  }
+}
+
+/**
+ * GET /:bookingId/download
+ * - Access rules:
+ *    * SUPER_ADMIN -> allowed
+ *    * THEATRE_ADMIN -> allowed if booking.showtime.theater === token.theatreId (token must include theatreId)
+ *    * USER -> allowed if booking.user === token.userId
+ * - Accepts token via Bearer header or ?token=... query param (for emailed links).
+ */
 router.get("/:bookingId/download", async (req, res) => {
   try {
     const { bookingId } = req.params;
-    if (!mongoose.isValidObjectId(bookingId))
-      return res.status(400).send("Invalid booking ID");
+    if (!mongoose.isValidObjectId(bookingId)) return res.status(400).send("Invalid booking ID");
 
+    // decode auth/token if present
+    const auth = decodeAuth(req);
+
+    // fetch booking + populated showtime/movie/screen
     const booking = await Booking.findById(bookingId)
       .populate({
         path: "showtime",
@@ -30,6 +68,36 @@ router.get("/:bookingId/download", async (req, res) => {
 
     if (!booking) return res.status(404).send("Booking not found");
 
+    // Determine access
+    const bookingUserId = booking.user ? String(booking.user) : null;
+    const showtimeTheaterId = booking.showtime?.theater ? String(booking.showtime.theater) : null;
+
+    const role = auth.role || null;
+    const requesterId = auth.userId || null;
+    const requesterTheatreId = auth.theatreId || null;
+
+    // If no token/header provided, require a logged-in user via cookie/session — but this route handles token-based auth only.
+    // For safety, we treat missing auth as unauthorized.
+    if (!requesterId && !role) {
+      return res.status(401).send("Unauthorized: missing token");
+    }
+
+    const isSuper = role === "SUPER_ADMIN";
+    const isTheatreAdmin = role === "THEATRE_ADMIN";
+    const isOwner = requesterId && bookingUserId && requesterId === bookingUserId;
+
+    // Allow if owner
+    let allowed = false;
+    if (isSuper) allowed = true;
+    else if (isOwner) allowed = true;
+    else if (isTheatreAdmin && requesterTheatreId && showtimeTheaterId && requesterTheatreId === String(showtimeTheaterId)) {
+      allowed = true;
+    }
+
+    if (!allowed) {
+      return res.status(403).send("Forbidden: you are not allowed to download this ticket");
+    }
+
     // -------------------------
     // 🌐 Resolve PUBLIC URLs (env-first; production fallback)
     // -------------------------
@@ -37,24 +105,17 @@ router.get("/:bookingId/download", async (req, res) => {
       process.env.APP_PUBLIC_BASE ||
       process.env.FRONTEND_PUBLIC_BASE ||
       process.env.VITE_APP_BASE_URL ||
-      process.env.URL || // Netlify
+      process.env.URL ||
       (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined) ||
       (process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined) ||
-      "https://movie-ticket-booking-rajy.netlify.app"; // production fallback
+      "https://movie-ticket-booking-rajy.netlify.app";
 
     const BACKEND_PUBLIC_BASE =
       process.env.BACKEND_PUBLIC_BASE ||
       process.env.BACKEND_URL ||
       process.env.API_BASE ||
       (process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : undefined) ||
-      "https://movie-ticket-booking-backend-o1m2.onrender.com"; // production fallback
-
-    console.log(
-      "[tickets.download] FRONTEND_PUBLIC_BASE=%s BACKEND_PUBLIC_BASE=%s bookingId=%s",
-      FRONTEND_PUBLIC_BASE,
-      BACKEND_PUBLIC_BASE,
-      bookingId
-    );
+      "https://movie-ticket-booking-backend-o1m2.onrender.com";
 
     // -------------------------
     // 🧾 Generate ticket PDF
@@ -95,51 +156,40 @@ router.get("/:bookingId/download", async (req, res) => {
     });
 
     // -------------------------
-    // 📧 Email the ticket
+    // 📧 Email the ticket (if email exists)
     // -------------------------
     if (emailTo) {
-      // Build canonical URLs (will prefer env vars from mailer.createTicketUrls and will rewrite localhost)
+      // Build canonical URLs (pass through token if present so emailed links work)
+      const tokenToAttach = auth.rawToken || undefined;
       const { ticketPdfUrl, ticketViewUrl } = createTicketUrls({
         bookingId: booking._id.toString(),
-        // token: optionalTokenIfYouGenerateOneFor PDF auth
+        token: tokenToAttach,
       });
 
       // Safe fallback: if PDF link still contains "localhost", use BACKEND_PUBLIC_BASE
       const safePdfLink =
         ticketPdfUrl && !/localhost|127\.0\.0\.1/i.test(ticketPdfUrl)
           ? ticketPdfUrl
-          : `${String(BACKEND_PUBLIC_BASE).replace(/\/$/, "")}/tickets/${booking._id}/download`;
+          : `${String(BACKEND_PUBLIC_BASE).replace(/\/$/, "")}/tickets/${booking._id}/download${tokenToAttach ? `?token=${tokenToAttach}` : ""}`;
 
       const safeViewLink =
         ticketViewUrl && !/localhost|127\.0\.0\.1/i.test(ticketViewUrl)
           ? ticketViewUrl
-          : `${String(FRONTEND_PUBLIC_BASE).replace(/\/$/, "")}/bookings/${booking._id}`;
+          : `${String(FRONTEND_PUBLIC_BASE).replace(/\/$/, "")}/bookings/${booking._id}${tokenToAttach ? `?token=${tokenToAttach}` : ""}`;
 
-      console.log(
-        "[tickets.download] built links -> pdf=%s view=%s (email=%s)",
-        safePdfLink,
-        safeViewLink,
-        emailTo
-      );
-
-      // Prefer to use renderTemplate("ticket", ...) if you have it; otherwise build a simple HTML email
       let html;
       try {
-        // If you already have a "ticket" template in mailer.js, this will be used.
         html = renderTemplate("ticket", {
           name: booking.user?.name || "Guest User",
           movieName,
           theaterName: booking.showtime?.screen?.name || "Unknown Theater",
-          showDate: booking.showtime?.date
-            ? new Date(booking.showtime.date).toLocaleDateString()
-            : "N/A",
+          showDate: booking.showtime?.date ? new Date(booking.showtime.date).toLocaleDateString() : "N/A",
           showTime: booking.showtime?.time || "N/A",
           seatNumber: booking.seatNumber || "N/A",
           pdfLink: safePdfLink,
           viewLink: safeViewLink,
         });
       } catch (err) {
-        // Fallback inline template (simple)
         console.warn("[tickets.download] renderTemplate('ticket') missing or failed, using fallback template", err?.message);
         html = `
           <div style="font-family:sans-serif;background:#f9fafb;padding:20px;">
@@ -196,10 +246,7 @@ router.get("/:bookingId/download", async (req, res) => {
     // 📤 Stream or send the PDF to user (download response)
     // -------------------------
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="ticket-${booking._id}.pdf"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="ticket-${booking._id}.pdf"`);
 
     if (buffer) {
       res.send(buffer);
@@ -213,14 +260,20 @@ router.get("/:bookingId/download", async (req, res) => {
       });
       stream.on("error", (err) => {
         console.error("Stream error:", err);
-        res.status(500).send("Failed to stream ticket");
+        // if response already started, just destroy socket; otherwise send 500
+        try {
+          if (!res.headersSent) res.status(500).send("Failed to stream ticket");
+          else res.destroy();
+        } catch (e) {}
       });
     } else {
       throw new Error("No PDF output from generator");
     }
   } catch (err) {
     console.error("❌ Ticket download error:", err);
-    res.status(500).send("Failed to generate ticket PDF");
+    // Hide internal errors from clients
+    if (!res.headersSent) return res.status(500).send("Failed to generate ticket PDF");
+    try { res.destroy(); } catch (e) {}
   }
 });
 
