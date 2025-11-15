@@ -1,5 +1,6 @@
 // backend/src/routes/screens.routes.js — FULL UPDATED (patched)
-// - Fixed requireAuth usage (call factory: requireAuth())
+// - requireAuth() usage (factory) already correct
+// - Fixed requireAdmin usage: call the factory (requireAdmin())
 // - Set router.routesPrefix to /api/screens for predictable auto-mount
 import { Router } from "express";
 import mongoose from "mongoose";
@@ -29,8 +30,8 @@ const notFound = (res, msg = "Not found") => res.status(404).json({ ok: false, m
 /** GET all screens of a theatre (admin, scoped) */
 router.get(
   "/admin/theaters/:theaterId/screens",
-  requireAuth(), // FIXED: call factory
-  requireAdmin,
+  requireAuth(),
+  requireAdmin({ allowTheatreAdmin: true }),
   requireScopedTheatre,
   async (req, res) => {
     try {
@@ -55,7 +56,7 @@ router.get(
 
 /** SUPER ADMIN: list ALL screens (no theaterId required) */
 /** Now scoped: SUPER_ADMIN => all, THEATRE_ADMIN => only their theatre */
-router.get("/admin/screens", requireAuth(), requireAdmin, async (req, res) => {
+router.get("/admin/screens", requireAuth(), requireAdmin({ allowTheatreAdmin: true }), async (req, res) => {
   try {
     const role = String(req.user?.role || "").toUpperCase();
     const myTheatre = req.user?.theatreId || req.user?.theaterId || null;
@@ -81,7 +82,7 @@ router.get("/admin/screens", requireAuth(), requireAdmin, async (req, res) => {
 router.post(
   "/admin/theaters/:theaterId/screens",
   requireAuth(),
-  requireAdmin,
+  requireAdmin({ allowTheatreAdmin: true }),
   requireScopedTheatre,
   parseFields,
   async (req, res) => {
@@ -131,7 +132,7 @@ router.post(
 router.get(
   "/admin/theaters/:theaterId/screens/:screenId",
   requireAuth(),
-  requireAdmin,
+  requireAdmin({ allowTheatreAdmin: true }),
   requireScopedTheatre,
   async (req, res) => {
     try {
@@ -159,7 +160,7 @@ router.get(
 router.patch(
   "/admin/theaters/:theaterId/screens/:screenId",
   requireAuth(),
-  requireAdmin,
+  requireAdmin({ allowTheatreAdmin: true }),
   requireScopedTheatre,
   parseFields,
   async (req, res) => {
@@ -209,7 +210,7 @@ router.patch(
 router.delete(
   "/admin/theaters/:theaterId/screens/:screenId",
   requireAuth(),
-  requireAdmin,
+  requireAdmin({ allowTheatreAdmin: true }),
   requireScopedTheatre,
   async (req, res) => {
     try {
@@ -339,7 +340,7 @@ const buildSeatLabels = (rows, cols) => {
 router.get(
   "/admin/theaters/:theaterId/screens/:screenId/seats",
   requireAuth(),
-  requireAdmin,
+  requireAdmin({ allowTheatreAdmin: true }),
   requireScopedTheatre,
   async (req, res) => {
     try {
