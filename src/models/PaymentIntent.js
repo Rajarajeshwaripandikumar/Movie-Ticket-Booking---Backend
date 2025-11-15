@@ -1,14 +1,80 @@
-import mongoose from 'mongoose';
+// src/services/paymentService.js
+import razorpay from "../config/razorpay.js"; // your razorpay instance
+import PaymentIntent from "../models/PaymentIntent.js";
 
-const paymentIntentSchema = new mongoose.Schema({
-  booking: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking' },
-  showtime: { type: mongoose.Schema.Types.ObjectId, ref: 'Showtime' },
-  seats: { type: [String], default: [] },
-  amount: { type: Number, required: true },
-  status: { type: String, enum: ['REQUIRES_PAYMENT','SUCCEEDED','FAILED','CANCELED'], default: 'REQUIRES_PAYMENT' },
-  provider: { type: String, default: 'mock' },
-  providerIntentId: { type: String },
-  idempotencyKey: { type: String, unique: true, sparse: true }
-}, { timestamps: true });
+/**
+ * Create Razorpay order idempotently and store PaymentIntent
+ * - amount (in rupees) passed by business logic; we convert to paise
+ * - idempotencyKey required from client to dedupe
+ */
+export async function createRazorpayOrder({
+  bookingId = null,
+  userId = null,
+  showtimeId = null,
+  seats = [],
+  amount = 0, // rupees
+  idempotencyKey,
+}) {
+  if (!idempotencyKey) throw new Error("idempotencyKey required");
 
-export default mongoose.model('PaymentIntent', paymentIntentSchema);
+  // convert to paise (integer)
+  const amountPaise = Math.round(amount * 100);
+
+  // Try to find an existing PaymentIntent created with this idempotencyKey
+  let pi = await PaymentIntent.findOne({ idempotencyKey });
+  if (pi) {
+    // If already created, return existing order details
+    if (pi.providerOrderId && pi.status === "CREATED") {
+      return { existing: true, paymentIntent: pi };
+    }
+    // If found but in other state, return it too
+    return { existing: true, paymentIntent: pi };
+  }
+
+  // create Razorpay order
+  const options = {
+    amount: amountPaise,
+    currency: "INR",
+    receipt: `booking_${bookingId || "guest"}_${Date.now()}`,
+    notes: {
+      bookingId: bookingId?.toString?.() || null,
+      userId: userId?.toString?.() || null,
+      seats: seats.join(","),
+      idempotencyKey,
+    },
+  };
+
+  const order = await razorpay.orders.create(options);
+
+  // persist PaymentIntent
+  pi = await PaymentIntent.create({
+    booking: bookingId || null,
+    showtime: showtimeId || null,
+    seats,
+    amount,
+    amountPaise,
+    status: "CREATED",
+    provider: "razorpay",
+    providerOrderId: order.id,
+    raw: order,
+    idempotencyKey,
+    user: userId || null,
+  });
+
+  return { existing: false, paymentIntent: pi, order };
+}
+
+/**
+ * Mark PaymentIntent as succeeded (after verifying signature)
+ */
+export async function markPaymentSucceeded({ idempotencyKey, providerOrderId, providerPaymentId, providerPayload = {} }) {
+  const query = idempotencyKey ? { idempotencyKey } : { providerOrderId };
+  const pi = await PaymentIntent.findOne(query);
+  if (!pi) throw new Error("PaymentIntent not found");
+
+  pi.status = "SUCCEEDED";
+  pi.providerPaymentId = providerPaymentId;
+  pi.raw = { ...(pi.raw || {}), providerPayload };
+  await pi.save();
+  return pi;
+}
